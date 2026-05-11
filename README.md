@@ -202,4 +202,4 @@ npm test
 
 ## 许可证
 
-本项目未内置许可证。公开复用前请根据实际需要补充许可证文件。
+本项目使用 MIT License，详见 [LICENSE](LICENSE)。
