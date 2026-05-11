@@ -1,5 +1,7 @@
 # 保研夏令营邮件订阅系统
 
+![保研夏令营邮件订阅系统 Hero 图](public/assets/hero.png)
+
 一个部署在 Cloudflare Workers 上的轻量邮件订阅系统。用户提交邮箱并确认订阅后，系统每天定时拉取
 `CS-BAOYAN-DDL` 的 `schools.json`，检测新增或重要字段变更，并通过阿里云邮件推送发送摘要邮件。
 
