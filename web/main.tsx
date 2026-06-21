@@ -44,6 +44,8 @@ interface TimelineStop {
   entries: TimelineEntry[];
 }
 
+type TimelineExpansion = "collapsed" | "expanded";
+
 type TierFilter = "Top2" | "华五" | "C9" | "985" | "211" | "其他";
 type RangeFilter = "today" | "3" | "7" | "15" | "future";
 type SourceFilter = "all" | "cs" | "baoyanxinxi";
@@ -513,22 +515,91 @@ function Timeline({
   loading: boolean;
   stops: TimelineStop[];
 }): React.ReactElement | null {
+  const [expandedStops, setExpandedStops] = useState<Set<number>>(new Set());
+  const expandableStopKeys = useMemo(
+    () =>
+      stops
+        .filter((stop) => stop.entries.length > TIMELINE_COLLAPSE_LIMIT)
+        .map((stop) => stop.remainingDays),
+    [stops]
+  );
+  const expandedStopCount = useMemo(
+    () => expandableStopKeys.filter((key) => expandedStops.has(key)).length,
+    [expandableStopKeys, expandedStops]
+  );
+  const hasExpandableStops = expandableStopKeys.length > 0;
+  const allExpandableStopsExpanded =
+    hasExpandableStops && expandedStopCount === expandableStopKeys.length;
+
+  useEffect(() => {
+    setExpandedStops((previous) => {
+      const activeKeys = new Set(expandableStopKeys);
+      const next = new Set([...previous].filter((key) => activeKeys.has(key)));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [expandableStopKeys]);
+
   if (loading) {
     return null;
+  }
+
+  function setAllStopsExpansion(nextExpansion: TimelineExpansion): void {
+    setExpandedStops(
+      nextExpansion === "expanded" ? new Set(expandableStopKeys) : new Set()
+    );
+  }
+
+  function toggleStopExpansion(key: number): void {
+    setExpandedStops((previous) => {
+      const next = new Set(previous);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
   }
 
   return (
     <section className="timeline" aria-label="7 天内截止时间线">
       <div className="timeline-head">
-        <span className="timeline-title">未来 7 天截止</span>
-        <span className="timeline-hint">按筛选条件实时更新</span>
+        <div className="timeline-head-text">
+          <span className="timeline-title">未来 7 天截止</span>
+          <span className="timeline-hint">按筛选条件实时更新</span>
+        </div>
+        {hasExpandableStops && (
+          <div className="timeline-actions" aria-label="时间线展开控制">
+            <button
+              className="timeline-action"
+              disabled={allExpandableStopsExpanded}
+              onClick={() => setAllStopsExpansion("expanded")}
+              type="button"
+            >
+              全部展开
+            </button>
+            <button
+              className="timeline-action"
+              disabled={expandedStopCount === 0}
+              onClick={() => setAllStopsExpansion("collapsed")}
+              type="button"
+            >
+              全部收起
+            </button>
+          </div>
+        )}
       </div>
       {stops.length === 0 ? (
         <p className="timeline-empty">未来 7 天内暂无符合条件的截止。</p>
       ) : (
         <ol className="timeline-track">
           {stops.map((stop) => (
-            <TimelineColumn key={stop.remainingDays} stop={stop} />
+            <TimelineColumn
+              expanded={expandedStops.has(stop.remainingDays)}
+              key={stop.remainingDays}
+              onToggleExpanded={() => toggleStopExpansion(stop.remainingDays)}
+              stop={stop}
+            />
           ))}
         </ol>
       )}
@@ -536,8 +607,15 @@ function Timeline({
   );
 }
 
-function TimelineColumn({ stop }: { stop: TimelineStop }): React.ReactElement {
-  const [expanded, setExpanded] = useState(false);
+function TimelineColumn({
+  expanded,
+  onToggleExpanded,
+  stop
+}: {
+  expanded: boolean;
+  onToggleExpanded: () => void;
+  stop: TimelineStop;
+}): React.ReactElement {
   const overflow = stop.entries.length - TIMELINE_COLLAPSE_LIMIT;
   const collapsible = overflow > 0;
   const visible = collapsible && !expanded ? stop.entries.slice(0, TIMELINE_COLLAPSE_LIMIT) : stop.entries;
@@ -572,7 +650,7 @@ function TimelineColumn({ stop }: { stop: TimelineStop }): React.ReactElement {
       {collapsible && (
         <button
           className="timeline-more"
-          onClick={() => setExpanded((value) => !value)}
+          onClick={onToggleExpanded}
           type="button"
         >
           {expanded ? "收起" : `展开 +${overflow} 所`}
