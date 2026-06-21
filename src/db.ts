@@ -1,9 +1,9 @@
 import type {
   Env,
   ItemSnapshotRow,
+  NewDeadlineNotificationRow,
+  NewDeadlineNotificationWithItem,
   NormalizedItem,
-  NotificationRow,
-  NotificationWithItem,
   SubscriberRow
 } from "./types";
 
@@ -138,10 +138,43 @@ export async function getSnapshotCount(env: Env): Promise<number> {
   return row?.count ?? 0;
 }
 
+export async function getAppState(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB.prepare("SELECT value FROM app_state WHERE key = ?")
+    .bind(key)
+    .first<{ value: string }>();
+  return row?.value ?? null;
+}
+
+export async function setAppState(
+  env: Env,
+  key: string,
+  value: string,
+  now: string
+): Promise<void> {
+  await env.DB.prepare(
+    `
+      INSERT INTO app_state (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = excluded.updated_at
+    `
+  )
+    .bind(key, value, now)
+    .run();
+}
+
 export async function getSnapshots(env: Env): Promise<Map<string, ItemSnapshotRow>> {
   const result = await env.DB.prepare("SELECT * FROM item_snapshots").all<ItemSnapshotRow>();
   const rows = result.results ?? [];
   return new Map(rows.map((row) => [row.item_key, row]));
+}
+
+export async function getSnapshotItems(env: Env): Promise<NormalizedItem[]> {
+  const result = await env.DB.prepare(
+    "SELECT payload FROM item_snapshots ORDER BY item_key ASC"
+  ).all<{ payload: string }>();
+  return (result.results ?? []).map((row) => JSON.parse(row.payload) as NormalizedItem);
 }
 
 export async function upsertSnapshots(
@@ -172,44 +205,50 @@ export async function upsertSnapshots(
   await runBatchInChunks(env, statements);
 }
 
-export async function insertNotifications(
+export async function insertNewDeadlineNotifications(
   env: Env,
-  notifications: Array<{ item: NormalizedItem; kind: "added" | "changed" }>,
+  notifications: Array<{
+    item: NormalizedItem;
+    deadlineAt: string;
+  }>,
   now: string
 ): Promise<number> {
-  const statements = notifications.map(({ item, kind }) =>
+  const statements = notifications.map((notification) =>
     env.DB.prepare(
       `
-        INSERT OR IGNORE INTO notifications (
+        INSERT OR IGNORE INTO new_deadline_notifications (
           item_key,
-          kind,
-          content_hash,
+          deadline_at,
           payload,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?)
       `
-    ).bind(item.key, kind, item.contentHash, JSON.stringify(item), now)
+    ).bind(
+      notification.item.key,
+      notification.deadlineAt,
+      JSON.stringify(notification.item),
+      now
+    )
   );
   const results = await runBatchInChunks(env, statements);
   return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
 }
 
-export async function getPendingNotifications(
+export async function getPendingNewDeadlineNotifications(
   env: Env,
-  limit: number
-): Promise<NotificationWithItem[]> {
+  now: string
+): Promise<NewDeadlineNotificationWithItem[]> {
   const result = await env.DB.prepare(
     `
       SELECT *
-      FROM notifications
-      WHERE sent_at IS NULL
-      ORDER BY id ASC
-      LIMIT ?
+      FROM new_deadline_notifications
+      WHERE sent_at IS NULL AND deadline_at > ?
+      ORDER BY deadline_at ASC, id ASC
     `
   )
-    .bind(limit)
-    .all<NotificationRow>();
+    .bind(now)
+    .all<NewDeadlineNotificationRow>();
 
   return (result.results ?? []).map((row) => ({
     ...row,
@@ -217,13 +256,13 @@ export async function getPendingNotifications(
   }));
 }
 
-export async function markNotificationsSent(
+export async function markNewDeadlineNotificationsSent(
   env: Env,
   ids: number[],
   now: string
 ): Promise<void> {
   const statements = ids.map((id) =>
-    env.DB.prepare("UPDATE notifications SET sent_at = ? WHERE id = ?").bind(now, id)
+    env.DB.prepare("UPDATE new_deadline_notifications SET sent_at = ? WHERE id = ?").bind(now, id)
   );
   await runBatchInChunks(env, statements);
 }

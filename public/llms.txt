@@ -1,0 +1,46 @@
+# 保研 DDL 速查 (CS Baoyan Deadlines)
+
+> 计算机与电子信息方向保研（夏令营 / 预推免）截止时间的结构化数据。汇总自 CS-BAOYAN-DDL 与保研信息平台，按截止时间排序，每日更新。
+
+本站为 LLM / Agent 提供机器可读的 JSON 接口，可直接抓取，无需解析 HTML 页面。
+
+## 数据接口
+
+- [DDL JSON 数据](https://baoyan-mail.weijuebu.workers.dev/api/ddl): 全部未截止与已截止条目的结构化 JSON。GET 请求，无需鉴权，已开启 CORS（跨域可读）。部署到本站后，同源亦可通过相对路径 `/api/ddl` 访问。
+
+## 响应结构
+
+GET 返回 `application/json; charset=utf-8`：
+
+```json
+{
+  "ok": true,
+  "generatedAt": "ISO-8601 生成时间 (UTC)",
+  "timezone": "Asia/Shanghai",
+  "total": 0,
+  "items": []
+}
+```
+
+### items[] 中每个条目（DdlItem）的字段
+
+- `key`: 条目唯一标识 (string)
+- `school`: 学校名称，如 "北京大学" (string)
+- `institute`: 院系名称，可能为空字符串 (string)
+- `description`: 通知摘要，可能为空字符串 (string)
+- `deadlineAt`: 截止时间，ISO-8601 带时区 (string)
+- `deadlineText`: 截止时间的中文展示，东八区，如 "2026/06/21 23:59" (string)
+- `remainingDays`: 距今剩余自然天数，按东八区日历计算。0 = 今日截止，负数 = 已过 (number)
+- `remainingText`: 剩余时间中文展示，如 "今日截止" / "3 天后截止" / "已截止" (string)
+- `status`: 取值 `"today"` | `"future"` | `"expired"` (string)
+- `tier`: 学校层次，取值之一 `"Top2"` | `"华五"` | `"C9"` | `"985"` | `"211"` | `"其他"` (string)
+- `sourceGroup`: 来源分组标识，如 `"camp2026"`（夏令营）/ `"yutuimian2026"`（预推免）/ `"baoyanxinxi2026jsjby"`（保研信息平台）(string)
+- `sourceLabel`: 来源的中文展示，如 "2026 夏令营" (string)
+- `website`: 原始通知链接 (string, URL)
+
+## 使用建议
+
+- `items` 已按 `deadlineAt` 升序排序；同截止时间再按学校层次、校名排序。
+- 只看未来 DDL：过滤 `status !== "expired"`。
+- 按层次筛选用 `tier`；按来源筛选用 `sourceGroup`；按紧迫度筛选用 `remainingDays`。
+- 数据在边缘约缓存 5 分钟，`generatedAt` 为该次生成时刻。

@@ -1,9 +1,11 @@
 import {
   confirmSubscriberByToken,
   findSubscriberByEmail,
+  getSnapshotItems,
   unsubscribeByToken,
   upsertPendingSubscriber
 } from "./db";
+import { buildDdlResponse } from "./ddl";
 import { sendConfirmationEmail } from "./email";
 import { runCheck } from "./checker";
 import { createToken, tokenHash } from "./crypto";
@@ -33,6 +35,12 @@ export async function handleRequest(
     if (request.method === "GET" && url.pathname === "/api/health") {
       return jsonResponse({ ok: true, time: new Date().toISOString() });
     }
+    if (request.method === "GET" && url.pathname === "/api/ddl") {
+      return await handleDdl(env);
+    }
+    if (request.method === "OPTIONS" && url.pathname === "/api/ddl") {
+      return handleDdlPreflight();
+    }
     if (request.method === "GET" && url.pathname === "/api/admin/run-check") {
       return await handleManualRun(request, env, ctx);
     }
@@ -56,7 +64,7 @@ async function handleSubscribe(request: Request, env: Env): Promise<Response> {
   const existing = await findSubscriberByEmail(env, email);
   if (existing?.status === "active") {
     return htmlResponse(
-      renderMessagePage("订阅请求已收到", "如果该邮箱已经订阅，将继续收到后续摘要。")
+      renderMessagePage("订阅请求已收到", "如果该邮箱已经订阅，将继续收到后续 DDL 邮件。")
     );
   }
 
@@ -71,7 +79,7 @@ async function handleSubscribe(request: Request, env: Env): Promise<Response> {
   await sendConfirmationEmail(env, email, confirmUrl);
 
   return htmlResponse(
-    renderMessagePage("确认邮件已发送", "请查看邮箱并点击确认链接，确认后才会收到更新摘要。")
+    renderMessagePage("确认邮件已发送", "请查看邮箱并点击确认链接，确认后才会收到 DDL 邮件。")
   );
 }
 
@@ -90,7 +98,9 @@ async function handleConfirm(url: URL, env: Env): Promise<Response> {
     return htmlResponse(renderMessagePage("确认链接无效", "链接可能已经使用或已经过期。"), 400);
   }
 
-  return htmlResponse(renderMessagePage("订阅成功", "之后有保研通知更新时，你会收到邮件摘要。"));
+  return htmlResponse(
+    renderMessagePage("订阅成功", "之后会收到每日 DDL 汇总和新增 DDL 提醒。")
+  );
 }
 
 async function handleUnsubscribe(url: URL, env: Env): Promise<Response> {
@@ -104,7 +114,7 @@ async function handleUnsubscribe(url: URL, env: Env): Promise<Response> {
     return htmlResponse(renderMessagePage("退订链接无效", "链接可能已经失效。"), 400);
   }
 
-  return htmlResponse(renderMessagePage("退订成功", "该邮箱之后不会再收到保研通知摘要。"));
+  return htmlResponse(renderMessagePage("退订成功", "该邮箱之后不会再收到保研通知邮件。"));
 }
 
 async function handleManualRun(
@@ -120,6 +130,28 @@ async function handleManualRun(
   ctx.waitUntil(resultPromise);
   const result = await resultPromise;
   return jsonResponse({ ok: true, result });
+}
+
+async function handleDdl(env: Env): Promise<Response> {
+  const response = buildDdlResponse(await getSnapshotItems(env));
+  return jsonResponse(response, 200, {
+    "cache-control": "public, max-age=300, s-maxage=900",
+    // 允许 LLM / Agent 在浏览器端跨域抓取结构化数据
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, OPTIONS"
+  });
+}
+
+function handleDdlPreflight(): Response {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET, OPTIONS",
+      "access-control-allow-headers": "*",
+      "access-control-max-age": "86400"
+    }
+  });
 }
 
 async function readEmailFromRequest(request: Request): Promise<string> {
@@ -167,11 +199,16 @@ function htmlResponse(html: string, status = 200): Response {
   });
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
+function jsonResponse(
+  body: unknown,
+  status = 200,
+  extraHeaders: Record<string, string> = {}
+): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
-      "content-type": "application/json; charset=utf-8"
+      "content-type": "application/json; charset=utf-8",
+      ...extraHeaders
     }
   });
 }
@@ -180,7 +217,7 @@ function renderSubscribePage(): string {
   return renderPage(
     "保研通知订阅",
     `
-      <p class="lead">订阅后，系统会在发现 CS-BAOYAN-DDL 数据更新时发送每日邮件摘要。</p>
+      <p class="lead">订阅后，系统会发送未来 15 天 DDL 汇总和新增 DDL 提醒。</p>
       <form action="/api/subscribe" method="post">
         <label for="email">邮箱地址</label>
         <div class="field">

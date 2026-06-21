@@ -1,4 +1,10 @@
-import type { Env, NotificationWithItem, SubscriberRow } from "./types";
+import type {
+  DeadlineReminderWithItem,
+  Env,
+  NewDeadlineNotificationWithItem,
+  SubscriberRow
+} from "./types";
+import { getSchoolTierTags } from "./source";
 
 const ALIYUN_DM_ENDPOINT = "https://dm.aliyuncs.com/";
 const ALIYUN_DM_VERSION = "2015-11-23";
@@ -34,14 +40,15 @@ export async function sendConfirmationEmail(
   });
 }
 
-export async function sendSummaryEmails(
+export async function sendDailyDeadlineDigestEmails(
   env: Env,
   subscribers: SubscriberRow[],
-  notifications: NotificationWithItem[],
+  items: DeadlineReminderWithItem[],
   baseUrl: string,
-  chunkIndex: number
+  chunkIndex: number,
+  now: Date
 ): Promise<SendEmailResult> {
-  const subject = `保研通知更新摘要：${notifications.length} 条`;
+  const subject = `保研通知未来 15 天 DDL 汇总：${items.length} 条`;
   const messageIds: string[] = [];
 
   for (const subscriber of subscribers) {
@@ -51,36 +58,110 @@ export async function sendSummaryEmails(
     const result = await sendAliyunDirectMail(env, {
       toAddress: subscriber.email,
       subject,
-      htmlBody: renderSummaryEmail(notifications, unsubscribeUrl)
+      htmlBody: renderDailyDeadlineDigestEmail(items, unsubscribeUrl, now)
     });
     if (result.messageId !== null) {
       messageIds.push(result.messageId);
     }
   }
 
-  return { messageId: messageIds.length > 0 ? messageIds.join(",") : `batch-${chunkIndex}` };
+  return {
+    messageId: messageIds.length > 0 ? messageIds.join(",") : `daily-deadline-${chunkIndex}`
+  };
 }
 
-export function renderSummaryEmail(
-  notifications: NotificationWithItem[],
-  unsubscribeUrl: string
+export async function sendNewDeadlineNotificationEmails(
+  env: Env,
+  subscribers: SubscriberRow[],
+  notifications: NewDeadlineNotificationWithItem[],
+  baseUrl: string,
+  chunkIndex: number,
+  now: Date
+): Promise<SendEmailResult> {
+  const subject = `保研通知新增 DDL：${notifications.length} 条`;
+  const messageIds: string[] = [];
+
+  for (const subscriber of subscribers) {
+    const unsubscribeUrl = `${baseUrl}/api/unsubscribe?token=${encodeURIComponent(
+      subscriber.unsubscribe_token
+    )}`;
+    const result = await sendAliyunDirectMail(env, {
+      toAddress: subscriber.email,
+      subject,
+      htmlBody: renderNewDeadlineNotificationEmail(notifications, unsubscribeUrl, now)
+    });
+    if (result.messageId !== null) {
+      messageIds.push(result.messageId);
+    }
+  }
+
+  return {
+    messageId: messageIds.length > 0 ? messageIds.join(",") : `new-deadline-${chunkIndex}`
+  };
+}
+
+export function renderDailyDeadlineDigestEmail(
+  items: DeadlineReminderWithItem[],
+  unsubscribeUrl: string,
+  now: Date = new Date()
 ): string {
-  const addedCount = notifications.filter((notification) => notification.kind === "added").length;
-  const changedCount = notifications.length - addedCount;
-  const entries = notifications
-    .map((notification) => {
-      const item = notification.item;
-      const kindText = notification.kind === "added" ? "新增" : "变更";
-      const tags = item.tags.length > 0 ? item.tags.join(" / ") : "未标注";
+  return renderDeadlineListEmail({
+    title: "保研通知未来 15 天 DDL 汇总",
+    eyebrow: "未来 15 天 DDL 汇总",
+    summaryTitle: `未来 15 天内共有 ${items.length} 条保研通知即将截止`,
+    summaryMeta: `${formatDeadlineBucketSummary(items, now)}。请以学校官网原始通知为准。`,
+    entries: items,
+    unsubscribeUrl,
+    now,
+    footerReason: "订阅了保研通知摘要和 DDL 汇总"
+  });
+}
+
+export function renderNewDeadlineNotificationEmail(
+  notifications: NewDeadlineNotificationWithItem[],
+  unsubscribeUrl: string,
+  now: Date = new Date()
+): string {
+  const entries = notifications.map((notification) => ({
+    ...notification,
+    reminder_window_days: 15
+  }));
+  return renderDeadlineListEmail({
+    title: "保研通知新增 DDL",
+    eyebrow: "新增 DDL",
+    summaryTitle: `本次发现 ${notifications.length} 条新增 DDL`,
+    summaryMeta: "这些通知是系统首次发现且带有未来截止时间的项目。请以学校官网原始通知为准。",
+    entries,
+    unsubscribeUrl,
+    now,
+    footerReason: "订阅了保研通知摘要和新增 DDL 提醒"
+  });
+}
+
+function renderDeadlineListEmail(params: {
+  title: string;
+  eyebrow: string;
+  summaryTitle: string;
+  summaryMeta: string;
+  entries: DeadlineReminderWithItem[];
+  unsubscribeUrl: string;
+  now: Date;
+  footerReason: string;
+}): string {
+  const entries = params.entries
+    .map((entry) => {
+      const item = entry.item;
+      const urgencyText = formatReminderUrgency(entry, params.now);
+      const schoolTier = getSchoolTierTags(item.name).join(" / ");
       const description =
         item.description === "" || item.description === "_No response_"
           ? "暂无补充说明"
           : item.description;
-      const deadlineText = formatDeadline(item.deadline);
+      const deadlineText = formatDeadline(entry.deadline_at);
       return `
         <section class="notice">
           <div class="notice-head">
-            <span class="badge">${escapeHtml(kindText)}</span>
+            <span class="badge">${escapeHtml(urgencyText)}</span>
             <span class="source">${escapeHtml(formatSourceGroup(item.sourceGroup))}</span>
           </div>
           <h2>${escapeHtml(item.name)}</h2>
@@ -91,8 +172,8 @@ export function renderSummaryEmail(
               <dd>${escapeHtml(deadlineText)}</dd>
             </div>
             <div>
-              <dt>标签</dt>
-              <dd>${escapeHtml(tags)}</dd>
+              <dt>学校层次</dt>
+              <dd>${escapeHtml(schoolTier)}</dd>
             </div>
           </dl>
           <p class="description">${escapeHtml(truncateText(description, 220))}</p>
@@ -107,18 +188,20 @@ export function renderSummaryEmail(
     .join("");
 
   return renderLayout(
-    `保研通知更新摘要`,
+    params.title,
     `
       <section class="summary">
-        <p class="eyebrow">CS-BAOYAN-DDL 更新</p>
-        <p class="summary-title">本次发现 ${notifications.length} 条保研通知更新</p>
-        <p class="summary-meta">新增 ${addedCount} 条，变更 ${changedCount} 条。请以学校官网原始通知为准。</p>
+        <p class="eyebrow">${escapeHtml(params.eyebrow)}</p>
+        <p class="summary-title">${escapeHtml(params.summaryTitle)}</p>
+        <p class="summary-meta">${escapeHtml(params.summaryMeta)}</p>
       </section>
       ${entries}
       <p class="footer">
-        数据来源：CS-BAOYAN-DDL。你收到这封邮件是因为订阅了保研通知摘要。
+        数据来源：CS-BAOYAN-DDL 和保研信息平台补充源。你收到这封邮件是因为${escapeHtml(
+          params.footerReason
+        )}。
         <br>
-        不想继续接收邮件，可以点击 <a href="${escapeAttribute(unsubscribeUrl)}">退订链接</a>。
+        不想继续接收邮件，可以点击 <a href="${escapeAttribute(params.unsubscribeUrl)}">退订链接</a>。
       </p>
     `
   );
@@ -306,12 +389,56 @@ function formatDeadline(deadline: string): string {
 }
 
 function formatSourceGroup(sourceGroup: string): string {
+  if (sourceGroup === "baoyanxinxi2026jsjby") {
+    return "保研信息平台";
+  }
   const match = /^(camp|yutuimian)(\d{4})$/.exec(sourceGroup);
   if (match === null) {
     return sourceGroup;
   }
   const type = match[1] === "camp" ? "夏令营" : "预推免";
   return `${match[2]} ${type}`;
+}
+
+function formatReminderUrgency(reminder: DeadlineReminderWithItem, now: Date): string {
+  if (isSameShanghaiDate(new Date(reminder.deadline_at), now)) {
+    return "今日截止";
+  }
+  return `${reminder.reminder_window_days} 天内截止`;
+}
+
+function formatDeadlineBucketSummary(reminders: DeadlineReminderWithItem[], now: Date): string {
+  const todayCount = reminders.filter((reminder) =>
+    isSameShanghaiDate(new Date(reminder.deadline_at), now)
+  ).length;
+  const oneDayCount = reminders.filter(
+    (reminder) =>
+      reminder.reminder_window_days === 1 &&
+      !isSameShanghaiDate(new Date(reminder.deadline_at), now)
+  ).length;
+  const threeDayCount = reminders.filter(
+    (reminder) => reminder.reminder_window_days === 3
+  ).length;
+  const sevenDayCount = reminders.filter(
+    (reminder) => reminder.reminder_window_days === 7
+  ).length;
+  const fifteenDayCount = reminders.filter(
+    (reminder) => reminder.reminder_window_days === 15
+  ).length;
+  return `今日截止 ${todayCount} 条，1 天内 ${oneDayCount} 条，3 天内 ${threeDayCount} 条，7 天内 ${sevenDayCount} 条，15 天内 ${fifteenDayCount} 条`;
+}
+
+function isSameShanghaiDate(left: Date, right: Date): boolean {
+  return formatShanghaiDate(left) === formatShanghaiDate(right);
+}
+
+function formatShanghaiDate(date: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
 }
 
 function truncateText(value: string, maxLength: number): string {

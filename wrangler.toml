@@ -5,6 +5,7 @@ workers_dev = true
 
 [vars]
 SOURCE_URL = "https://raw.githubusercontent.com/CS-BAOYAN/CS-BAOYAN-DDL/main/src/data/schools.json"
+BAOYANXINXI_SOURCE_URL = "https://www.baoyanxinxi.cn/2026jsjby/"
 APP_BASE_URL = "https://baoyan.example.com"
 MAIL_PROVIDER = "aliyun"
 SENDER_NAME = "保研通知"
@@ -12,7 +13,6 @@ ALIYUN_DM_ACCOUNT_NAME = "notify@example.com"
 ALIYUN_DM_ENDPOINT = "https://dm.aliyuncs.com/"
 ALIYUN_REGION_ID = "cn-hangzhou"
 BATCH_SIZE = "50"
-ITEMS_PER_EMAIL = "30"
 
 [triggers]
 # Cloudflare Cron 使用 UTC 时间。这里是每天北京时间 09:00。

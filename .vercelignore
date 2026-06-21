@@ -1,10 +1,11 @@
 node_modules/
 .wrangler/
+.git/
 .dev.vars
 .dev.vars.*
 .env
 .env.*
 dist/
 coverage/
+outputs/
 *.log
-.vercel

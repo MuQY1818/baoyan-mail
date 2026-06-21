@@ -2,9 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   buildAliyunSingleSendMailParams,
   percentEncode,
+  renderDailyDeadlineDigestEmail,
+  renderNewDeadlineNotificationEmail,
   signAliyunRpcParams
 } from "../src/email";
-import type { Env } from "../src/types";
+import type {
+  DeadlineReminderWithItem,
+  Env,
+  NewDeadlineNotificationWithItem
+} from "../src/types";
 
 describe("aliyun direct mail", () => {
   it("builds SingleSendMail params", () => {
@@ -61,5 +67,80 @@ describe("aliyun direct mail", () => {
     );
 
     expect(signature).toBe("YVCycQ0WO1qOlYrxNw8t/k/cfmo=");
+  });
+});
+
+describe("daily deadline digest email", () => {
+  it("renders daily digest summary and links", () => {
+    const reminder: DeadlineReminderWithItem = {
+      id: 1,
+      item_key: "item-key",
+      deadline_at: "2026-06-09T16:00:00.000Z",
+      reminder_window_days: 3,
+      payload: "",
+      created_at: "2026-06-07T01:00:00.000Z",
+      sent_at: null,
+      item: {
+        key: "item-key",
+        contentHash: "content-hash",
+        sourceGroup: "camp2026",
+        name: "南京大学",
+        institute: "计算机学院",
+        description: "夏令营通知",
+        deadline: "2026-06-10T00:00:00+08:00",
+        website: "https://example.com/notice",
+        tags: ["C9"]
+      }
+    };
+
+    const html = renderDailyDeadlineDigestEmail(
+      [reminder],
+      "https://example.com/api/unsubscribe?token=token",
+      new Date("2026-06-07T01:00:00.000Z")
+    );
+
+    expect(html).toContain("保研通知未来 15 天 DDL 汇总");
+    expect(html).toContain("未来 15 天内共有 1 条保研通知即将截止");
+    expect(html).toContain("3 天内截止");
+    expect(html).toContain("学校层次");
+    expect(html).toContain("华五");
+    expect(html).toContain("https://example.com/notice");
+    expect(html).toContain("https://example.com/api/unsubscribe?token=token");
+  });
+});
+
+describe("new deadline notification email", () => {
+  it("renders new deadline summary and links", () => {
+    const notification: NewDeadlineNotificationWithItem = {
+      id: 1,
+      item_key: "item-key",
+      deadline_at: "2026-06-09T16:00:00.000Z",
+      payload: "",
+      created_at: "2026-06-07T01:00:00.000Z",
+      sent_at: null,
+      item: {
+        key: "item-key",
+        contentHash: "content-hash",
+        sourceGroup: "baoyanxinxi2026jsjby",
+        name: "北京大学",
+        institute: "计算机学院",
+        description: "夏令营通知",
+        deadline: "2026-06-10T00:00:00+08:00",
+        website: "https://example.com/notice",
+        tags: ["保研信息平台", "计算机大类"]
+      }
+    };
+
+    const html = renderNewDeadlineNotificationEmail(
+      [notification],
+      "https://example.com/api/unsubscribe?token=token",
+      new Date("2026-06-07T01:00:00.000Z")
+    );
+
+    expect(html).toContain("保研通知新增 DDL");
+    expect(html).toContain("本次发现 1 条新增 DDL");
+    expect(html).toContain("Top2");
+    expect(html).not.toContain("计算机大类");
+    expect(html).toContain("https://example.com/notice");
   });
 });
