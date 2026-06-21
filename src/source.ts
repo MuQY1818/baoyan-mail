@@ -5,6 +5,11 @@ const DEFAULT_SOURCE_URL =
   "https://raw.githubusercontent.com/CS-BAOYAN/CS-BAOYAN-DDL/main/src/data/schools.json";
 const DEFAULT_BAOYANXINXI_SOURCE_URL = "https://www.baoyanxinxi.cn/2026jsjby/";
 export const BAOYANXINXI_SOURCE_GROUP = "baoyanxinxi2026jsjby";
+const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
+const SHANGHAI_YEAR_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: SHANGHAI_TIME_ZONE,
+  year: "numeric"
+});
 
 const UNKNOWN_DEADLINE_VALUES = new Set([
   "",
@@ -246,7 +251,9 @@ export async function fetchSourceItemsWithStats(env: Env): Promise<FetchSourceIt
 
   const data = await response.json();
   const csRecords = extractRecords(data);
-  const csItems = normalizeCsRecords(csRecords);
+  const normalizedCsItems = normalizeCsRecords(csRecords);
+  const dedupedCsItems = dedupeSourceItems(normalizedCsItems);
+  const csItems = dedupedCsItems.items;
   const baoyanXinxiUrl = env.BAOYANXINXI_SOURCE_URL ?? DEFAULT_BAOYANXINXI_SOURCE_URL;
   const baoyanXinxiResult = await fetchBaoyanXinxiItems(baoyanXinxiUrl);
   const merged = mergeSourceItems(csItems, baoyanXinxiResult.items, baoyanXinxiResult.stats);
@@ -260,8 +267,8 @@ export async function fetchSourceItemsWithStats(env: Env): Promise<FetchSourceIt
         url: sourceUrl,
         rawCount: csRecords.length,
         acceptedCount: csItems.length,
-        filteredCount: csRecords.length - csItems.length,
-        duplicateCount: 0,
+        filteredCount: csRecords.length - normalizedCsItems.length,
+        duplicateCount: dedupedCsItems.duplicateCount,
         supplementedDeadlineCount: 0
       },
       merged.baoyanXinxiStats
@@ -271,7 +278,8 @@ export async function fetchSourceItemsWithStats(env: Env): Promise<FetchSourceIt
 }
 
 export async function normalizeSourceData(data: unknown): Promise<NormalizedItem[]> {
-  return (await finalizeSourceItems(normalizeCsRecords(extractRecords(data)))).items;
+  return (await finalizeSourceItems(dedupeSourceItems(normalizeCsRecords(extractRecords(data))).items))
+    .items;
 }
 
 export function normalizeBaoyanXinxiHtml(
@@ -505,6 +513,107 @@ function mergeSourceItems(
   }
 
   return { items, baoyanXinxiStats: stats };
+}
+
+function dedupeSourceItems<T extends SourceItemInput | TaggedSourceItem>(
+  entries: T[]
+): { items: T[]; duplicateCount: number } {
+  const items: T[] = [];
+  const keyToIndex = new Map<string, number>();
+  let duplicateCount = 0;
+
+  for (const entry of entries) {
+    const item = getSourceItemInput(entry);
+    const duplicateKey = getSourceDuplicateKey(item);
+    if (duplicateKey === "") {
+      items.push(entry);
+      continue;
+    }
+
+    const existingIndex = keyToIndex.get(duplicateKey);
+    if (existingIndex === undefined) {
+      keyToIndex.set(duplicateKey, items.length);
+      items.push(entry);
+      continue;
+    }
+
+    duplicateCount += 1;
+    const existing = items[existingIndex];
+    if (existing !== undefined && shouldPreferSourceItem(item, getSourceItemInput(existing))) {
+      items[existingIndex] = entry;
+    }
+  }
+
+  return { items, duplicateCount };
+}
+
+function getSourceItemInput(entry: SourceItemInput | TaggedSourceItem): SourceItemInput {
+  return "item" in entry ? entry.item : entry;
+}
+
+function getSourceDuplicateKey(item: SourceItemInput): string {
+  const canonicalUrl = canonicalizeNotificationUrl(item.website);
+  if (canonicalUrl === "") {
+    return "";
+  }
+  return [
+    canonicalUrl,
+    normalizeDuplicateText(item.name),
+    normalizeDuplicateText(item.institute),
+    getComparableDeadlineKey(item.deadline)
+  ].join("\u0000");
+}
+
+function shouldPreferSourceItem(candidate: SourceItemInput, current: SourceItemInput): boolean {
+  const candidateYearDistance = getSourceDeadlineYearDistance(candidate);
+  const currentYearDistance = getSourceDeadlineYearDistance(current);
+  if (candidateYearDistance !== currentYearDistance) {
+    return candidateYearDistance < currentYearDistance;
+  }
+
+  const candidateDescriptionLength = getUsefulTextLength(candidate.description);
+  const currentDescriptionLength = getUsefulTextLength(current.description);
+  if (candidateDescriptionLength !== currentDescriptionLength) {
+    return candidateDescriptionLength > currentDescriptionLength;
+  }
+
+  return candidate.sourceGroup.localeCompare(current.sourceGroup) < 0;
+}
+
+function getSourceDeadlineYearDistance(item: SourceItemInput): number {
+  const sourceYear = getSourceGroupYear(item.sourceGroup);
+  const deadlineYear = getDeadlineYear(item.deadline);
+  if (sourceYear === null || deadlineYear === null) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return Math.abs(sourceYear - deadlineYear);
+}
+
+function getSourceGroupYear(sourceGroup: string): number | null {
+  const match = /\d{4}/u.exec(sourceGroup);
+  return match === null ? null : Number.parseInt(match[0], 10);
+}
+
+function getDeadlineYear(value: string): number | null {
+  const deadline = parseComparableDeadline(value);
+  if (deadline === null) {
+    return null;
+  }
+  return Number.parseInt(SHANGHAI_YEAR_FORMATTER.format(deadline), 10);
+}
+
+function getComparableDeadlineKey(value: string): string {
+  const deadline = parseComparableDeadline(value);
+  return deadline === null ? decodeHtml(value).trim() : deadline.toISOString();
+}
+
+function normalizeDuplicateText(value: string): string {
+  return value.replace(/\s+/gu, "").replace(/[（(].*?[）)]/gu, "").toLowerCase();
+}
+
+function getUsefulTextLength(value: string): number {
+  const trimmed = value.trim();
+  return trimmed === "_No response_" ? 0 : trimmed.length;
 }
 
 async function finalizeSourceItems(

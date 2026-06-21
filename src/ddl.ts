@@ -1,4 +1,4 @@
-import { getSchoolTierTags } from "./source";
+import { canonicalizeNotificationUrl, getSchoolTierTags } from "./source";
 import type { NormalizedItem } from "./types";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -39,6 +39,7 @@ export function buildDdlResponse(items: NormalizedItem[], now = new Date()): Ddl
   const ddlItems = items
     .map((item) => serializeDdlItem(item, now))
     .filter((item): item is DdlApiItem => item !== null)
+    .reduce(dedupeDdlItems(), [])
     .sort(compareDdlItems);
 
   return {
@@ -48,6 +49,75 @@ export function buildDdlResponse(items: NormalizedItem[], now = new Date()): Ddl
     total: ddlItems.length,
     items: ddlItems
   };
+}
+
+function dedupeDdlItems(): (items: DdlApiItem[], item: DdlApiItem) => DdlApiItem[] {
+  const keyToIndex = new Map<string, number>();
+  return (items, item) => {
+    const duplicateKey = getDdlDuplicateKey(item);
+    if (duplicateKey === "") {
+      items.push(item);
+      return items;
+    }
+
+    const existingIndex = keyToIndex.get(duplicateKey);
+    if (existingIndex === undefined) {
+      keyToIndex.set(duplicateKey, items.length);
+      items.push(item);
+      return items;
+    }
+
+    if (shouldPreferDdlItem(item, items[existingIndex]!)) {
+      items[existingIndex] = item;
+    }
+    return items;
+  };
+}
+
+function getDdlDuplicateKey(item: DdlApiItem): string {
+  const canonicalUrl = canonicalizeNotificationUrl(item.website);
+  if (canonicalUrl === "") {
+    return "";
+  }
+  return [
+    canonicalUrl,
+    normalizeDuplicateText(item.school),
+    normalizeDuplicateText(item.institute),
+    item.deadlineAt
+  ].join("\u0000");
+}
+
+function shouldPreferDdlItem(candidate: DdlApiItem, current: DdlApiItem): boolean {
+  const candidateYearDistance = getSourceDeadlineYearDistance(candidate);
+  const currentYearDistance = getSourceDeadlineYearDistance(current);
+  if (candidateYearDistance !== currentYearDistance) {
+    return candidateYearDistance < currentYearDistance;
+  }
+
+  const descriptionCompare = candidate.description.length - current.description.length;
+  if (descriptionCompare !== 0) {
+    return descriptionCompare > 0;
+  }
+
+  return candidate.sourceGroup.localeCompare(current.sourceGroup) < 0;
+}
+
+function getSourceDeadlineYearDistance(item: DdlApiItem): number {
+  const sourceYear = getSourceGroupYear(item.sourceGroup);
+  const deadlineYear = Number.parseInt(formatShanghaiDate(new Date(item.deadlineAt)).slice(0, 4), 10);
+  if (sourceYear === null || Number.isNaN(deadlineYear)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return Math.abs(sourceYear - deadlineYear);
+}
+
+function getSourceGroupYear(sourceGroup: string): number | null {
+  const match = /\d{4}/u.exec(sourceGroup);
+  return match === null ? null : Number.parseInt(match[0], 10);
+}
+
+function normalizeDuplicateText(value: string): string {
+  return value.replace(/\s+/gu, "").replace(/[（(].*?[）)]/gu, "").toLowerCase();
 }
 
 export function serializeDdlItem(item: NormalizedItem, now = new Date()): DdlApiItem | null {

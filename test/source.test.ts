@@ -329,6 +329,37 @@ describe("source normalization", () => {
     }
   });
 
+  it("dedupes CS records with the same URL, school, institute, and deadline across groups", async () => {
+    const items = await normalizeSourceData({
+      camp2027: [
+        {
+          name: "中国科学技术大学",
+          institute: "网络空间安全学院",
+          description: "简短介绍",
+          deadline: "2026-06-23T23:59:59+08:00",
+          website: "https://cybersec.ustc.edu.cn/2026/0520/c23826a741220/page.htm",
+          tags: ["华五"]
+        }
+      ],
+      camp2026: [
+        {
+          name: "中国科学技术大学",
+          institute: "网络空间安全学院",
+          description: "更完整的网信安全科学营介绍",
+          deadline: "2026-06-23T23:59:59+08:00",
+          website: "https://cybersec.ustc.edu.cn/2026/0520/c23826a741220/page.htm",
+          tags: ["华五"]
+        }
+      ]
+    });
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      sourceGroup: "camp2026",
+      description: "更完整的网信安全科学营介绍"
+    });
+  });
+
   it("initializes BaoyanXinxi supplemental snapshots without historical notifications", async () => {
     const db = new FakeD1Database();
     const originalSourceItems = await normalizeSourceData({
@@ -685,6 +716,43 @@ describe("DDL API", () => {
     });
     expect(response.items[0]).not.toHaveProperty("contentHash");
     expect(response.items[0]).not.toHaveProperty("payload");
+  });
+
+  it("dedupes existing snapshots with the same URL, school, institute, and deadline", () => {
+    const response = buildDdlResponse(
+      [
+        {
+          key: "wrong-year",
+          contentHash: "hash",
+          sourceGroup: "camp2027",
+          name: "中国科学技术大学",
+          institute: "网络空间安全学院",
+          description: "简短介绍",
+          deadline: "2026-06-23T23:59:59+08:00",
+          website: "https://cybersec.ustc.edu.cn/2026/0520/c23826a741220/page.htm",
+          tags: []
+        },
+        {
+          key: "right-year",
+          contentHash: "hash",
+          sourceGroup: "camp2026",
+          name: "中国科学技术大学",
+          institute: "网络空间安全学院",
+          description: "更完整的网信安全科学营介绍",
+          deadline: "2026-06-23T23:59:59+08:00",
+          website: "https://cybersec.ustc.edu.cn/2026/0520/c23826a741220/page.htm",
+          tags: []
+        }
+      ],
+      now
+    );
+
+    expect(response.total).toBe(1);
+    expect(response.items[0]).toMatchObject({
+      key: "right-year",
+      sourceGroup: "camp2026",
+      sourceLabel: "2026 夏令营"
+    });
   });
 
   it("serves public DDL data without admin authorization", async () => {
