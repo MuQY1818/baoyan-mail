@@ -69,6 +69,7 @@ type RangeFilter = "today" | "3" | "7" | "15" | "future";
 type SourceFilter = "all" | "cs" | "baoyanxinxi" | "manual";
 type RecentFilter = "all" | "new" | "updated";
 type ViewMode = "cards" | "table";
+type ThemeMode = "light" | "dark";
 
 const TIER_OPTIONS: TierFilter[] = ["Top2", "华五", "C9", "985", "211", "其他"];
 const TIER_RANK: Record<TierFilter, number> = {
@@ -107,11 +108,11 @@ const RECENT_OPTIONS: Array<{ value: RecentFilter; label: string }> = [
 ];
 const SUBSCRIBE_URL = "https://baoyan-mail.weijuebu.workers.dev/";
 const API_URL = "https://baoyan-mail.weijuebu.workers.dev/api/ddl";
-const MISSING_LINK_URL = "/api/missing-link";
 const LLMS_TXT_URL = "/llms.txt";
 const RECENT_DAYS = 7;
 const FAVORITE_STORAGE_KEY = "baoyan-ddl-favorites";
 const READ_STORAGE_KEY = "baoyan-ddl-read";
+const THEME_STORAGE_KEY = "baoyan-ddl-theme";
 
 interface RailBucket {
   label: string;
@@ -130,6 +131,7 @@ const RAIL_BUCKETS: RailBucket[] = [
 
 function App(): React.ReactElement {
   const initialFilters = useMemo(readFiltersFromUrl, []);
+  const [theme, setTheme] = useState<ThemeMode>(readInitialTheme);
   const [data, setData] = useState<DdlResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -178,6 +180,16 @@ function App(): React.ReactElement {
   useEffect(() => {
     writeFiltersToUrl({ activeTiers, query, range, recent, source, viewMode });
   }, [activeTiers, query, range, recent, source, viewMode]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      // Ignore storage failures; the visual state still applies for this session.
+    }
+  }, [theme]);
 
   const futureItems = useMemo(
     () => data?.items.filter((item) => item.status !== "expired") ?? [],
@@ -291,6 +303,10 @@ function App(): React.ReactElement {
     setActiveTiers(new Set(TIER_OPTIONS));
   }
 
+  function toggleTheme(): void {
+    setTheme((current) => (current === "dark" ? "light" : "dark"));
+  }
+
   return (
     <main className="shell">
       <section className="hero" aria-labelledby="page-title">
@@ -302,16 +318,10 @@ function App(): React.ReactElement {
           </p>
         </div>
         <div className="hero-actions">
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
           <a className="subscribe-link" href={SUBSCRIBE_URL}>
             订阅每日邮件
           </a>
-          <button
-            className="quiet-action"
-            onClick={() => downloadIcs(visibleItems, "baoyan-ddl-filtered")}
-            type="button"
-          >
-            导出日历
-          </button>
           <span className="updated">{formatGeneratedAt(data?.lastSyncedAt ?? data?.generatedAt)}</span>
         </div>
       </section>
@@ -429,9 +439,6 @@ function App(): React.ReactElement {
             <SummaryCell label="当前显示" value={visibleItems.length} />
           </section>
 
-          <SourceStatus data={data} />
-          <MissingLinkPanel />
-
           {isLoading ? (
             <StateMessage title="正在校准刻度" message="正在读取最新 DDL 数据。" />
           ) : error !== null ? (
@@ -500,88 +507,28 @@ function ApiHint(): React.ReactElement {
   );
 }
 
-function SourceStatus({ data }: { data: DdlResponse | null }): React.ReactElement | null {
-  if (data === null) {
-    return null;
-  }
+function ThemeToggle({
+  onToggle,
+  theme
+}: {
+  onToggle: () => void;
+  theme: ThemeMode;
+}): React.ReactElement {
+  const isDark = theme === "dark";
   return (
-    <section className="source-status" aria-label="数据源状态">
-      <div>
-        <strong>源站同步</strong>
-        <span>{formatGeneratedAt(data.lastSyncedAt ?? data.generatedAt)}</span>
-      </div>
-      <div>
-        <strong>宽限显示</strong>
-        <span>{data.sourceStats.reduce((sum, stat) => sum + stat.grace, 0)} 条</span>
-      </div>
-      <div>
-        <strong>已隐藏 stale</strong>
-        <span>{data.staleCount} 条</span>
-      </div>
-      <div className="source-status-list">
-        {data.sourceStats.map((stat) => (
-          <span key={stat.sourceGroup}>
-            {stat.sourceLabel} {stat.total}
-          </span>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function MissingLinkPanel(): React.ReactElement {
-  const [status, setStatus] = useState<string>("");
-
-  async function submitMissingLink(event: React.FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const formData = new FormData(form);
-    setStatus("提交中");
-    try {
-      const response = await fetch(MISSING_LINK_URL, {
-        method: "POST",
-        body: formData
-      });
-      if (!response.ok) {
-        throw new Error(`提交失败 ${response.status}`);
-      }
-      form.reset();
-      setStatus("已提交，等待人工审核");
-    } catch (submitError) {
-      setStatus(submitError instanceof Error ? submitError.message : String(submitError));
-    }
-  }
-
-  return (
-    <details className="missing-panel">
-      <summary>提交缺漏链接</summary>
-      <form className="missing-form" onSubmit={(event) => void submitMissingLink(event)}>
-        <label>
-          原始链接
-          <input name="website" required type="url" placeholder="https://..." />
-        </label>
-        <label>
-          学校
-          <input name="name" placeholder="可选，知道就填" />
-        </label>
-        <label>
-          院系
-          <input name="institute" placeholder="可选" />
-        </label>
-        <label>
-          截止时间
-          <input name="deadline" placeholder="例如 2026-06-30 23:59" />
-        </label>
-        <label className="missing-form-wide">
-          备注
-          <input name="note" placeholder="方向、来源说明或需要人工确认的点" />
-        </label>
-        <button className="chip chip-active" type="submit">
-          提交审核
-        </button>
-        {status !== "" && <span className="missing-status">{status}</span>}
-      </form>
-    </details>
+    <button
+      aria-label={isDark ? "切换到白昼模式" : "切换到夜间模式"}
+      className={isDark ? "theme-toggle theme-toggle-dark" : "theme-toggle"}
+      onClick={onToggle}
+      type="button"
+    >
+      <span className="theme-toggle-track" aria-hidden="true">
+        <span>昼</span>
+        <span>夜</span>
+        <span className="theme-toggle-thumb" />
+      </span>
+      <span className="theme-toggle-label">{isDark ? "夜间" : "白昼"}</span>
+    </button>
   );
 }
 
@@ -693,9 +640,6 @@ function DdlCard({
           </button>
           <button className="icon-action" onClick={onToggleRead} type="button">
             {read ? "未读" : "已读"}
-          </button>
-          <button className="icon-action" onClick={() => downloadIcs([item], item.key)} type="button">
-            日历
           </button>
         </div>
       </article>
@@ -1125,6 +1069,18 @@ function truncate(value: string, maxLength: number): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
 }
 
+function readInitialTheme(): ThemeMode {
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === "light" || stored === "dark") {
+      return stored;
+    }
+  } catch {
+    // Fall back to system preference below.
+  }
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
 function readFiltersFromUrl(): {
   query: string;
   range: RangeFilter;
@@ -1237,57 +1193,6 @@ function isRecentlyUpdated(item: DdlItem): boolean {
     return false;
   }
   return item.firstSeenAt === null || item.updatedAt !== item.firstSeenAt;
-}
-
-function downloadIcs(items: DdlItem[], filename: string): void {
-  if (items.length === 0) {
-    return;
-  }
-  const content = buildIcs(items);
-  const blob = new Blob([content], { type: "text/calendar;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `${filename}.ics`;
-  document.body?.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
-}
-
-function buildIcs(items: DdlItem[]): string {
-  const lines = [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//baoyan-ddl//csddl//ZH-CN",
-    "CALSCALE:GREGORIAN"
-  ];
-  for (const item of items) {
-    const deadline = new Date(item.deadlineAt);
-    if (Number.isNaN(deadline.getTime())) {
-      continue;
-    }
-    lines.push(
-      "BEGIN:VEVENT",
-      `UID:${escapeIcsText(item.key)}@csddl.muqyy.top`,
-      `DTSTAMP:${formatIcsDate(new Date())}`,
-      `DTSTART:${formatIcsDate(deadline)}`,
-      `SUMMARY:${escapeIcsText(`${item.school} ${item.institute} DDL`)}`,
-      `DESCRIPTION:${escapeIcsText(`${item.deadlineText}\\n${item.sourceLabel}\\n${item.website}`)}`,
-      `URL:${escapeIcsText(item.website)}`,
-      "END:VEVENT"
-    );
-  }
-  lines.push("END:VCALENDAR");
-  return `${lines.join("\r\n")}\r\n`;
-}
-
-function formatIcsDate(date: Date): string {
-  return date.toISOString().replace(/[-:]/gu, "").replace(/\.\d{3}Z$/u, "Z");
-}
-
-function escapeIcsText(value: string): string {
-  return value.replace(/\\/gu, "\\\\").replace(/\n/gu, "\\n").replace(/,/gu, "\\,").replace(/;/gu, "\\;");
 }
 
 const rootElement = document.getElementById("root");
