@@ -6,7 +6,7 @@
 
 ## 数据接口
 
-- [DDL JSON 数据](https://baoyan-mail.weijuebu.workers.dev/api/ddl): 全部未截止与已截止条目的结构化 JSON。GET 请求，无需鉴权，已开启 CORS（跨域可读）。部署到本站后，同源亦可通过相对路径 `/api/ddl` 访问。
+- [DDL JSON 数据](https://baoyan-mail.weijuebu.workers.dev/api/ddl): 当前可信且未截止条目的结构化 JSON。GET 请求，无需鉴权，已开启 CORS（跨域可读）。部署到本站后，同源亦可通过相对路径 `/api/ddl` 访问。
 
 ## 响应结构
 
@@ -16,8 +16,12 @@ GET 返回 `application/json; charset=utf-8`：
 {
   "ok": true,
   "generatedAt": "ISO-8601 生成时间 (UTC)",
+  "lastSyncedAt": "ISO-8601 最近源站同步时间 (UTC)",
   "timezone": "Asia/Shanghai",
   "total": 0,
+  "staleCount": 0,
+  "graceHours": 48,
+  "sourceStats": [],
   "items": []
 }
 ```
@@ -37,10 +41,15 @@ GET 返回 `application/json; charset=utf-8`：
 - `sourceGroup`: 来源分组标识，如 `"camp2026"`（夏令营）/ `"yutuimian2026"`（预推免）/ `"baoyanxinxi2026jsjby"`（保研信息平台）(string)
 - `sourceLabel`: 来源的中文展示，如 "2026 夏令营" (string)
 - `website`: 原始通知链接 (string, URL)
+- `firstSeenAt`: 系统首次看到该条目的时间，UTC ISO 字符串或 null
+- `updatedAt`: 内容最近变化时间，UTC ISO 字符串或 null
+- `lastSeenAt`: 源站最近仍可见时间，UTC ISO 字符串或 null
+- `missingSince`: 源站首次消失时间，UTC ISO 字符串或 null
+- `sourceVisibility`: `"current"` 表示源站仍可见，`"grace"` 表示源站短期消失但仍在 48 小时宽限内
 
 ## 使用建议
 
 - `items` 已按 `deadlineAt` 升序排序；同截止时间再按学校层次、校名排序。
-- 只看未来 DDL：过滤 `status !== "expired"`。
+- 接口默认只返回未截止条目；超过 48 小时宽限期的 stale 条目默认隐藏，可参考响应里的 `staleCount`。
 - 按层次筛选用 `tier`；按来源筛选用 `sourceGroup`；按紧迫度筛选用 `remainingDays`。
-- 数据在边缘约缓存 5 分钟，`generatedAt` 为该次生成时刻。
+- 数据在边缘约缓存 5 分钟，`generatedAt` 为该次生成时刻，`lastSyncedAt` 为最近源站同步时刻。

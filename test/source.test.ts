@@ -8,6 +8,7 @@ import {
 } from "../src/checker";
 import {
   canonicalizeNotificationUrl,
+  classifyBaoyanXinxiRecord,
   fetchSourceItemsWithStats,
   getSchoolTierTags,
   isBaoyanXinxiRelevant,
@@ -26,6 +27,8 @@ interface FakeSnapshotRow {
   source_group: string;
   first_seen_at: string;
   updated_at: string;
+  last_seen_at: string | null;
+  missing_since: string | null;
 }
 
 class FakeD1Statement {
@@ -87,6 +90,14 @@ class FakeD1Database {
     if (sql.includes("SELECT * FROM item_snapshots")) {
       return Array.from(this.itemSnapshots.values()) as T[];
     }
+    if (sql.includes("SELECT item_key, source_group FROM item_snapshots")) {
+      return Array.from(this.itemSnapshots.values())
+        .filter((row) => row.missing_since === null)
+        .map((row) => ({
+          item_key: row.item_key,
+          source_group: row.source_group
+        })) as T[];
+    }
     if (sql.includes("SELECT payload FROM item_snapshots")) {
       return Array.from(this.itemSnapshots.values()).map((row) => ({
         payload: row.payload
@@ -130,7 +141,9 @@ class FakeD1Database {
         payload: String(bindings[2]),
         source_group: String(bindings[3]),
         first_seen_at: String(bindings[4]),
-        updated_at: String(bindings[5])
+        updated_at: String(bindings[5]),
+        last_seen_at: String(bindings[6] ?? bindings[5]),
+        missing_since: null
       };
       this.itemSnapshots.set(row.item_key, row);
       changes = 1;
@@ -141,6 +154,13 @@ class FakeD1Database {
       const itemKey = String(bindings[0]);
       if (!this.newDeadlineNotifications.some((entry) => String(entry[0]) === itemKey)) {
         this.newDeadlineNotifications.push(bindings);
+        changes = 1;
+      }
+    } else if (sql.includes("UPDATE item_snapshots") && sql.includes("missing_since")) {
+      const itemKey = String(bindings[1]);
+      const row = this.itemSnapshots.get(itemKey);
+      if (row !== undefined && row.missing_since === null) {
+        row.missing_since = String(bindings[0]);
         changes = 1;
       }
     } else if (sql.includes("UPDATE new_deadline_notifications SET sent_at")) {
@@ -267,6 +287,24 @@ describe("source normalization", () => {
     expect(isBaoyanXinxiRelevant("北京大学", "光华管理学院")).toBe(false);
   });
 
+  it("puts borderline future records into review candidates instead of publishing directly", () => {
+    expect(classifyBaoyanXinxiRecord("北京大学深圳研究生院", "科学智能学院")).toBe("review");
+    const html = `
+      <h2 id="北京大学深圳研究生院"><a href="#北京大学深圳研究生院"></a>北京大学深圳研究生院</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2099-06-20T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/pku-smart">科学智能学院</a></p>
+    `;
+    const result = normalizeBaoyanXinxiHtml(html, "https://www.baoyanxinxi.cn/2026jsjby/");
+
+    expect(result.items).toHaveLength(0);
+    expect(result.reviewCandidates).toHaveLength(1);
+    expect(result.stats.reviewCandidateCount).toBe(1);
+    expect(result.reviewCandidates[0]?.payload).toMatchObject({
+      name: "北京大学深圳研究生院",
+      institute: "科学智能学院",
+      website: "https://example.com/pku-smart"
+    });
+  });
+
   it("adds conservative school tier tags", () => {
     expect(getSchoolTierTags("北京大学")).toEqual(["Top2"]);
     expect(getSchoolTierTags("中国科学技术大学")).toEqual(["华五"]);
@@ -382,7 +420,9 @@ describe("source normalization", () => {
       payload: JSON.stringify(originalItem),
       source_group: originalItem!.sourceGroup,
       first_seen_at: "2026-06-18T00:00:00.000Z",
-      updated_at: "2026-06-18T00:00:00.000Z"
+      updated_at: "2026-06-18T00:00:00.000Z",
+      last_seen_at: "2026-06-18T00:00:00.000Z",
+      missing_since: null
     });
 
     const sourceData = {
@@ -501,7 +541,9 @@ describe("source normalization", () => {
       payload: JSON.stringify(originalItem),
       source_group: originalItem!.sourceGroup,
       first_seen_at: "2026-06-18T00:00:00.000Z",
-      updated_at: "2026-06-18T00:00:00.000Z"
+      updated_at: "2026-06-18T00:00:00.000Z",
+      last_seen_at: "2026-06-18T00:00:00.000Z",
+      missing_since: null
     });
 
     const sourceData = {
@@ -555,6 +597,55 @@ describe("source normalization", () => {
     } finally {
       globalThis.fetch = originalFetch;
       vi.useRealTimers();
+    }
+  });
+
+  it("marks disappeared source records as missing without sending mail in sync-only mode", async () => {
+    const db = new FakeD1Database();
+    const originalItems = await normalizeSourceData({
+      camp2026: [
+        {
+          name: "南京大学",
+          institute: "计算机学院",
+          description: "夏令营",
+          deadline: "2099-06-10T23:59:59+08:00",
+          website: "https://example.com/nju",
+          tags: ["C9"]
+        }
+      ]
+    });
+    const originalItem = originalItems[0];
+    expect(originalItem).toBeDefined();
+    db.itemSnapshots.set(originalItem!.key, {
+      item_key: originalItem!.key,
+      content_hash: originalItem!.contentHash,
+      payload: JSON.stringify(originalItem),
+      source_group: originalItem!.sourceGroup,
+      first_seen_at: "2026-06-18T00:00:00.000Z",
+      updated_at: "2026-06-18T00:00:00.000Z",
+      last_seen_at: "2026-06-18T00:00:00.000Z",
+      missing_since: null
+    });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ camp2026: [] }), { status: 200 });
+
+    try {
+      const result = await runCheck(
+        {
+          DB: db as unknown as D1Database,
+          SOURCE_URL: "https://example.com/schools.json",
+          APP_BASE_URL: "https://example.com"
+        } as Env,
+        "https://example.com",
+        { sendEmails: false }
+      );
+
+      expect(result.missingCount).toBe(1);
+      expect(result.newDeadlineDetected).toBe(0);
+      expect(db.itemSnapshots.get(originalItem!.key)?.missing_since).toBeDefined();
+    } finally {
+      globalThis.fetch = originalFetch;
     }
   });
 });
@@ -755,6 +846,37 @@ describe("DDL API", () => {
     });
   });
 
+  it("hides stale future DDL after the visibility grace period", () => {
+    const response = buildDdlResponse(
+      [
+        {
+          item_key: "stale",
+          content_hash: "hash",
+          payload: JSON.stringify({
+            key: "stale",
+            contentHash: "hash",
+            sourceGroup: "camp2026",
+            name: "南京大学",
+            institute: "计算机学院",
+            description: "夏令营通知",
+            deadline: "2026-06-10T00:00:00+08:00",
+            website: "https://example.com/stale",
+            tags: []
+          }),
+          source_group: "camp2026",
+          first_seen_at: "2026-06-01T00:00:00.000Z",
+          updated_at: "2026-06-01T00:00:00.000Z",
+          last_seen_at: "2026-06-01T00:00:00.000Z",
+          missing_since: "2026-06-01T00:00:00.000Z"
+        }
+      ],
+      now
+    );
+
+    expect(response.total).toBe(0);
+    expect(response.staleCount).toBe(1);
+  });
+
   it("serves public DDL data without admin authorization", async () => {
     const db = new FakeD1Database();
     const item: NormalizedItem = {
@@ -764,7 +886,7 @@ describe("DDL API", () => {
       name: "浙江大学",
       institute: "计算机学院",
       description: "补充源",
-      deadline: "2026-06-10T00:00:00+08:00",
+      deadline: "2099-06-10T00:00:00+08:00",
       website: "https://example.com/zju",
       tags: []
     };
@@ -774,7 +896,9 @@ describe("DDL API", () => {
       payload: JSON.stringify(item),
       source_group: item.sourceGroup,
       first_seen_at: "2026-06-01T00:00:00.000Z",
-      updated_at: "2026-06-01T00:00:00.000Z"
+      updated_at: "2026-06-01T00:00:00.000Z",
+      last_seen_at: "2026-06-01T00:00:00.000Z",
+      missing_since: null
     });
 
     const response = await handleRequest(

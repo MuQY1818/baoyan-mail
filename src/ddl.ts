@@ -1,7 +1,9 @@
 import { canonicalizeNotificationUrl, getSchoolTierTags } from "./source";
-import type { NormalizedItem } from "./types";
+import type { ItemSnapshotRow, NormalizedItem } from "./types";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const STALE_GRACE_HOURS = 48;
+const STALE_GRACE_MS = STALE_GRACE_HOURS * 60 * 60 * 1000;
 const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const UNKNOWN_DEADLINE_VALUES = new Set(["", "暂无", "待定", "无明确说明"]);
 const SHANGHAI_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
@@ -25,30 +27,70 @@ export interface DdlApiItem {
   sourceGroup: string;
   sourceLabel: string;
   website: string;
+  firstSeenAt: string | null;
+  updatedAt: string | null;
+  lastSeenAt: string | null;
+  missingSince: string | null;
+  sourceVisibility: "current" | "grace" | "stale";
+}
+
+export interface DdlApiSourceStat {
+  sourceGroup: string;
+  sourceLabel: string;
+  total: number;
+  current: number;
+  grace: number;
+  staleHidden: number;
 }
 
 export interface DdlApiResponse {
   ok: true;
   generatedAt: string;
+  lastSyncedAt: string | null;
   timezone: "Asia/Shanghai";
   total: number;
+  staleCount: number;
+  graceHours: number;
+  sourceStats: DdlApiSourceStat[];
   items: DdlApiItem[];
 }
 
-export function buildDdlResponse(items: NormalizedItem[], now = new Date()): DdlApiResponse {
-  const ddlItems = items
-    .map((item) => serializeDdlItem(item, now))
+export function buildDdlResponse(
+  entries: Array<NormalizedItem | ItemSnapshotRow>,
+  now = new Date(),
+  lastSyncedAt: string | null = null
+): DdlApiResponse {
+  const contexts = entries.map(toDdlContext);
+  const serializedItems = contexts
+    .map((context) => serializeDdlItem(context, now))
     .filter((item): item is DdlApiItem => item !== null)
     .reduce(dedupeDdlItems(), [])
     .sort(compareDdlItems);
+  const ddlItems = serializedItems.filter(
+    (item) => item.status !== "expired" && item.sourceVisibility !== "stale"
+  );
 
   return {
     ok: true,
     generatedAt: now.toISOString(),
+    lastSyncedAt: lastSyncedAt ?? getLatestLastSeenAt(contexts),
     timezone: SHANGHAI_TIME_ZONE,
     total: ddlItems.length,
+    staleCount: serializedItems.filter(
+      (item) => item.status !== "expired" && item.sourceVisibility === "stale"
+    ).length,
+    graceHours: STALE_GRACE_HOURS,
+    sourceStats: buildSourceStats(serializedItems),
     items: ddlItems
   };
+}
+
+interface DdlContext {
+  item: NormalizedItem;
+  firstSeenAt: string | null;
+  updatedAt: string | null;
+  lastSeenAt: string | null;
+  missingSince: string | null;
 }
 
 function dedupeDdlItems(): (items: DdlApiItem[], item: DdlApiItem) => DdlApiItem[] {
@@ -120,7 +162,12 @@ function normalizeDuplicateText(value: string): string {
   return value.replace(/\s+/gu, "").replace(/[（(].*?[）)]/gu, "").toLowerCase();
 }
 
-export function serializeDdlItem(item: NormalizedItem, now = new Date()): DdlApiItem | null {
+export function serializeDdlItem(
+  contextOrItem: DdlContext | NormalizedItem,
+  now = new Date()
+): DdlApiItem | null {
+  const context = "item" in contextOrItem ? contextOrItem : toDdlContext(contextOrItem);
+  const item = context.item;
   const deadline = parseDeadline(item.deadline);
   if (deadline === null) {
     return null;
@@ -143,7 +190,12 @@ export function serializeDdlItem(item: NormalizedItem, now = new Date()): DdlApi
     tier,
     sourceGroup: item.sourceGroup,
     sourceLabel: formatSourceGroup(item.sourceGroup),
-    website: item.website
+    website: item.website,
+    firstSeenAt: context.firstSeenAt,
+    updatedAt: context.updatedAt,
+    lastSeenAt: context.lastSeenAt,
+    missingSince: context.missingSince,
+    sourceVisibility: getSourceVisibility(context.missingSince, now)
   };
 }
 
@@ -220,6 +272,9 @@ function formatShanghaiDateTime(date: Date): string {
 }
 
 function formatSourceGroup(sourceGroup: string): string {
+  if (sourceGroup === "manual") {
+    return "人工补充";
+  }
   if (sourceGroup === "baoyanxinxi2026jsjby") {
     return "保研信息平台";
   }
@@ -266,4 +321,75 @@ function readDatePart(parts: Intl.DateTimeFormatPart[], type: string): number {
 
 function toUtcDayNumber(parts: { year: number; month: number; day: number }): number {
   return Math.floor(Date.UTC(parts.year, parts.month - 1, parts.day) / MS_PER_DAY);
+}
+
+function toDdlContext(entry: NormalizedItem | ItemSnapshotRow): DdlContext {
+  if ("payload" in entry) {
+    return {
+      item: JSON.parse(entry.payload) as NormalizedItem,
+      firstSeenAt: entry.first_seen_at,
+      updatedAt: entry.updated_at,
+      lastSeenAt: entry.last_seen_at,
+      missingSince: entry.missing_since
+    };
+  }
+  return {
+    item: entry,
+    firstSeenAt: null,
+    updatedAt: null,
+    lastSeenAt: null,
+    missingSince: null
+  };
+}
+
+function getSourceVisibility(
+  missingSince: string | null,
+  now: Date
+): DdlApiItem["sourceVisibility"] {
+  if (missingSince === null) {
+    return "current";
+  }
+  const missingSinceDate = new Date(missingSince);
+  if (
+    !Number.isNaN(missingSinceDate.getTime()) &&
+    now.getTime() - missingSinceDate.getTime() <= STALE_GRACE_MS
+  ) {
+    return "grace";
+  }
+  return "stale";
+}
+
+function getLatestLastSeenAt(contexts: DdlContext[]): string | null {
+  const values = contexts
+    .map((context) => context.lastSeenAt)
+    .filter((value): value is string => value !== null && value !== "")
+    .sort();
+  return values.at(-1) ?? null;
+}
+
+function buildSourceStats(items: DdlApiItem[]): DdlApiSourceStat[] {
+  const stats = new Map<string, DdlApiSourceStat>();
+  for (const item of items.filter((entry) => entry.status !== "expired")) {
+    const current = stats.get(item.sourceGroup) ?? {
+      sourceGroup: item.sourceGroup,
+      sourceLabel: item.sourceLabel,
+      total: 0,
+      current: 0,
+      grace: 0,
+      staleHidden: 0
+    };
+    if (item.sourceVisibility === "current") {
+      current.current += 1;
+      current.total += 1;
+    } else if (item.sourceVisibility === "grace") {
+      current.grace += 1;
+      current.total += 1;
+    } else {
+      current.staleHidden += 1;
+    }
+    stats.set(item.sourceGroup, current);
+  }
+  return Array.from(stats.values()).sort((left, right) =>
+    left.sourceLabel.localeCompare(right.sourceLabel, "zh-CN")
+  );
 }

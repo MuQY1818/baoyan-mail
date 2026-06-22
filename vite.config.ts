@@ -5,7 +5,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      "/api/ddl": "http://127.0.0.1:8787"
+      "/api/ddl": "http://127.0.0.1:8787",
+      "/api/missing-link": "http://127.0.0.1:8787"
     }
   }
 });

@@ -5,6 +5,10 @@
     {
       "source": "/api/ddl",
       "destination": "https://baoyan-mail.weijuebu.workers.dev/api/ddl"
+    },
+    {
+      "source": "/api/missing-link",
+      "destination": "https://baoyan-mail.weijuebu.workers.dev/api/missing-link"
     }
   ]
 }

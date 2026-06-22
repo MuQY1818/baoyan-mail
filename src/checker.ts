@@ -2,13 +2,18 @@ import {
   countActiveSubscribers,
   getActiveSubscribers,
   getAppState,
+  getManualItems,
   getPendingNewDeadlineNotifications,
   getSnapshotCount,
+  getSnapshotRows,
   getSnapshots,
+  getUnmissingSnapshotRefs,
   insertNewDeadlineNotifications,
   logMailSend,
+  markSnapshotsMissing,
   markNewDeadlineNotificationsSent,
   setAppState,
+  upsertReviewCandidates,
   upsertSnapshots
 } from "./db";
 import {
@@ -28,6 +33,9 @@ const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const UNKNOWN_DEADLINE_VALUES = new Set(["", "暂无", "待定", "无明确说明"]);
 const BAOYANXINXI_INIT_STATE_KEY = BAOYANXINXI_SOURCE_GROUP;
 const DAILY_DEADLINE_DIGEST_STATE_KEY = "daily_deadline_digest_sent_date";
+const LAST_SYNC_STATE_KEY = "last_synced_at";
+const STALE_GRACE_HOURS = 48;
+const STALE_GRACE_MS = STALE_GRACE_HOURS * 60 * 60 * 1000;
 const SHANGHAI_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
   timeZone: SHANGHAI_TIME_ZONE,
   year: "numeric",
@@ -41,13 +49,24 @@ export interface DeadlineReminderCandidate {
   reminderWindowDays: number;
 }
 
-export async function runCheck(env: Env, baseUrl?: string): Promise<RunCheckResult> {
+export interface RunCheckOptions {
+  sendEmails?: boolean;
+}
+
+export async function runCheck(
+  env: Env,
+  baseUrl?: string,
+  options: RunCheckOptions = {}
+): Promise<RunCheckResult> {
+  const sendEmails = options.sendEmails ?? true;
   const now = new Date().toISOString();
   const nowDate = new Date(now);
   const today = formatShanghaiDate(nowDate);
   const sourceResult = await fetchSourceItemsWithStats(env);
-  const items = sourceResult.items;
+  const manualItems = await getManualItems(env);
+  const items = [...sourceResult.items, ...manualItems];
   const sourceStats = sourceResult.stats.map((stats) => ({ ...stats }));
+  await upsertReviewCandidates(env, sourceResult.reviewCandidates, now);
   const snapshotCount = await getSnapshotCount(env);
   const snapshots = snapshotCount === 0 ? new Map() : await getSnapshots(env);
   const baoyanXinxiState = await getAppState(env, BAOYANXINXI_INIT_STATE_KEY);
@@ -63,11 +82,15 @@ export async function runCheck(env: Env, baseUrl?: string): Promise<RunCheckResu
   let initialized = false;
   let baoyanXinxiInitializedThisRun = false;
   let newDeadlineItems: NormalizedItem[] = [];
+  let addedCount = 0;
+  let changedCount = 0;
+  let missingCount = 0;
   const baoyanXinxiSupplementedKeys = new Set(sourceResult.baoyanXinxiSupplementedItemKeys);
 
   if (snapshotCount === 0) {
     await upsertSnapshots(env, items, now);
     initialized = true;
+    addedCount = items.length;
     if (canInitializeBaoyanXinxi) {
       await setAppState(env, BAOYANXINXI_INIT_STATE_KEY, now, now);
       baoyanXinxiInitializedThisRun = true;
@@ -92,33 +115,37 @@ export async function runCheck(env: Env, baseUrl?: string): Promise<RunCheckResu
     }
 
     const detected = detectChanges(itemsForChangeDetection, snapshots);
-    newDeadlineItems = detected
-      .filter((change) => change.kind === "added")
-      .map((change) => change.item);
+    addedCount = detected.filter((change) => change.kind === "added").length;
+    changedCount = detected.filter((change) => change.kind === "changed").length;
+    if (sendEmails) {
+      newDeadlineItems = detected
+        .filter((change) => change.kind === "added")
+        .map((change) => change.item);
+    }
     await upsertSnapshots(env, items, now);
+    missingCount = await markMissingForSuccessfulSources(env, items, sourceStats, now);
   }
 
+  await setAppState(env, LAST_SYNC_STATE_KEY, now, now);
   const dailyDeadlineDigest = collectDailyDeadlineDigestItems(
     items,
     DAILY_DEADLINE_DIGEST_DAYS,
     nowDate
   );
-  const dailyDeadlineResult = await sendDailyDeadlineDigestIfNeeded(
-    env,
-    baseUrl,
-    dailyDeadlineDigest,
-    today,
-    now,
-    nowDate
-  );
-  const newDeadlineCandidates = collectNewDeadlineNotificationCandidates(newDeadlineItems, nowDate);
-  const newDeadlineDetected = await insertNewDeadlineNotifications(env, newDeadlineCandidates, now);
-  const newDeadlineSendResult = await sendPendingNewDeadlineNotifications(
-    env,
-    baseUrl,
-    now,
-    nowDate
-  );
+  const dailyDeadlineResult = sendEmails
+    ? await sendDailyDeadlineDigestIfNeeded(env, baseUrl, dailyDeadlineDigest, today, now, nowDate)
+    : { sent: 0, subscriberCount: 0 };
+  const newDeadlineCandidates = sendEmails
+    ? collectNewDeadlineNotificationCandidates(newDeadlineItems, nowDate)
+    : [];
+  const newDeadlineDetected =
+    newDeadlineCandidates.length === 0
+      ? 0
+      : await insertNewDeadlineNotifications(env, newDeadlineCandidates, now);
+  const newDeadlineSendResult = sendEmails
+    ? await sendPendingNewDeadlineNotifications(env, baseUrl, now, nowDate)
+    : { sent: 0, subscriberCount: 0 };
+  const staleCounts = countStaleSnapshotRows(await getSnapshotRows(env), nowDate);
   return {
     initialized,
     scanned: items.length,
@@ -134,12 +161,73 @@ export async function runCheck(env: Env, baseUrl?: string): Promise<RunCheckResu
       dailyDeadlineResult.subscriberCount,
       newDeadlineSendResult.subscriberCount
     ),
+    addedCount,
+    changedCount,
+    missingCount,
+    staleVisibleCount: staleCounts.visible,
+    staleHiddenCount: staleCounts.hidden,
+    lastSyncedAt: now,
     sourceStats: annotateSourceStats(
       sourceStats,
       baoyanXinxiState !== null || baoyanXinxiInitializedThisRun,
       baoyanXinxiInitializedThisRun
     )
   };
+}
+
+async function markMissingForSuccessfulSources(
+  env: Env,
+  items: NormalizedItem[],
+  sourceStats: SourceStats[],
+  now: string
+): Promise<number> {
+  const seenKeys = new Set(items.map((item) => item.key));
+  const baoyanXinxiStat = sourceStats.find(
+    (stats) => stats.sourceGroup === BAOYANXINXI_SOURCE_GROUP
+  );
+  const canMarkBaoyanXinxi =
+    baoyanXinxiStat?.error === undefined && (baoyanXinxiStat?.rawCount ?? 0) > 0;
+  const refs = await getUnmissingSnapshotRefs(env);
+  const missingKeys = refs
+    .filter((ref) => !seenKeys.has(ref.item_key))
+    .filter((ref) => shouldMarkSourceGroupMissing(ref.source_group, canMarkBaoyanXinxi))
+    .map((ref) => ref.item_key);
+  return markSnapshotsMissing(env, missingKeys, now);
+}
+
+function shouldMarkSourceGroupMissing(sourceGroup: string, canMarkBaoyanXinxi: boolean): boolean {
+  if (sourceGroup === "manual") {
+    return false;
+  }
+  if (sourceGroup === BAOYANXINXI_SOURCE_GROUP) {
+    return canMarkBaoyanXinxi;
+  }
+  return true;
+}
+
+function countStaleSnapshotRows(
+  rows: Array<{ payload: string; missing_since: string | null }>,
+  now: Date
+): { visible: number; hidden: number } {
+  let visible = 0;
+  let hidden = 0;
+  for (const row of rows) {
+    if (row.missing_since === null) {
+      continue;
+    }
+    const item = JSON.parse(row.payload) as NormalizedItem;
+    const deadline = parseDeadline(item.deadline);
+    if (deadline === null || deadline.getTime() <= now.getTime()) {
+      continue;
+    }
+    const missingSince = new Date(row.missing_since);
+    if (!Number.isNaN(missingSince.getTime()) && now.getTime() - missingSince.getTime() <= STALE_GRACE_MS) {
+      visible += 1;
+    } else {
+      hidden += 1;
+    }
+  }
+  return { visible, hidden };
 }
 
 function annotateSourceStats(

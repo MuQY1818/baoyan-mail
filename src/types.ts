@@ -11,6 +11,7 @@ export interface Env {
   ALIYUN_DM_ENDPOINT?: string;
   ALIYUN_REGION_ID?: string;
   ADMIN_TOKEN?: string;
+  ADMIN_REVIEW_PASSWORD?: string;
   BATCH_SIZE?: string;
 }
 
@@ -47,6 +48,8 @@ export interface ItemSnapshotRow {
   source_group: string;
   first_seen_at: string;
   updated_at: string;
+  last_seen_at: string | null;
+  missing_since: string | null;
 }
 
 export interface DeadlineReminderRow {
@@ -82,6 +85,7 @@ export interface SourceStats {
   rawCount: number;
   acceptedCount: number;
   filteredCount: number;
+  reviewCandidateCount?: number;
   duplicateCount: number;
   supplementedDeadlineCount: number;
   initialized?: boolean;
@@ -101,5 +105,41 @@ export interface RunCheckResult {
   newDeadlineDetected: number;
   newDeadlineSent: number;
   subscriberCount: number;
+  addedCount: number;
+  changedCount: number;
+  missingCount: number;
+  staleVisibleCount: number;
+  staleHiddenCount: number;
+  lastSyncedAt: string;
   sourceStats?: SourceStats[];
+}
+
+export type ReviewCandidateStatus = "pending" | "approved" | "rejected";
+
+export interface ReviewCandidatePayload {
+  sourceGroup: string;
+  name: string;
+  institute: string;
+  description: string;
+  deadline: string;
+  website: string;
+  submittedBy?: string;
+  note?: string;
+}
+
+export interface SourceReviewCandidateRow {
+  id: number;
+  normalized_url: string;
+  source_group: string;
+  status: ReviewCandidateStatus;
+  reason: string;
+  payload: string;
+  created_at: string;
+  updated_at: string;
+  reviewed_at: string | null;
+  review_note: string | null;
+}
+
+export interface SourceReviewCandidateWithPayload extends SourceReviewCandidateRow {
+  candidate: ReviewCandidatePayload;
 }

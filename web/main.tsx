@@ -18,14 +18,32 @@ interface DdlItem {
   sourceGroup: string;
   sourceLabel: string;
   website: string;
+  firstSeenAt: string | null;
+  updatedAt: string | null;
+  lastSeenAt: string | null;
+  missingSince: string | null;
+  sourceVisibility: "current" | "grace" | "stale";
 }
 
 interface DdlResponse {
   ok: true;
   generatedAt: string;
+  lastSyncedAt: string | null;
   timezone: "Asia/Shanghai";
   total: number;
+  staleCount: number;
+  graceHours: number;
+  sourceStats: SourceStat[];
   items: DdlItem[];
+}
+
+interface SourceStat {
+  sourceGroup: string;
+  sourceLabel: string;
+  total: number;
+  current: number;
+  grace: number;
+  staleHidden: number;
 }
 
 interface TimelineEntry {
@@ -48,7 +66,9 @@ type TimelineExpansion = "collapsed" | "expanded";
 
 type TierFilter = "Top2" | "华五" | "C9" | "985" | "211" | "其他";
 type RangeFilter = "today" | "3" | "7" | "15" | "future";
-type SourceFilter = "all" | "cs" | "baoyanxinxi";
+type SourceFilter = "all" | "cs" | "baoyanxinxi" | "manual";
+type RecentFilter = "all" | "new" | "updated";
+type ViewMode = "cards" | "table";
 
 const TIER_OPTIONS: TierFilter[] = ["Top2", "华五", "C9", "985", "211", "其他"];
 const TIER_RANK: Record<TierFilter, number> = {
@@ -77,11 +97,21 @@ const RANGE_WIDTH: Record<RangeFilter, number> = {
 const SOURCE_OPTIONS: Array<{ value: SourceFilter; label: string }> = [
   { value: "all", label: "全部来源" },
   { value: "cs", label: "CS-BAOYAN-DDL" },
-  { value: "baoyanxinxi", label: "保研信息平台" }
+  { value: "baoyanxinxi", label: "保研信息平台" },
+  { value: "manual", label: "人工补充" }
+];
+const RECENT_OPTIONS: Array<{ value: RecentFilter; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "new", label: "最近新增" },
+  { value: "updated", label: "最近更新" }
 ];
 const SUBSCRIBE_URL = "https://baoyan-mail.weijuebu.workers.dev/";
 const API_URL = "https://baoyan-mail.weijuebu.workers.dev/api/ddl";
+const MISSING_LINK_URL = "/api/missing-link";
 const LLMS_TXT_URL = "/llms.txt";
+const RECENT_DAYS = 7;
+const FAVORITE_STORAGE_KEY = "baoyan-ddl-favorites";
+const READ_STORAGE_KEY = "baoyan-ddl-read";
 
 interface RailBucket {
   label: string;
@@ -99,13 +129,18 @@ const RAIL_BUCKETS: RailBucket[] = [
 ];
 
 function App(): React.ReactElement {
+  const initialFilters = useMemo(readFiltersFromUrl, []);
   const [data, setData] = useState<DdlResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [query, setQuery] = useState("");
-  const [range, setRange] = useState<RangeFilter>("future");
-  const [source, setSource] = useState<SourceFilter>("all");
-  const [activeTiers, setActiveTiers] = useState<Set<TierFilter>>(new Set(TIER_OPTIONS));
+  const [query, setQuery] = useState(initialFilters.query);
+  const [range, setRange] = useState<RangeFilter>(initialFilters.range);
+  const [source, setSource] = useState<SourceFilter>(initialFilters.source);
+  const [recent, setRecent] = useState<RecentFilter>(initialFilters.recent);
+  const [viewMode, setViewMode] = useState<ViewMode>(initialFilters.viewMode);
+  const [activeTiers, setActiveTiers] = useState<Set<TierFilter>>(initialFilters.tiers);
+  const [favorites, toggleFavorite] = useStoredKeySet(FAVORITE_STORAGE_KEY);
+  const [readItems, toggleReadItem] = useStoredKeySet(READ_STORAGE_KEY);
   const scrollTargetRef = useRef<string | null>(null);
   const [scrollNonce, setScrollNonce] = useState(0);
   const [highlightKey, setHighlightKey] = useState<string | null>(null);
@@ -140,25 +175,29 @@ function App(): React.ReactElement {
     };
   }, []);
 
+  useEffect(() => {
+    writeFiltersToUrl({ activeTiers, query, range, recent, source, viewMode });
+  }, [activeTiers, query, range, recent, source, viewMode]);
+
   const futureItems = useMemo(
     () => data?.items.filter((item) => item.status !== "expired") ?? [],
     [data]
   );
   const visibleItems = useMemo(
-    () => filterItems(futureItems, query, range, source, activeTiers),
-    [activeTiers, futureItems, query, range, source]
+    () => filterItems(futureItems, query, range, source, activeTiers, recent),
+    [activeTiers, futureItems, query, range, recent, source]
   );
   const stats = useMemo(() => buildStats(futureItems), [futureItems]);
   // 概览计数与跳转候选用同一套筛选（忽略范围），保证点击后一定能找到目标卡片
   const railCounts = useMemo(() => {
-    const scoped = filterItems(futureItems, query, "future", source, activeTiers);
+    const scoped = filterItems(futureItems, query, "future", source, activeTiers, recent);
     return RAIL_BUCKETS.map(
       (bucket) => scoped.filter((item) => bucket.matches(item.remainingDays)).length
     );
-  }, [activeTiers, futureItems, query, source]);
+  }, [activeTiers, futureItems, query, recent, source]);
   const timelineStops = useMemo(
-    () => buildTimeline(filterItems(futureItems, query, "7", source, activeTiers)),
-    [activeTiers, futureItems, query, source]
+    () => buildTimeline(filterItems(futureItems, query, "7", source, activeTiers, recent)),
+    [activeTiers, futureItems, query, recent, source]
   );
 
   // 点击概览后等列表渲染完成再滚动到目标卡片，滚动结束后再高亮（确保视线到位时才闪烁）
@@ -218,7 +257,7 @@ function App(): React.ReactElement {
   }, [highlightKey]);
 
   function jumpToBucket(bucket: RailBucket): void {
-    const candidates = filterItems(futureItems, query, "future", source, activeTiers);
+    const candidates = filterItems(futureItems, query, "future", source, activeTiers, recent);
     const target = candidates.find((item) => bucket.matches(item.remainingDays));
     if (target === undefined) {
       return;
@@ -247,6 +286,8 @@ function App(): React.ReactElement {
     setQuery("");
     setRange("future");
     setSource("all");
+    setRecent("all");
+    setViewMode("cards");
     setActiveTiers(new Set(TIER_OPTIONS));
   }
 
@@ -264,7 +305,14 @@ function App(): React.ReactElement {
           <a className="subscribe-link" href={SUBSCRIBE_URL}>
             订阅每日邮件
           </a>
-          <span className="updated">{formatGeneratedAt(data?.generatedAt)}</span>
+          <button
+            className="quiet-action"
+            onClick={() => downloadIcs(visibleItems, "baoyan-ddl-filtered")}
+            type="button"
+          >
+            导出日历
+          </button>
+          <span className="updated">{formatGeneratedAt(data?.lastSyncedAt ?? data?.generatedAt)}</span>
         </div>
       </section>
 
@@ -342,6 +390,36 @@ function App(): React.ReactElement {
                 ))}
               </select>
             </label>
+
+            <div className="control-row" aria-label="最近状态">
+              {RECENT_OPTIONS.map((option) => (
+                <button
+                  className={recent === option.value ? "chip chip-active" : "chip"}
+                  key={option.value}
+                  onClick={() => setRecent(option.value)}
+                  type="button"
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="control-row" aria-label="视图模式">
+              <button
+                className={viewMode === "cards" ? "chip chip-active" : "chip"}
+                onClick={() => setViewMode("cards")}
+                type="button"
+              >
+                卡片
+              </button>
+              <button
+                className={viewMode === "table" ? "chip chip-active" : "chip"}
+                onClick={() => setViewMode("table")}
+                type="button"
+              >
+                表格
+              </button>
+            </div>
           </section>
 
           <section className="summary-strip" aria-label="数据概览">
@@ -350,6 +428,9 @@ function App(): React.ReactElement {
             <SummaryCell label="15 天内" value={stats.fifteenDays} />
             <SummaryCell label="当前显示" value={visibleItems.length} />
           </section>
+
+          <SourceStatus data={data} />
+          <MissingLinkPanel />
 
           {isLoading ? (
             <StateMessage title="正在校准刻度" message="正在读取最新 DDL 数据。" />
@@ -363,11 +444,15 @@ function App(): React.ReactElement {
               onAction={resetFilters}
             />
           ) : (
-            <ol className="notice-list">
-              {visibleItems.map((item) => (
-                <DdlCard highlighted={item.key === highlightKey} item={item} key={item.key} />
-              ))}
-            </ol>
+            <DdlResults
+              favorites={favorites}
+              highlightedKey={highlightKey}
+              items={visibleItems}
+              onToggleFavorite={toggleFavorite}
+              onToggleRead={toggleReadItem}
+              readItems={readItems}
+              viewMode={viewMode}
+            />
           )}
         </div>
       </section>
@@ -415,12 +500,150 @@ function ApiHint(): React.ReactElement {
   );
 }
 
-function DdlCard({
-  highlighted,
-  item
+function SourceStatus({ data }: { data: DdlResponse | null }): React.ReactElement | null {
+  if (data === null) {
+    return null;
+  }
+  return (
+    <section className="source-status" aria-label="数据源状态">
+      <div>
+        <strong>源站同步</strong>
+        <span>{formatGeneratedAt(data.lastSyncedAt ?? data.generatedAt)}</span>
+      </div>
+      <div>
+        <strong>宽限显示</strong>
+        <span>{data.sourceStats.reduce((sum, stat) => sum + stat.grace, 0)} 条</span>
+      </div>
+      <div>
+        <strong>已隐藏 stale</strong>
+        <span>{data.staleCount} 条</span>
+      </div>
+      <div className="source-status-list">
+        {data.sourceStats.map((stat) => (
+          <span key={stat.sourceGroup}>
+            {stat.sourceLabel} {stat.total}
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MissingLinkPanel(): React.ReactElement {
+  const [status, setStatus] = useState<string>("");
+
+  async function submitMissingLink(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const formData = new FormData(form);
+    setStatus("提交中");
+    try {
+      const response = await fetch(MISSING_LINK_URL, {
+        method: "POST",
+        body: formData
+      });
+      if (!response.ok) {
+        throw new Error(`提交失败 ${response.status}`);
+      }
+      form.reset();
+      setStatus("已提交，等待人工审核");
+    } catch (submitError) {
+      setStatus(submitError instanceof Error ? submitError.message : String(submitError));
+    }
+  }
+
+  return (
+    <details className="missing-panel">
+      <summary>提交缺漏链接</summary>
+      <form className="missing-form" onSubmit={(event) => void submitMissingLink(event)}>
+        <label>
+          原始链接
+          <input name="website" required type="url" placeholder="https://..." />
+        </label>
+        <label>
+          学校
+          <input name="name" placeholder="可选，知道就填" />
+        </label>
+        <label>
+          院系
+          <input name="institute" placeholder="可选" />
+        </label>
+        <label>
+          截止时间
+          <input name="deadline" placeholder="例如 2026-06-30 23:59" />
+        </label>
+        <label className="missing-form-wide">
+          备注
+          <input name="note" placeholder="方向、来源说明或需要人工确认的点" />
+        </label>
+        <button className="chip chip-active" type="submit">
+          提交审核
+        </button>
+        {status !== "" && <span className="missing-status">{status}</span>}
+      </form>
+    </details>
+  );
+}
+
+function DdlResults({
+  favorites,
+  highlightedKey,
+  items,
+  onToggleFavorite,
+  onToggleRead,
+  readItems,
+  viewMode
 }: {
+  favorites: Set<string>;
+  highlightedKey: string | null;
+  items: DdlItem[];
+  onToggleFavorite: (key: string) => void;
+  onToggleRead: (key: string) => void;
+  readItems: Set<string>;
+  viewMode: ViewMode;
+}): React.ReactElement {
+  if (viewMode === "table") {
+    return (
+      <DdlTable
+        favorites={favorites}
+        items={items}
+        onToggleFavorite={onToggleFavorite}
+        onToggleRead={onToggleRead}
+        readItems={readItems}
+      />
+    );
+  }
+  return (
+    <ol className="notice-list">
+      {items.map((item) => (
+        <DdlCard
+          favorite={favorites.has(item.key)}
+          highlighted={item.key === highlightedKey}
+          item={item}
+          key={item.key}
+          onToggleFavorite={() => onToggleFavorite(item.key)}
+          onToggleRead={() => onToggleRead(item.key)}
+          read={readItems.has(item.key)}
+        />
+      ))}
+    </ol>
+  );
+}
+
+function DdlCard({
+  favorite,
+  highlighted,
+  item,
+  onToggleFavorite,
+  onToggleRead,
+  read
+}: {
+  favorite: boolean;
   highlighted: boolean;
   item: DdlItem;
+  onToggleFavorite: () => void;
+  onToggleRead: () => void;
+  read: boolean;
 }): React.ReactElement {
   const classes = ["notice-card"];
   if (item.status === "today") {
@@ -428,6 +651,9 @@ function DdlCard({
   }
   if (highlighted) {
     classes.push("notice-card-flash");
+  }
+  if (read) {
+    classes.push("notice-card-read");
   }
   return (
     <li className={classes.join(" ")} id={`ddl-${item.key}`}>
@@ -458,11 +684,80 @@ function DdlCard({
           </div>
         </dl>
         {item.description !== "" && <p className="description">{truncate(item.description, 96)}</p>}
-        <a className="source-link" href={item.website} rel="noreferrer" target="_blank">
-          查看原始通知
-        </a>
+        <div className="card-actions">
+          <a className="source-link" href={item.website} rel="noreferrer" target="_blank">
+            查看原始通知
+          </a>
+          <button className="icon-action" onClick={onToggleFavorite} type="button">
+            {favorite ? "已收藏" : "收藏"}
+          </button>
+          <button className="icon-action" onClick={onToggleRead} type="button">
+            {read ? "未读" : "已读"}
+          </button>
+          <button className="icon-action" onClick={() => downloadIcs([item], item.key)} type="button">
+            日历
+          </button>
+        </div>
       </article>
     </li>
+  );
+}
+
+function DdlTable({
+  favorites,
+  items,
+  onToggleFavorite,
+  onToggleRead,
+  readItems
+}: {
+  favorites: Set<string>;
+  items: DdlItem[];
+  onToggleFavorite: (key: string) => void;
+  onToggleRead: (key: string) => void;
+  readItems: Set<string>;
+}): React.ReactElement {
+  return (
+    <div className="table-wrap">
+      <table className="ddl-table">
+        <thead>
+          <tr>
+            <th>学校</th>
+            <th>院系</th>
+            <th>DDL</th>
+            <th>层次</th>
+            <th>来源</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((item) => (
+            <tr className={readItems.has(item.key) ? "table-row-read" : ""} key={item.key}>
+              <td>{item.school}</td>
+              <td>{item.institute || "未提供院系"}</td>
+              <td>
+                <strong>{item.remainingText}</strong>
+                <span>{item.deadlineText}</span>
+              </td>
+              <td>{item.tier}</td>
+              <td>{item.sourceLabel}</td>
+              <td>
+                <div className="table-actions">
+                  <a href={item.website} rel="noreferrer" target="_blank">
+                    原文
+                  </a>
+                  <button onClick={() => onToggleFavorite(item.key)} type="button">
+                    {favorites.has(item.key) ? "已藏" : "收藏"}
+                  </button>
+                  <button onClick={() => onToggleRead(item.key)} type="button">
+                    {readItems.has(item.key) ? "未读" : "已读"}
+                  </button>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -689,7 +984,8 @@ function filterItems(
   query: string,
   range: RangeFilter,
   source: SourceFilter,
-  tiers: Set<TierFilter>
+  tiers: Set<TierFilter>,
+  recent: RecentFilter
 ): DdlItem[] {
   const keyword = query.trim().toLowerCase();
   const rangeConfig = RANGE_OPTIONS.find((option) => option.value === range);
@@ -702,10 +998,22 @@ function filterItems(
         return false;
       }
     }
-    if (source === "cs" && item.sourceGroup === "baoyanxinxi2026jsjby") {
+    if (
+      source === "cs" &&
+      (item.sourceGroup === "baoyanxinxi2026jsjby" || item.sourceGroup === "manual")
+    ) {
       return false;
     }
     if (source === "baoyanxinxi" && item.sourceGroup !== "baoyanxinxi2026jsjby") {
+      return false;
+    }
+    if (source === "manual" && item.sourceGroup !== "manual") {
+      return false;
+    }
+    if (recent === "new" && !isWithinRecentDays(item.firstSeenAt)) {
+      return false;
+    }
+    if (recent === "updated" && !isRecentlyUpdated(item)) {
       return false;
     }
     if (keyword === "") {
@@ -815,6 +1123,171 @@ function formatGeneratedAt(value: string | undefined): string {
 
 function truncate(value: string, maxLength: number): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
+}
+
+function readFiltersFromUrl(): {
+  query: string;
+  range: RangeFilter;
+  source: SourceFilter;
+  recent: RecentFilter;
+  viewMode: ViewMode;
+  tiers: Set<TierFilter>;
+} {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    query: params.get("q") ?? "",
+    range: readOption(params.get("range"), RANGE_OPTIONS.map((option) => option.value), "future"),
+    source: readOption(params.get("source"), SOURCE_OPTIONS.map((option) => option.value), "all"),
+    recent: readOption(params.get("recent"), RECENT_OPTIONS.map((option) => option.value), "all"),
+    viewMode: readOption(params.get("view"), ["cards", "table"], "cards"),
+    tiers: readTierSet(params.get("tiers"))
+  };
+}
+
+function writeFiltersToUrl(filters: {
+  activeTiers: Set<TierFilter>;
+  query: string;
+  range: RangeFilter;
+  recent: RecentFilter;
+  source: SourceFilter;
+  viewMode: ViewMode;
+}): void {
+  const params = new URLSearchParams();
+  if (filters.query.trim() !== "") {
+    params.set("q", filters.query.trim());
+  }
+  if (filters.range !== "future") {
+    params.set("range", filters.range);
+  }
+  if (filters.source !== "all") {
+    params.set("source", filters.source);
+  }
+  if (filters.recent !== "all") {
+    params.set("recent", filters.recent);
+  }
+  if (filters.viewMode !== "cards") {
+    params.set("view", filters.viewMode);
+  }
+  if (filters.activeTiers.size !== TIER_OPTIONS.length) {
+    params.set("tiers", TIER_OPTIONS.filter((tier) => filters.activeTiers.has(tier)).join(","));
+  }
+  const nextQuery = params.toString();
+  const nextUrl = `${window.location.pathname}${nextQuery === "" ? "" : `?${nextQuery}`}`;
+  if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
+    window.history.replaceState(null, "", nextUrl);
+  }
+}
+
+function readOption<T extends string>(value: string | null, options: T[], fallback: T): T {
+  return value !== null && options.includes(value as T) ? (value as T) : fallback;
+}
+
+function readTierSet(value: string | null): Set<TierFilter> {
+  if (value === null || value.trim() === "") {
+    return new Set(TIER_OPTIONS);
+  }
+  const tiers = value
+    .split(",")
+    .filter((entry): entry is TierFilter => TIER_OPTIONS.includes(entry as TierFilter));
+  return new Set(tiers.length === 0 ? TIER_OPTIONS : tiers);
+}
+
+function useStoredKeySet(key: string): [Set<string>, (value: string) => void] {
+  const [values, setValues] = useState<Set<string>>(() => {
+    try {
+      const raw = window.localStorage.getItem(key);
+      return new Set(raw === null ? [] : (JSON.parse(raw) as string[]));
+    } catch {
+      return new Set();
+    }
+  });
+
+  useEffect(() => {
+    window.localStorage.setItem(key, JSON.stringify([...values]));
+  }, [key, values]);
+
+  function toggle(value: string): void {
+    setValues((previous) => {
+      const next = new Set(previous);
+      if (next.has(value)) {
+        next.delete(value);
+      } else {
+        next.add(value);
+      }
+      return next;
+    });
+  }
+
+  return [values, toggle];
+}
+
+function isWithinRecentDays(value: string | null): boolean {
+  if (value === null) {
+    return false;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return false;
+  }
+  return Date.now() - date.getTime() <= RECENT_DAYS * 24 * 60 * 60 * 1000;
+}
+
+function isRecentlyUpdated(item: DdlItem): boolean {
+  if (!isWithinRecentDays(item.updatedAt)) {
+    return false;
+  }
+  return item.firstSeenAt === null || item.updatedAt !== item.firstSeenAt;
+}
+
+function downloadIcs(items: DdlItem[], filename: string): void {
+  if (items.length === 0) {
+    return;
+  }
+  const content = buildIcs(items);
+  const blob = new Blob([content], { type: "text/calendar;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${filename}.ics`;
+  document.body?.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function buildIcs(items: DdlItem[]): string {
+  const lines = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//baoyan-ddl//csddl//ZH-CN",
+    "CALSCALE:GREGORIAN"
+  ];
+  for (const item of items) {
+    const deadline = new Date(item.deadlineAt);
+    if (Number.isNaN(deadline.getTime())) {
+      continue;
+    }
+    lines.push(
+      "BEGIN:VEVENT",
+      `UID:${escapeIcsText(item.key)}@csddl.muqyy.top`,
+      `DTSTAMP:${formatIcsDate(new Date())}`,
+      `DTSTART:${formatIcsDate(deadline)}`,
+      `SUMMARY:${escapeIcsText(`${item.school} ${item.institute} DDL`)}`,
+      `DESCRIPTION:${escapeIcsText(`${item.deadlineText}\\n${item.sourceLabel}\\n${item.website}`)}`,
+      `URL:${escapeIcsText(item.website)}`,
+      "END:VEVENT"
+    );
+  }
+  lines.push("END:VCALENDAR");
+  return `${lines.join("\r\n")}\r\n`;
+}
+
+function formatIcsDate(date: Date): string {
+  return date.toISOString().replace(/[-:]/gu, "").replace(/\.\d{3}Z$/u, "Z");
+}
+
+function escapeIcsText(value: string): string {
+  return value.replace(/\\/gu, "\\\\").replace(/\n/gu, "\\n").replace(/,/gu, "\\,").replace(/;/gu, "\\;");
 }
 
 const rootElement = document.getElementById("root");

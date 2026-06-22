@@ -1,5 +1,5 @@
 import { sha256Hex } from "./crypto";
-import type { Env, NormalizedItem, SourceStats } from "./types";
+import type { Env, NormalizedItem, ReviewCandidatePayload, SourceStats } from "./types";
 
 const DEFAULT_SOURCE_URL =
   "https://raw.githubusercontent.com/CS-BAOYAN/CS-BAOYAN-DDL/main/src/data/schools.json";
@@ -71,6 +71,22 @@ const EXCLUDE_PATTERNS = [
   /机械(?!与电子信息)|能源环境|新材料/u,
   /物理学院|数学科学|统计科学|统计与数据科学系/u,
   /口腔|中医|中山医学院|华西/u
+];
+
+const REVIEW_PATTERNS = [
+  /科学智能/u,
+  /智能创意/u,
+  /交互/u,
+  /信息/u,
+  /电子/u,
+  /系统/u,
+  /遥感/u,
+  /电气/u,
+  /仪器/u,
+  /物联网/u,
+  /量子/u,
+  /中国电子科技集团/u,
+  /信息支援部队/u
 ];
 
 const C9_SCHOOLS = [
@@ -220,6 +236,14 @@ export interface FetchSourceItemsResult {
   items: NormalizedItem[];
   stats: SourceStats[];
   baoyanXinxiSupplementedItemKeys: string[];
+  reviewCandidates: SourceReviewCandidateInput[];
+}
+
+export interface SourceReviewCandidateInput {
+  normalizedUrl: string;
+  sourceGroup: string;
+  reason: string;
+  payload: ReviewCandidatePayload;
 }
 
 interface BaoyanXinxiRecord {
@@ -273,7 +297,8 @@ export async function fetchSourceItemsWithStats(env: Env): Promise<FetchSourceIt
       },
       merged.baoyanXinxiStats
     ],
-    baoyanXinxiSupplementedItemKeys: finalized.baoyanXinxiSupplementedItemKeys
+    baoyanXinxiSupplementedItemKeys: finalized.baoyanXinxiSupplementedItemKeys,
+    reviewCandidates: baoyanXinxiResult.reviewCandidates
   };
 }
 
@@ -285,12 +310,35 @@ export async function normalizeSourceData(data: unknown): Promise<NormalizedItem
 export function normalizeBaoyanXinxiHtml(
   html: string,
   sourceUrl = DEFAULT_BAOYANXINXI_SOURCE_URL
-): { items: SourceItemInput[]; stats: SourceStats } {
+): { items: SourceItemInput[]; stats: SourceStats; reviewCandidates: SourceReviewCandidateInput[] } {
   const parsed = parseBaoyanXinxiHtml(html, sourceUrl);
   const items: SourceItemInput[] = [];
+  const reviewCandidates: SourceReviewCandidateInput[] = [];
 
   for (const record of parsed.records) {
-    if (!isBaoyanXinxiRelevant(record.name, record.institute)) {
+    const deadline = normalizeBaoyanXinxiDeadline(record.deadline);
+    const classification = classifyBaoyanXinxiRecord(record.name, record.institute);
+    if (classification === "review" && isFutureDeadline(deadline)) {
+      const normalizedUrl = canonicalizeNotificationUrl(record.website);
+      if (normalizedUrl === "") {
+        continue;
+      }
+      reviewCandidates.push({
+        normalizedUrl,
+        sourceGroup: BAOYANXINXI_SOURCE_GROUP,
+        reason: "review-keyword",
+        payload: {
+          sourceGroup: BAOYANXINXI_SOURCE_GROUP,
+          name: record.name,
+          institute: record.institute,
+          description: "保研信息平台候选条目",
+          deadline,
+          website: record.website
+        }
+      });
+      continue;
+    }
+    if (classification !== "accepted") {
       continue;
     }
     items.push({
@@ -298,7 +346,7 @@ export function normalizeBaoyanXinxiHtml(
       name: record.name,
       institute: record.institute,
       description: "保研信息平台补充源",
-      deadline: normalizeBaoyanXinxiDeadline(record.deadline),
+      deadline,
       website: record.website,
       tags: getSchoolTierTags(record.name)
     });
@@ -312,9 +360,11 @@ export function normalizeBaoyanXinxiHtml(
       rawCount: parsed.rawCount,
       acceptedCount: items.length,
       filteredCount: parsed.rawCount - items.length,
+      reviewCandidateCount: reviewCandidates.length,
       duplicateCount: 0,
       supplementedDeadlineCount: 0
-    }
+    },
+    reviewCandidates
   };
 }
 
@@ -351,14 +401,26 @@ export function normalizeBaoyanXinxiDeadline(value: string): string {
 }
 
 export function isBaoyanXinxiRelevant(name: string, institute: string): boolean {
+  return classifyBaoyanXinxiRecord(name, institute) === "accepted";
+}
+
+export function classifyBaoyanXinxiRecord(
+  name: string,
+  institute: string
+): "accepted" | "review" | "rejected" {
   const text = `${name} ${institute}`;
-  if (EXCLUDE_PATTERNS.some((pattern) => pattern.test(text))) {
-    return false;
-  }
-  return (
+  const hasIncludeMatch =
     INCLUDE_PATTERNS.some((pattern) => pattern.test(text)) ||
-    SCHOOL_INCLUDE_PATTERNS.some((pattern) => pattern.test(name))
-  );
+    SCHOOL_INCLUDE_PATTERNS.some((pattern) => pattern.test(name));
+  const hasExcludeMatch = EXCLUDE_PATTERNS.some((pattern) => pattern.test(text));
+
+  if (hasIncludeMatch && !hasExcludeMatch) {
+    return "accepted";
+  }
+  if (REVIEW_PATTERNS.some((pattern) => pattern.test(text))) {
+    return "review";
+  }
+  return "rejected";
 }
 
 export function getSchoolTierTags(name: string): string[] {
@@ -441,9 +503,41 @@ export function stableStringify(value: unknown): string {
   return JSON.stringify(value);
 }
 
+export async function createManualItemFromReviewPayload(
+  payload: ReviewCandidatePayload
+): Promise<NormalizedItem> {
+  const sourceGroup = "manual";
+  const itemInput: SourceItemInput = {
+    sourceGroup,
+    name: payload.name.trim(),
+    institute: payload.institute.trim(),
+    description: payload.description.trim(),
+    deadline: payload.deadline.trim(),
+    website: payload.website.trim(),
+    tags: getSchoolTierTags(payload.name)
+  };
+  const key = await sha256Hex(
+    stableStringify({
+      sourceGroup,
+      name: itemInput.name,
+      institute: itemInput.institute,
+      website: canonicalizeNotificationUrl(itemInput.website)
+    })
+  );
+  return {
+    ...itemInput,
+    key,
+    contentHash: await sha256Hex(stableStringify(itemInput))
+  };
+}
+
 async function fetchBaoyanXinxiItems(
   sourceUrl: string
-): Promise<{ items: SourceItemInput[]; stats: SourceStats }> {
+): Promise<{
+  items: SourceItemInput[];
+  stats: SourceStats;
+  reviewCandidates: SourceReviewCandidateInput[];
+}> {
   try {
     const response = await fetch(sourceUrl, {
       headers: {
@@ -464,10 +558,12 @@ async function fetchBaoyanXinxiItems(
         rawCount: 0,
         acceptedCount: 0,
         filteredCount: 0,
+        reviewCandidateCount: 0,
         duplicateCount: 0,
         supplementedDeadlineCount: 0,
         error: `拉取补充源失败：${message}`
-      }
+      },
+      reviewCandidates: []
     };
   }
 }
@@ -822,6 +918,11 @@ function parseComparableDeadline(value: string): Date | null {
   }
   const date = new Date(trimmed);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function isFutureDeadline(value: string): boolean {
+  const deadline = parseComparableDeadline(value);
+  return deadline !== null && deadline.getTime() > Date.now();
 }
 
 function toTaggedSourceItem(entry: SourceItemInput | TaggedSourceItem): TaggedSourceItem {

@@ -4,6 +4,9 @@ import type {
   NewDeadlineNotificationRow,
   NewDeadlineNotificationWithItem,
   NormalizedItem,
+  ReviewCandidatePayload,
+  SourceReviewCandidateRow,
+  SourceReviewCandidateWithPayload,
   SubscriberRow
 } from "./types";
 
@@ -170,11 +173,13 @@ export async function getSnapshots(env: Env): Promise<Map<string, ItemSnapshotRo
   return new Map(rows.map((row) => [row.item_key, row]));
 }
 
+export async function getSnapshotRows(env: Env): Promise<ItemSnapshotRow[]> {
+  const result = await env.DB.prepare("SELECT * FROM item_snapshots").all<ItemSnapshotRow>();
+  return result.results ?? [];
+}
+
 export async function getSnapshotItems(env: Env): Promise<NormalizedItem[]> {
-  const result = await env.DB.prepare(
-    "SELECT payload FROM item_snapshots ORDER BY item_key ASC"
-  ).all<{ payload: string }>();
-  return (result.results ?? []).map((row) => JSON.parse(row.payload) as NormalizedItem);
+  return (await getSnapshotRows(env)).map((row) => JSON.parse(row.payload) as NormalizedItem);
 }
 
 export async function upsertSnapshots(
@@ -191,18 +196,204 @@ export async function upsertSnapshots(
           payload,
           source_group,
           first_seen_at,
-          updated_at
+          updated_at,
+          last_seen_at,
+          missing_since
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
         ON CONFLICT(item_key) DO UPDATE SET
           content_hash = excluded.content_hash,
           payload = excluded.payload,
           source_group = excluded.source_group,
-          updated_at = excluded.updated_at
+          updated_at = CASE
+            WHEN item_snapshots.content_hash <> excluded.content_hash THEN excluded.updated_at
+            ELSE item_snapshots.updated_at
+          END,
+          last_seen_at = excluded.last_seen_at,
+          missing_since = NULL
       `
-    ).bind(item.key, item.contentHash, JSON.stringify(item), item.sourceGroup, now, now)
+    ).bind(item.key, item.contentHash, JSON.stringify(item), item.sourceGroup, now, now, now)
   );
   await runBatchInChunks(env, statements);
+}
+
+export async function getUnmissingSnapshotRefs(
+  env: Env
+): Promise<Array<{ item_key: string; source_group: string }>> {
+  const result = await env.DB.prepare(
+    "SELECT item_key, source_group FROM item_snapshots WHERE missing_since IS NULL"
+  ).all<{ item_key: string; source_group: string }>();
+  return result.results ?? [];
+}
+
+export async function markSnapshotsMissing(
+  env: Env,
+  itemKeys: string[],
+  now: string
+): Promise<number> {
+  const statements = itemKeys.map((itemKey) =>
+    env.DB.prepare(
+      `
+        UPDATE item_snapshots
+        SET missing_since = ?
+        WHERE item_key = ? AND missing_since IS NULL
+      `
+    ).bind(now, itemKey)
+  );
+  const results = await runBatchInChunks(env, statements);
+  return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
+}
+
+export async function upsertReviewCandidates(
+  env: Env,
+  candidates: Array<{
+    normalizedUrl: string;
+    sourceGroup: string;
+    reason: string;
+    payload: ReviewCandidatePayload;
+  }>,
+  now: string
+): Promise<number> {
+  const statements = candidates.map((candidate) =>
+    env.DB.prepare(
+      `
+        INSERT INTO source_review_candidates (
+          normalized_url,
+          source_group,
+          status,
+          reason,
+          payload,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, 'pending', ?, ?, ?, ?)
+        ON CONFLICT(normalized_url, source_group) DO UPDATE SET
+          reason = CASE
+            WHEN source_review_candidates.status = 'pending' THEN excluded.reason
+            ELSE source_review_candidates.reason
+          END,
+          payload = CASE
+            WHEN source_review_candidates.status = 'pending' THEN excluded.payload
+            ELSE source_review_candidates.payload
+          END,
+          updated_at = CASE
+            WHEN source_review_candidates.status = 'pending' THEN excluded.updated_at
+            ELSE source_review_candidates.updated_at
+          END
+      `
+    ).bind(
+      candidate.normalizedUrl,
+      candidate.sourceGroup,
+      candidate.reason,
+      JSON.stringify(candidate.payload),
+      now,
+      now
+    )
+  );
+  const results = await runBatchInChunks(env, statements);
+  return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
+}
+
+export async function getPendingReviewCandidates(
+  env: Env
+): Promise<SourceReviewCandidateWithPayload[]> {
+  const result = await env.DB.prepare(
+    `
+      SELECT *
+      FROM source_review_candidates
+      WHERE status = 'pending'
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 200
+    `
+  ).all<SourceReviewCandidateRow>();
+  return (result.results ?? []).map(hydrateReviewCandidate);
+}
+
+export async function getReviewCandidateById(
+  env: Env,
+  id: number
+): Promise<SourceReviewCandidateWithPayload | null> {
+  const row = await env.DB.prepare("SELECT * FROM source_review_candidates WHERE id = ?")
+    .bind(id)
+    .first<SourceReviewCandidateRow>();
+  return row === null ? null : hydrateReviewCandidate(row);
+}
+
+export async function approveReviewCandidate(
+  env: Env,
+  id: number,
+  note: string | null,
+  now: string
+): Promise<void> {
+  await env.DB.prepare(
+    `
+      UPDATE source_review_candidates
+      SET status = 'approved', reviewed_at = ?, review_note = ?, updated_at = ?
+      WHERE id = ?
+    `
+  )
+    .bind(now, note, now, id)
+    .run();
+}
+
+export async function rejectReviewCandidate(
+  env: Env,
+  id: number,
+  note: string | null,
+  now: string
+): Promise<void> {
+  await env.DB.prepare(
+    `
+      UPDATE source_review_candidates
+      SET status = 'rejected', reviewed_at = ?, review_note = ?, updated_at = ?
+      WHERE id = ?
+    `
+  )
+    .bind(now, note, now, id)
+    .run();
+}
+
+export async function insertReviewRule(
+  env: Env,
+  ruleType: "allow" | "reject",
+  normalizedUrl: string,
+  note: string | null,
+  now: string
+): Promise<void> {
+  await env.DB.prepare(
+    `
+      INSERT OR IGNORE INTO source_review_rules (rule_type, normalized_url, note, created_at)
+      VALUES (?, ?, ?, ?)
+    `
+  )
+    .bind(ruleType, normalizedUrl, note, now)
+    .run();
+}
+
+export async function getManualItems(env: Env): Promise<NormalizedItem[]> {
+  const result = await env.DB.prepare(
+    "SELECT payload FROM manual_items ORDER BY updated_at DESC, id DESC"
+  ).all<{ payload: string }>();
+  return (result.results ?? []).map((row) => JSON.parse(row.payload) as NormalizedItem);
+}
+
+export async function upsertManualItem(
+  env: Env,
+  item: NormalizedItem,
+  now: string
+): Promise<void> {
+  await env.DB.prepare(
+    `
+      INSERT INTO manual_items (item_key, payload, source_group, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(item_key) DO UPDATE SET
+        payload = excluded.payload,
+        source_group = excluded.source_group,
+        updated_at = excluded.updated_at
+    `
+  )
+    .bind(item.key, JSON.stringify(item), item.sourceGroup, now, now)
+    .run();
 }
 
 export async function insertNewDeadlineNotifications(
@@ -306,4 +497,13 @@ async function runBatchInChunks(
     results.push(...(await env.DB.batch(chunk)));
   }
   return results;
+}
+
+function hydrateReviewCandidate(
+  row: SourceReviewCandidateRow
+): SourceReviewCandidateWithPayload {
+  return {
+    ...row,
+    candidate: JSON.parse(row.payload) as ReviewCandidatePayload
+  };
 }
