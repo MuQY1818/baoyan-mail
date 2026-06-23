@@ -197,7 +197,7 @@ function renderDeadlineListEmail(params: {
       </section>
       ${entries}
       <p class="footer">
-        数据来源：CS-BAOYAN-DDL 和保研信息平台补充源。你收到这封邮件是因为${escapeHtml(
+        数据来源：保研信息平台。你收到这封邮件是因为${escapeHtml(
           params.footerReason
         )}。
         <br>

@@ -1,6 +1,6 @@
 # 保研 DDL 速查 (CS Baoyan Deadlines)
 
-> 计算机与电子信息方向保研（夏令营 / 预推免）截止时间的结构化数据。汇总自 CS-BAOYAN-DDL 与保研信息平台，按截止时间排序，每日更新。
+> 保研（夏令营 / 预推免）截止时间的结构化数据。汇总自保研信息平台，按截止时间排序，每日更新，并为计算机、电子信息等方向提供分类标签。
 
 本站为 LLM / Agent 提供机器可读的 JSON 接口，可直接抓取，无需解析 HTML 页面。
 
@@ -38,8 +38,9 @@ GET 返回 `application/json; charset=utf-8`：
 - `remainingText`: 剩余时间中文展示，如 "今日截止" / "3 天后截止" / "已截止" (string)
 - `status`: 取值 `"today"` | `"future"` | `"expired"` (string)
 - `tier`: 学校层次，取值之一 `"Top2"` | `"华五"` | `"C9"` | `"985"` | `"211"` | `"其他"` (string)
-- `sourceGroup`: 来源分组标识，如 `"camp2026"`（夏令营）/ `"yutuimian2026"`（预推免）/ `"baoyanxinxi2026jsjby"`（保研信息平台）(string)
-- `sourceLabel`: 来源的中文展示，如 "2026 夏令营" (string)
+- `areas`: 方向分类数组，可能包含 `"计算机"`、`"软件"`、`"人工智能"`、`"网络安全"`、`"电子信息"`、`"通信"`、`"集成电路"`、`"自动化控制"`、`"数据科学"`、`"机器人光电"`、`"其他"` (string[])
+- `sourceGroup`: 来源分组标识，如 `"baoyanxinxi2026jsjby"`（保研信息平台）/ `"manual"`（人工补充）(string)
+- `sourceLabel`: 来源的中文展示，如 "保研信息平台" / "人工补充" (string)
 - `website`: 原始通知链接 (string, URL)
 - `firstSeenAt`: 系统首次看到该条目的时间，UTC ISO 字符串或 null
 - `updatedAt`: 内容最近变化时间，UTC ISO 字符串或 null
@@ -51,5 +52,5 @@ GET 返回 `application/json; charset=utf-8`：
 
 - `items` 已按 `deadlineAt` 升序排序；同截止时间再按学校层次、校名排序。
 - 接口默认只返回未截止条目；超过 48 小时宽限期的 stale 条目默认隐藏，可参考响应里的 `staleCount`。
-- 按层次筛选用 `tier`；按来源筛选用 `sourceGroup`；按紧迫度筛选用 `remainingDays`。
+- 按方向筛选用 `areas`；按层次筛选用 `tier`；按来源筛选用 `sourceGroup`；按紧迫度筛选用 `remainingDays`。
 - 数据在边缘约缓存 5 分钟，`generatedAt` 为该次生成时刻，`lastSyncedAt` 为最近源站同步时刻。

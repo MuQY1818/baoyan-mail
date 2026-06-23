@@ -10,6 +10,7 @@ import {
   canonicalizeNotificationUrl,
   classifyBaoyanXinxiRecord,
   fetchSourceItemsWithStats,
+  getBaoyanXinxiAreas,
   getSchoolTierTags,
   isBaoyanXinxiRelevant,
   normalizeBaoyanXinxiDeadline,
@@ -88,7 +89,12 @@ class FakeD1Database {
 
   all<T>(sql: string, bindings: unknown[]): T[] {
     if (sql.includes("SELECT * FROM item_snapshots")) {
-      return Array.from(this.itemSnapshots.values()) as T[];
+      const rows = Array.from(this.itemSnapshots.values());
+      if (sql.includes("WHERE source_group IN")) {
+        const sourceGroups = new Set(bindings.map(String));
+        return rows.filter((row) => sourceGroups.has(row.source_group)) as T[];
+      }
+      return rows as T[];
     }
     if (sql.includes("SELECT item_key, source_group FROM item_snapshots")) {
       return Array.from(this.itemSnapshots.values())
@@ -243,7 +249,7 @@ describe("source normalization", () => {
     expect(changes[0]?.kind).toBe("changed");
   });
 
-  it("parses and filters BaoyanXinxi HTML records", () => {
+  it("parses BaoyanXinxi HTML records without hiding unrelated records", () => {
     const html = `
       <h2 id="清华大学"><a href="#清华大学"></a>清华大学</h2>
       <p>【报名截止：<span class="deadline" data-deadline="2026-6-20T24:00:00">Loading…</span>】<a target="_blank" href="https://example.com/cs?scene=1&amp;click_id=20">计算机系</a></p>
@@ -255,12 +261,18 @@ describe("source normalization", () => {
     const result = normalizeBaoyanXinxiHtml(html, "https://www.baoyanxinxi.cn/2026jsjby/");
 
     expect(result.stats.rawCount).toBe(3);
-    expect(result.stats.acceptedCount).toBe(2);
-    expect(result.stats.filteredCount).toBe(1);
-    expect(result.items.map((item) => item.institute)).toEqual(["计算机系", "网络空间安全学院"]);
+    expect(result.stats.acceptedCount).toBe(3);
+    expect(result.stats.filteredCount).toBe(0);
+    expect(result.items.map((item) => item.institute)).toEqual([
+      "计算机系",
+      "生命科学学院",
+      "网络空间安全学院"
+    ]);
     expect(result.items[0]?.deadline).toBe("2026-06-20T16:00:00.000Z");
     expect(result.items[0]?.tags).toEqual(["Top2"]);
-    expect(result.items[1]?.website).toBe("https://www.baoyanxinxi.cn/notice");
+    expect(result.items[0]?.areas).toEqual(["计算机"]);
+    expect(result.items[1]?.areas).toEqual(["其他"]);
+    expect(result.items[2]?.website).toBe("https://www.baoyanxinxi.cn/notice");
   });
 
   it("normalizes BaoyanXinxi deadlines", () => {
@@ -281,13 +293,14 @@ describe("source normalization", () => {
     expect(isBaoyanXinxiRelevant("南京大学", "人工智能学院-LAMDA实验室")).toBe(true);
     expect(isBaoyanXinxiRelevant("中国科学技术大学", "网络空间安全学院")).toBe(true);
     expect(isBaoyanXinxiRelevant("哈尔滨工业大学", "电子与信息工程学院")).toBe(true);
+    expect(isBaoyanXinxiRelevant("浙江大学", "信息与电子工程学院")).toBe(true);
     expect(isBaoyanXinxiRelevant("北京邮电大学", "未来学院")).toBe(true);
     expect(isBaoyanXinxiRelevant("复旦大学", "公共卫生学院")).toBe(false);
     expect(isBaoyanXinxiRelevant("浙江大学", "材料科学与工程学院")).toBe(false);
     expect(isBaoyanXinxiRelevant("北京大学", "光华管理学院")).toBe(false);
   });
 
-  it("puts borderline future records into review candidates instead of publishing directly", () => {
+  it("classifies borderline records but still publishes them for user-side filtering", () => {
     expect(classifyBaoyanXinxiRecord("北京大学深圳研究生院", "科学智能学院")).toBe("review");
     const html = `
       <h2 id="北京大学深圳研究生院"><a href="#北京大学深圳研究生院"></a>北京大学深圳研究生院</h2>
@@ -295,14 +308,25 @@ describe("source normalization", () => {
     `;
     const result = normalizeBaoyanXinxiHtml(html, "https://www.baoyanxinxi.cn/2026jsjby/");
 
-    expect(result.items).toHaveLength(0);
-    expect(result.reviewCandidates).toHaveLength(1);
-    expect(result.stats.reviewCandidateCount).toBe(1);
-    expect(result.reviewCandidates[0]?.payload).toMatchObject({
+    expect(result.items).toHaveLength(1);
+    expect(result.reviewCandidates).toHaveLength(0);
+    expect(result.stats.reviewCandidateCount).toBe(0);
+    expect(result.items[0]).toMatchObject({
       name: "北京大学深圳研究生院",
       institute: "科学智能学院",
-      website: "https://example.com/pku-smart"
+      website: "https://example.com/pku-smart",
+      areas: ["人工智能"]
     });
+  });
+
+  it("assigns direction areas for user-side filtering", () => {
+    expect(getBaoyanXinxiAreas("浙江大学", "网络空间安全学院")).toEqual(["网络安全"]);
+    expect(getBaoyanXinxiAreas("浙江大学", "信息与电子工程学院")).toEqual(["电子信息"]);
+    expect(getBaoyanXinxiAreas("中山大学", "电子与通信工程学院")).toEqual([
+      "电子信息",
+      "通信"
+    ]);
+    expect(getBaoyanXinxiAreas("复旦大学", "公共卫生学院")).toEqual(["其他"]);
   });
 
   it("adds conservative school tier tags", () => {
@@ -323,44 +347,26 @@ describe("source normalization", () => {
   });
 
   it("dedupes BaoyanXinxi records by canonical source URL", async () => {
-    const sourceData = {
-      camp2026: [
-        {
-          name: "清华大学",
-          institute: "计算机系",
-          description: "夏令营",
-          deadline: "",
-          website: "https://mp.weixin.qq.com/s/example?scene=1",
-          tags: ["985"]
-        }
-      ]
-    };
     const html = `
       <h2 id="清华大学"><a href="#清华大学"></a>清华大学</h2>
       <p>【报名截止：<span class="deadline" data-deadline="2026-06-20T23:59:59">Loading…</span>】<a target="_blank" href="https://mp.weixin.qq.com/s/example?click_id=20">计算机系</a></p>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-06-20T23:59:59">Loading…</span>】<a target="_blank" href="https://mp.weixin.qq.com/s/example?scene=1">计算机系</a></p>
     `;
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async (input) => {
-      const url = String(input);
-      if (url.includes("schools.json")) {
-        return new Response(JSON.stringify(sourceData), { status: 200 });
-      }
-      return new Response(html, { status: 200, headers: { "content-type": "text/html" } });
-    };
+    globalThis.fetch = async () =>
+      new Response(html, { status: 200, headers: { "content-type": "text/html" } });
 
     try {
       const result = await fetchSourceItemsWithStats({
-        SOURCE_URL:
-          "https://raw.githubusercontent.com/CS-BAOYAN/CS-BAOYAN-DDL/main/src/data/schools.json",
         BAOYANXINXI_SOURCE_URL: "https://www.baoyanxinxi.cn/2026jsjby/"
       } as Env);
 
       expect(result.items).toHaveLength(1);
-      expect(result.items[0]?.sourceGroup).toBe("camp2026");
+      expect(result.items[0]?.sourceGroup).toBe("baoyanxinxi2026jsjby");
       expect(result.items[0]?.deadline).toBe("2026-06-20T15:59:59.000Z");
-      expect(result.stats[1]).toMatchObject({
+      expect(result.stats[0]).toMatchObject({
         duplicateCount: 1,
-        supplementedDeadlineCount: 1
+        supplementedDeadlineCount: 0
       });
     } finally {
       globalThis.fetch = originalFetch;
@@ -398,7 +404,7 @@ describe("source normalization", () => {
     });
   });
 
-  it("initializes BaoyanXinxi supplemental snapshots without historical notifications", async () => {
+  it("suppresses new DDL mail when a BaoyanXinxi record matches an old CS snapshot URL", async () => {
     const db = new FakeD1Database();
     const originalSourceItems = await normalizeSourceData({
       camp2026: [
@@ -407,7 +413,7 @@ describe("source normalization", () => {
           institute: "计算机学院",
           description: "夏令营",
           deadline: "",
-          website: "https://example.com/cs",
+          website: "https://example.com/zju-cs",
           tags: ["C9"]
         }
       ]
@@ -425,36 +431,17 @@ describe("source normalization", () => {
       missing_since: null
     });
 
-    const sourceData = {
-      camp2026: [
-        {
-          name: "南京大学",
-          institute: "计算机学院",
-          description: "夏令营",
-          deadline: "",
-          website: "https://example.com/cs",
-          tags: ["C9"]
-        }
-      ]
-    };
     const html = `
       <h2 id="浙江大学"><a href="#浙江大学"></a>浙江大学</h2>
       <p>【报名截止：<span class="deadline" data-deadline="2099-06-20T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/zju-cs">计算机学院</a></p>
     `;
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async (input) => {
-      const url = String(input);
-      if (url.includes("schools.json")) {
-        return new Response(JSON.stringify(sourceData), { status: 200 });
-      }
-      return new Response(html, { status: 200, headers: { "content-type": "text/html" } });
-    };
+    globalThis.fetch = async () =>
+      new Response(html, { status: 200, headers: { "content-type": "text/html" } });
 
     try {
       const result = await runCheck({
         DB: db as unknown as D1Database,
-        SOURCE_URL:
-          "https://raw.githubusercontent.com/CS-BAOYAN/CS-BAOYAN-DDL/main/src/data/schools.json",
         BAOYANXINXI_SOURCE_URL: "https://www.baoyanxinxi.cn/2026jsjby/",
         APP_BASE_URL: "https://example.com"
       } as Env);
@@ -464,11 +451,9 @@ describe("source normalization", () => {
       expect(result.dailyDeadlineDetected).toBe(0);
       expect(result.newDeadlineDetected).toBe(0);
       expect(db.newDeadlineNotifications).toHaveLength(0);
-      expect(result.sourceStats?.[1]).toMatchObject({
+      expect(result.sourceStats?.[0]).toMatchObject({
         sourceGroup: "baoyanxinxi2026jsjby",
-        acceptedCount: 1,
-        initialized: true,
-        initializedThisRun: true
+        acceptedCount: 1
       });
     } finally {
       globalThis.fetch = originalFetch;
@@ -479,30 +464,23 @@ describe("source normalization", () => {
     const db = new FakeD1Database();
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-07T01:00:00.000Z"));
-    const sourceData = {
-      camp2026: [
-        {
-          name: "南京大学",
-          institute: "计算机学院",
-          description: "夏令营",
-          deadline: "2026-06-10T23:59:59+08:00",
-          website: "https://example.com/cs",
-          tags: ["C9"]
-        }
-      ]
-    };
+    const html = `
+      <h2 id="南京大学"><a href="#南京大学"></a>南京大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/cs">计算机学院</a></p>
+    `;
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => new Response(JSON.stringify(sourceData), { status: 200 });
+    globalThis.fetch = async () =>
+      new Response(html, { status: 200, headers: { "content-type": "text/html" } });
 
     try {
       const first = await runCheck({
         DB: db as unknown as D1Database,
-        SOURCE_URL: "https://example.com/schools.json",
+        BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
       } as Env);
       const second = await runCheck({
         DB: db as unknown as D1Database,
-        SOURCE_URL: "https://example.com/schools.json",
+        BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
       } as Env);
 
@@ -511,6 +489,40 @@ describe("source normalization", () => {
       expect(second.dailyDeadlineDetected).toBe(1);
       expect(second.dailyDeadlineSent).toBe(0);
       expect(db.appState.get("daily_deadline_digest_sent_date")).toBeDefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps unrelated source records public but excludes them from email digests", async () => {
+    const db = new FakeD1Database();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-07T01:00:00.000Z"));
+    const html = `
+      <h2 id="南京大学"><a href="#南京大学"></a>南京大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/cs">计算机学院</a></p>
+      <h2 id="复旦大学"><a href="#复旦大学"></a>复旦大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/public-health">公共卫生学院</a></p>
+    `;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(html, { status: 200, headers: { "content-type": "text/html" } });
+
+    try {
+      const result = await runCheck({
+        DB: db as unknown as D1Database,
+        BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
+        APP_BASE_URL: "https://example.com"
+      } as Env);
+
+      expect(result.scanned).toBe(2);
+      expect(result.dailyDeadlineDetected).toBe(1);
+      expect(result.dailyDeadlineSent).toBe(1);
+      expect(Array.from(db.itemSnapshots.values()).map((row) => row.source_group)).toEqual([
+        "baoyanxinxi2026jsjby",
+        "baoyanxinxi2026jsjby"
+      ]);
     } finally {
       globalThis.fetch = originalFetch;
       vi.useRealTimers();
@@ -546,46 +558,27 @@ describe("source normalization", () => {
       missing_since: null
     });
 
-    const sourceData = {
-      camp2026: [
-        {
-          name: "南京大学",
-          institute: "计算机学院",
-          description: "夏令营",
-          deadline: "",
-          website: "https://example.com/cs",
-          tags: ["C9"]
-        },
-        {
-          name: "浙江大学",
-          institute: "计算机学院",
-          description: "夏令营",
-          deadline: "2026-06-10T23:59:59+08:00",
-          website: "https://example.com/zju",
-          tags: ["C9"]
-        },
-        {
-          name: "复旦大学",
-          institute: "计算机学院",
-          description: "夏令营",
-          deadline: "",
-          website: "https://example.com/fdu",
-          tags: ["C9"]
-        }
-      ]
-    };
+    const html = `
+      <h2 id="南京大学"><a href="#南京大学"></a>南京大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="N/A">Loading…</span>】<a target="_blank" href="https://example.com/cs">计算机学院</a></p>
+      <h2 id="浙江大学"><a href="#浙江大学"></a>浙江大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/zju">计算机学院</a></p>
+      <h2 id="复旦大学"><a href="#复旦大学"></a>复旦大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="N/A">Loading…</span>】<a target="_blank" href="https://example.com/fdu">计算机学院</a></p>
+    `;
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => new Response(JSON.stringify(sourceData), { status: 200 });
+    globalThis.fetch = async () =>
+      new Response(html, { status: 200, headers: { "content-type": "text/html" } });
 
     try {
       const first = await runCheck({
         DB: db as unknown as D1Database,
-        SOURCE_URL: "https://example.com/schools.json",
+        BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
       } as Env);
       const second = await runCheck({
         DB: db as unknown as D1Database,
-        SOURCE_URL: "https://example.com/schools.json",
+        BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
       } as Env);
 
@@ -600,41 +593,86 @@ describe("source normalization", () => {
     }
   });
 
+  it("keeps unrelated source records public but out of email queues", async () => {
+    const db = new FakeD1Database();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-07T01:00:00.000Z"));
+    const html = `
+      <h2 id="南京大学"><a href="#南京大学"></a>南京大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/cs">计算机学院</a></p>
+      <h2 id="复旦大学"><a href="#复旦大学"></a>复旦大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/public-health">公共卫生学院</a></p>
+    `;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(html, { status: 200, headers: { "content-type": "text/html" } });
+
+    try {
+      const result = await runCheck({
+        DB: db as unknown as D1Database,
+        BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
+        APP_BASE_URL: "https://example.com"
+      } as Env);
+      const publicResponse = buildDdlResponse(Array.from(db.itemSnapshots.values()), new Date());
+
+      expect(result.scanned).toBe(2);
+      expect(result.dailyDeadlineDetected).toBe(1);
+      expect(result.newDeadlineDetected).toBe(0);
+      expect(publicResponse.items.map((entry) => entry.institute).sort()).toEqual([
+        "公共卫生学院",
+        "计算机学院"
+      ]);
+      expect(publicResponse.items.find((entry) => entry.institute === "公共卫生学院")?.areas).toEqual([
+        "其他"
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
   it("marks disappeared source records as missing without sending mail in sync-only mode", async () => {
     const db = new FakeD1Database();
-    const originalItems = await normalizeSourceData({
-      camp2026: [
-        {
-          name: "南京大学",
-          institute: "计算机学院",
-          description: "夏令营",
-          deadline: "2099-06-10T23:59:59+08:00",
-          website: "https://example.com/nju",
-          tags: ["C9"]
-        }
-      ]
-    });
-    const originalItem = originalItems[0];
-    expect(originalItem).toBeDefined();
-    db.itemSnapshots.set(originalItem!.key, {
-      item_key: originalItem!.key,
-      content_hash: originalItem!.contentHash,
-      payload: JSON.stringify(originalItem),
-      source_group: originalItem!.sourceGroup,
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(
+        `
+          <h2 id="南京大学"><a href="#南京大学"></a>南京大学</h2>
+          <p>【报名截止：<span class="deadline" data-deadline="2099-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/nju">计算机学院</a></p>
+        `,
+        { status: 200, headers: { "content-type": "text/html" } }
+      );
+    const [finalizedItem] = (
+      await fetchSourceItemsWithStats({
+        BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html"
+      } as Env)
+    ).items;
+    expect(finalizedItem).toBeDefined();
+    db.itemSnapshots.set(finalizedItem!.key, {
+      item_key: finalizedItem!.key,
+      content_hash: finalizedItem!.contentHash,
+      payload: JSON.stringify(finalizedItem),
+      source_group: finalizedItem!.sourceGroup,
       first_seen_at: "2026-06-18T00:00:00.000Z",
       updated_at: "2026-06-18T00:00:00.000Z",
       last_seen_at: "2026-06-18T00:00:00.000Z",
       missing_since: null
     });
 
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => new Response(JSON.stringify({ camp2026: [] }), { status: 200 });
+    globalThis.fetch = async () =>
+      new Response(`
+        <h2 id="复旦大学"><a href="#复旦大学"></a>复旦大学</h2>
+        <p>【报名截止：<span class="deadline" data-deadline="2099-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/life">生命科学学院</a></p>
+      `, {
+        status: 200,
+        headers: { "content-type": "text/html" }
+      });
 
     try {
       const result = await runCheck(
         {
           DB: db as unknown as D1Database,
-          SOURCE_URL: "https://example.com/schools.json",
+          BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
           APP_BASE_URL: "https://example.com"
         } as Env,
         "https://example.com",
@@ -643,7 +681,7 @@ describe("source normalization", () => {
 
       expect(result.missingCount).toBe(1);
       expect(result.newDeadlineDetected).toBe(0);
-      expect(db.itemSnapshots.get(originalItem!.key)?.missing_since).toBeDefined();
+      expect(db.itemSnapshots.get(finalizedItem!.key)?.missing_since).toBeDefined();
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -895,6 +933,27 @@ describe("DDL API", () => {
       content_hash: item.contentHash,
       payload: JSON.stringify(item),
       source_group: item.sourceGroup,
+      first_seen_at: "2026-06-01T00:00:00.000Z",
+      updated_at: "2026-06-01T00:00:00.000Z",
+      last_seen_at: "2026-06-01T00:00:00.000Z",
+      missing_since: null
+    });
+    const hiddenOldSourceItem: NormalizedItem = {
+      key: "old-source",
+      contentHash: "hash",
+      sourceGroup: "camp2026",
+      name: "清华大学",
+      institute: "计算机系",
+      description: "旧源条目",
+      deadline: "2099-06-10T00:00:00+08:00",
+      website: "https://example.com/thu",
+      tags: []
+    };
+    db.itemSnapshots.set(hiddenOldSourceItem.key, {
+      item_key: hiddenOldSourceItem.key,
+      content_hash: hiddenOldSourceItem.contentHash,
+      payload: JSON.stringify(hiddenOldSourceItem),
+      source_group: hiddenOldSourceItem.sourceGroup,
       first_seen_at: "2026-06-01T00:00:00.000Z",
       updated_at: "2026-06-01T00:00:00.000Z",
       last_seen_at: "2026-06-01T00:00:00.000Z",

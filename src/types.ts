@@ -1,6 +1,5 @@
 export interface Env {
   DB: D1Database;
-  SOURCE_URL?: string;
   BAOYANXINXI_SOURCE_URL?: string;
   APP_BASE_URL?: string;
   MAIL_PROVIDER?: string;
@@ -39,6 +38,7 @@ export interface NormalizedItem {
   deadline: string;
   website: string;
   tags: string[];
+  areas?: string[];
 }
 
 export interface ItemSnapshotRow {
@@ -88,8 +88,6 @@ export interface SourceStats {
   reviewCandidateCount?: number;
   duplicateCount: number;
   supplementedDeadlineCount: number;
-  initialized?: boolean;
-  initializedThisRun?: boolean;
   error?: string;
 }
 

@@ -1,4 +1,4 @@
-import { canonicalizeNotificationUrl, getSchoolTierTags } from "./source";
+import { canonicalizeNotificationUrl, getBaoyanXinxiAreas, getSchoolTierTags } from "./source";
 import type { ItemSnapshotRow, NormalizedItem } from "./types";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -24,6 +24,7 @@ export interface DdlApiItem {
   remainingText: string;
   status: "today" | "future" | "expired";
   tier: string;
+  areas: string[];
   sourceGroup: string;
   sourceLabel: string;
   website: string;
@@ -188,6 +189,7 @@ export function serializeDdlItem(
     remainingText: formatRemainingText(status, remainingDays),
     status,
     tier,
+    areas: item.areas ?? getBaoyanXinxiAreas(item.name, item.institute),
     sourceGroup: item.sourceGroup,
     sourceLabel: formatSourceGroup(item.sourceGroup),
     website: item.website,

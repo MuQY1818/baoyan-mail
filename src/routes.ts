@@ -5,7 +5,7 @@ import {
   getAppState,
   getPendingReviewCandidates,
   getReviewCandidateById,
-  getSnapshotRows,
+  getSnapshotRowsBySourceGroups,
   insertReviewRule,
   rejectReviewCandidate,
   unsubscribeByToken,
@@ -17,6 +17,8 @@ import { sendConfirmationEmail } from "./email";
 import { runCheck } from "./checker";
 import { createToken, sha256Hex, tokenHash } from "./crypto";
 import {
+  BAOYANXINXI_SOURCE_GROUP,
+  MANUAL_SOURCE_GROUP,
   canonicalizeNotificationUrl,
   createManualItemFromReviewPayload,
   normalizeBaoyanXinxiDeadline
@@ -188,7 +190,7 @@ async function handleSyncSources(
 
 async function handleDdl(env: Env): Promise<Response> {
   const response = buildDdlResponse(
-    await getSnapshotRows(env),
+    await getSnapshotRowsBySourceGroups(env, [BAOYANXINXI_SOURCE_GROUP, MANUAL_SOURCE_GROUP]),
     new Date(),
     await getAppState(env, "last_synced_at")
   );

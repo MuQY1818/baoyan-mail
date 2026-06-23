@@ -1,10 +1,9 @@
 import { sha256Hex } from "./crypto";
 import type { Env, NormalizedItem, ReviewCandidatePayload, SourceStats } from "./types";
 
-const DEFAULT_SOURCE_URL =
-  "https://raw.githubusercontent.com/CS-BAOYAN/CS-BAOYAN-DDL/main/src/data/schools.json";
 const DEFAULT_BAOYANXINXI_SOURCE_URL = "https://www.baoyanxinxi.cn/2026jsjby/";
 export const BAOYANXINXI_SOURCE_GROUP = "baoyanxinxi2026jsjby";
+export const MANUAL_SOURCE_GROUP = "manual";
 const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const SHANGHAI_YEAR_FORMATTER = new Intl.DateTimeFormat("en-CA", {
   timeZone: SHANGHAI_TIME_ZONE,
@@ -42,7 +41,7 @@ const INCLUDE_PATTERNS = [
   /软件/u,
   /人工智能|智能科学|智能学部|智能工程|智能制造|智能产业/u,
   /网络空间安全|网安|信息安全|密码/u,
-  /信息工程|信息科学|电子信息|电子工程|电子科学|信息光电子|交叉信息|数据与信息/u,
+  /信息工程|信息科学|信息与电子|电子与信息|电子与通信|电子信息|电子工程|电子学院|电子科学|信息光电子|交叉信息|数据与信息/u,
   /通信|信息与通信|信通/u,
   /集成电路|微电子|半导体|芯片/u,
   /自动化|控制科学|控制工程|控制学院/u,
@@ -87,6 +86,51 @@ const REVIEW_PATTERNS = [
   /量子/u,
   /中国电子科技集团/u,
   /信息支援部队/u
+];
+
+const AREA_RULES = [
+  {
+    label: "计算机",
+    patterns: [/计算机|计科|计算/u]
+  },
+  {
+    label: "软件",
+    patterns: [/软件/u]
+  },
+  {
+    label: "人工智能",
+    patterns: [/人工智能|智能科学|智能学部|智能工程|智能制造|智能产业|科学智能/u]
+  },
+  {
+    label: "网络安全",
+    patterns: [/网络空间安全|网安|信息安全|密码/u]
+  },
+  {
+    label: "电子信息",
+    patterns: [
+      /信息工程|信息科学|信息与电子|电子与信息|电子与通信|信息电子|电子信息|电子工程|电子学院|电子科学|信息光电子|数据与信息|交叉信息/u
+    ]
+  },
+  {
+    label: "通信",
+    patterns: [/通信|信息与通信|信通/u]
+  },
+  {
+    label: "集成电路",
+    patterns: [/集成电路|微电子|半导体|芯片/u]
+  },
+  {
+    label: "自动化控制",
+    patterns: [/自动化|控制科学|控制工程|控制学院|电气/u]
+  },
+  {
+    label: "数据科学",
+    patterns: [/数据科学|大数据|机器学习|LAMDA/u]
+  },
+  {
+    label: "机器人光电",
+    patterns: [/机器人|光电学院|光电科学|光电信息/u]
+  }
 ];
 
 const C9_SCHOOLS = [
@@ -222,20 +266,9 @@ interface RawSchoolRecord {
 
 type SourceItemInput = Omit<NormalizedItem, "key" | "contentHash">;
 
-interface TaggedSourceItem {
-  item: SourceItemInput;
-  supplementedByBaoyanXinxi: boolean;
-}
-
-interface FinalizeResult {
-  items: NormalizedItem[];
-  baoyanXinxiSupplementedItemKeys: string[];
-}
-
 export interface FetchSourceItemsResult {
   items: NormalizedItem[];
   stats: SourceStats[];
-  baoyanXinxiSupplementedItemKeys: string[];
   reviewCandidates: SourceReviewCandidateInput[];
 }
 
@@ -263,41 +296,19 @@ export async function fetchSourceItems(env: Env): Promise<NormalizedItem[]> {
 }
 
 export async function fetchSourceItemsWithStats(env: Env): Promise<FetchSourceItemsResult> {
-  const sourceUrl = env.SOURCE_URL ?? DEFAULT_SOURCE_URL;
-  const response = await fetch(sourceUrl, {
-    headers: {
-      "User-Agent": "baoyan-mail-worker"
-    }
-  });
-  if (!response.ok) {
-    throw new Error(`拉取数据源失败：${response.status} ${response.statusText}`);
-  }
-
-  const data = await response.json();
-  const csRecords = extractRecords(data);
-  const normalizedCsItems = normalizeCsRecords(csRecords);
-  const dedupedCsItems = dedupeSourceItems(normalizedCsItems);
-  const csItems = dedupedCsItems.items;
   const baoyanXinxiUrl = env.BAOYANXINXI_SOURCE_URL ?? DEFAULT_BAOYANXINXI_SOURCE_URL;
   const baoyanXinxiResult = await fetchBaoyanXinxiItems(baoyanXinxiUrl);
-  const merged = mergeSourceItems(csItems, baoyanXinxiResult.items, baoyanXinxiResult.stats);
-  const finalized = await finalizeSourceItems(merged.items);
+  const dedupedItems = dedupeSourceItems(baoyanXinxiResult.items);
+  const finalized = await finalizeSourceItems(dedupedItems.items);
 
   return {
     items: finalized.items,
     stats: [
       {
-        sourceGroup: "cs-baoyan-ddl",
-        url: sourceUrl,
-        rawCount: csRecords.length,
-        acceptedCount: csItems.length,
-        filteredCount: csRecords.length - normalizedCsItems.length,
-        duplicateCount: dedupedCsItems.duplicateCount,
-        supplementedDeadlineCount: 0
-      },
-      merged.baoyanXinxiStats
+        ...baoyanXinxiResult.stats,
+        duplicateCount: baoyanXinxiResult.stats.duplicateCount + dedupedItems.duplicateCount
+      }
     ],
-    baoyanXinxiSupplementedItemKeys: finalized.baoyanXinxiSupplementedItemKeys,
     reviewCandidates: baoyanXinxiResult.reviewCandidates
   };
 }
@@ -313,34 +324,9 @@ export function normalizeBaoyanXinxiHtml(
 ): { items: SourceItemInput[]; stats: SourceStats; reviewCandidates: SourceReviewCandidateInput[] } {
   const parsed = parseBaoyanXinxiHtml(html, sourceUrl);
   const items: SourceItemInput[] = [];
-  const reviewCandidates: SourceReviewCandidateInput[] = [];
 
   for (const record of parsed.records) {
     const deadline = normalizeBaoyanXinxiDeadline(record.deadline);
-    const classification = classifyBaoyanXinxiRecord(record.name, record.institute);
-    if (classification === "review" && isFutureDeadline(deadline)) {
-      const normalizedUrl = canonicalizeNotificationUrl(record.website);
-      if (normalizedUrl === "") {
-        continue;
-      }
-      reviewCandidates.push({
-        normalizedUrl,
-        sourceGroup: BAOYANXINXI_SOURCE_GROUP,
-        reason: "review-keyword",
-        payload: {
-          sourceGroup: BAOYANXINXI_SOURCE_GROUP,
-          name: record.name,
-          institute: record.institute,
-          description: "保研信息平台候选条目",
-          deadline,
-          website: record.website
-        }
-      });
-      continue;
-    }
-    if (classification !== "accepted") {
-      continue;
-    }
     items.push({
       sourceGroup: BAOYANXINXI_SOURCE_GROUP,
       name: record.name,
@@ -348,7 +334,8 @@ export function normalizeBaoyanXinxiHtml(
       description: "保研信息平台补充源",
       deadline,
       website: record.website,
-      tags: getSchoolTierTags(record.name)
+      tags: getSchoolTierTags(record.name),
+      areas: getBaoyanXinxiAreas(record.name, record.institute)
     });
   }
 
@@ -360,11 +347,11 @@ export function normalizeBaoyanXinxiHtml(
       rawCount: parsed.rawCount,
       acceptedCount: items.length,
       filteredCount: parsed.rawCount - items.length,
-      reviewCandidateCount: reviewCandidates.length,
+      reviewCandidateCount: 0,
       duplicateCount: 0,
       supplementedDeadlineCount: 0
     },
-    reviewCandidates
+    reviewCandidates: []
   };
 }
 
@@ -421,6 +408,14 @@ export function classifyBaoyanXinxiRecord(
     return "review";
   }
   return "rejected";
+}
+
+export function getBaoyanXinxiAreas(name: string, institute: string): string[] {
+  const text = `${name} ${institute}`;
+  const areas = AREA_RULES.filter((rule) =>
+    rule.patterns.some((pattern) => pattern.test(text))
+  ).map((rule) => rule.label);
+  return areas.length === 0 ? ["其他"] : areas;
 }
 
 export function getSchoolTierTags(name: string): string[] {
@@ -506,9 +501,8 @@ export function stableStringify(value: unknown): string {
 export async function createManualItemFromReviewPayload(
   payload: ReviewCandidatePayload
 ): Promise<NormalizedItem> {
-  const sourceGroup = "manual";
   const itemInput: SourceItemInput = {
-    sourceGroup,
+    sourceGroup: MANUAL_SOURCE_GROUP,
     name: payload.name.trim(),
     institute: payload.institute.trim(),
     description: payload.description.trim(),
@@ -518,7 +512,7 @@ export async function createManualItemFromReviewPayload(
   };
   const key = await sha256Hex(
     stableStringify({
-      sourceGroup,
+      sourceGroup: MANUAL_SOURCE_GROUP,
       name: itemInput.name,
       institute: itemInput.institute,
       website: canonicalizeNotificationUrl(itemInput.website)
@@ -568,50 +562,7 @@ async function fetchBaoyanXinxiItems(
   }
 }
 
-function mergeSourceItems(
-  csItems: SourceItemInput[],
-  baoyanXinxiItems: SourceItemInput[],
-  baoyanXinxiStats: SourceStats
-): { items: TaggedSourceItem[]; baoyanXinxiStats: SourceStats } {
-  const items = csItems.map((item) => ({ item, supplementedByBaoyanXinxi: false }));
-  const stats = { ...baoyanXinxiStats };
-  const urlToIndex = new Map<string, number>();
-
-  for (const [index, entry] of items.entries()) {
-    const canonicalUrl = canonicalizeNotificationUrl(entry.item.website);
-    if (canonicalUrl !== "" && !urlToIndex.has(canonicalUrl)) {
-      urlToIndex.set(canonicalUrl, index);
-    }
-  }
-
-  for (const item of baoyanXinxiItems) {
-    const canonicalUrl = canonicalizeNotificationUrl(item.website);
-    const existingIndex = canonicalUrl === "" ? undefined : urlToIndex.get(canonicalUrl);
-    if (existingIndex !== undefined) {
-      stats.duplicateCount += 1;
-      const existing = items[existingIndex];
-      if (
-        existing !== undefined &&
-        shouldUseSupplementalDeadline(existing.item.deadline, item.deadline)
-      ) {
-        existing.item = { ...existing.item, deadline: item.deadline };
-        existing.supplementedByBaoyanXinxi = true;
-        stats.supplementedDeadlineCount += 1;
-      }
-      continue;
-    }
-
-    const nextIndex = items.length;
-    items.push({ item, supplementedByBaoyanXinxi: false });
-    if (canonicalUrl !== "") {
-      urlToIndex.set(canonicalUrl, nextIndex);
-    }
-  }
-
-  return { items, baoyanXinxiStats: stats };
-}
-
-function dedupeSourceItems<T extends SourceItemInput | TaggedSourceItem>(
+function dedupeSourceItems<T extends SourceItemInput>(
   entries: T[]
 ): { items: T[]; duplicateCount: number } {
   const items: T[] = [];
@@ -619,8 +570,7 @@ function dedupeSourceItems<T extends SourceItemInput | TaggedSourceItem>(
   let duplicateCount = 0;
 
   for (const entry of entries) {
-    const item = getSourceItemInput(entry);
-    const duplicateKey = getSourceDuplicateKey(item);
+    const duplicateKey = getSourceDuplicateKey(entry);
     if (duplicateKey === "") {
       items.push(entry);
       continue;
@@ -635,16 +585,12 @@ function dedupeSourceItems<T extends SourceItemInput | TaggedSourceItem>(
 
     duplicateCount += 1;
     const existing = items[existingIndex];
-    if (existing !== undefined && shouldPreferSourceItem(item, getSourceItemInput(existing))) {
+    if (existing !== undefined && shouldPreferSourceItem(entry, existing)) {
       items[existingIndex] = entry;
     }
   }
 
   return { items, duplicateCount };
-}
-
-function getSourceItemInput(entry: SourceItemInput | TaggedSourceItem): SourceItemInput {
-  return "item" in entry ? entry.item : entry;
 }
 
 function getSourceDuplicateKey(item: SourceItemInput): string {
@@ -712,22 +658,19 @@ function getUsefulTextLength(value: string): number {
   return trimmed === "_No response_" ? 0 : trimmed.length;
 }
 
-async function finalizeSourceItems(
-  items: SourceItemInput[] | TaggedSourceItem[]
-): Promise<FinalizeResult> {
+async function finalizeSourceItems(items: SourceItemInput[]): Promise<{ items: NormalizedItem[] }> {
   const baseKeyCounts = new Map<string, number>();
   const prepared = [];
 
-  for (const entry of items) {
-    const tagged = toTaggedSourceItem(entry);
+  for (const item of items) {
     const baseKey = await sha256Hex(
       stableStringify({
-        sourceGroup: tagged.item.sourceGroup,
-        name: tagged.item.name,
-        institute: tagged.item.institute
+        sourceGroup: item.sourceGroup,
+        name: item.name,
+        institute: item.institute
       })
     );
-    prepared.push({ baseKey, ...tagged });
+    prepared.push({ baseKey, item });
   }
 
   prepared.sort((left, right) => {
@@ -749,7 +692,6 @@ async function finalizeSourceItems(
   });
 
   const finalized: NormalizedItem[] = [];
-  const baoyanXinxiSupplementedItemKeys: string[] = [];
   for (const preparedItem of prepared) {
     const count = baseKeyCounts.get(preparedItem.baseKey) ?? 0;
     baseKeyCounts.set(preparedItem.baseKey, count + 1);
@@ -760,12 +702,9 @@ async function finalizeSourceItems(
       contentHash: await sha256Hex(stableStringify(preparedItem.item))
     };
     finalized.push(item);
-    if (preparedItem.supplementedByBaoyanXinxi) {
-      baoyanXinxiSupplementedItemKeys.push(key);
-    }
   }
 
-  return { items: finalized, baoyanXinxiSupplementedItemKeys };
+  return { items: finalized };
 }
 
 function normalizeCsRecords(
@@ -899,18 +838,6 @@ function normalizeTwentyFourHourDeadline(value: string): string {
   return `${datePart}T00:${match[4] ?? "00"}:${match[5] ?? "00"}${match[6] ?? ""}`;
 }
 
-function shouldUseSupplementalDeadline(
-  primaryDeadline: string,
-  supplementalDeadline: string
-): boolean {
-  const supplemental = parseComparableDeadline(supplementalDeadline);
-  if (supplemental === null) {
-    return false;
-  }
-  const primary = parseComparableDeadline(primaryDeadline);
-  return primary === null || primary.toISOString() !== supplemental.toISOString();
-}
-
 function parseComparableDeadline(value: string): Date | null {
   const trimmed = value.trim();
   if (UNKNOWN_DEADLINE_VALUES.has(trimmed)) {
@@ -925,12 +852,6 @@ function isFutureDeadline(value: string): boolean {
   return deadline !== null && deadline.getTime() > Date.now();
 }
 
-function toTaggedSourceItem(entry: SourceItemInput | TaggedSourceItem): TaggedSourceItem {
-  if ("supplementedByBaoyanXinxi" in entry) {
-    return entry;
-  }
-  return { item: entry, supplementedByBaoyanXinxi: false };
-}
 
 function toCleanString(value: unknown): string {
   if (typeof value !== "string") {

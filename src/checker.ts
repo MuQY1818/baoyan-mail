@@ -22,7 +22,9 @@ import {
 } from "./email";
 import {
   BAOYANXINXI_SOURCE_GROUP,
-  fetchSourceItemsWithStats
+  canonicalizeNotificationUrl,
+  fetchSourceItemsWithStats,
+  getBaoyanXinxiAreas
 } from "./source";
 import type { Env, NormalizedItem, RunCheckResult, SourceStats } from "./types";
 
@@ -31,7 +33,6 @@ const DAILY_DEADLINE_DIGEST_DAYS = 15;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const UNKNOWN_DEADLINE_VALUES = new Set(["", "暂无", "待定", "无明确说明"]);
-const BAOYANXINXI_INIT_STATE_KEY = BAOYANXINXI_SOURCE_GROUP;
 const DAILY_DEADLINE_DIGEST_STATE_KEY = "daily_deadline_digest_sent_date";
 const LAST_SYNC_STATE_KEY = "last_synced_at";
 const STALE_GRACE_HOURS = 48;
@@ -69,57 +70,24 @@ export async function runCheck(
   await upsertReviewCandidates(env, sourceResult.reviewCandidates, now);
   const snapshotCount = await getSnapshotCount(env);
   const snapshots = snapshotCount === 0 ? new Map() : await getSnapshots(env);
-  const baoyanXinxiState = await getAppState(env, BAOYANXINXI_INIT_STATE_KEY);
-  const baoyanXinxiStat = sourceStats.find(
-    (stats) => stats.sourceGroup === BAOYANXINXI_SOURCE_GROUP
-  );
-  const canInitializeBaoyanXinxi =
-    baoyanXinxiStat?.error === undefined && (baoyanXinxiStat?.rawCount ?? 0) > 0;
-  const shouldInitializeBaoyanXinxi =
-    snapshotCount > 0 &&
-    baoyanXinxiState === null &&
-    canInitializeBaoyanXinxi;
   let initialized = false;
-  let baoyanXinxiInitializedThisRun = false;
   let newDeadlineItems: NormalizedItem[] = [];
   let addedCount = 0;
   let changedCount = 0;
   let missingCount = 0;
-  const baoyanXinxiSupplementedKeys = new Set(sourceResult.baoyanXinxiSupplementedItemKeys);
 
   if (snapshotCount === 0) {
     await upsertSnapshots(env, items, now);
     initialized = true;
     addedCount = items.length;
-    if (canInitializeBaoyanXinxi) {
-      await setAppState(env, BAOYANXINXI_INIT_STATE_KEY, now, now);
-      baoyanXinxiInitializedThisRun = true;
-    }
   } else {
-    const itemsForChangeDetection = shouldInitializeBaoyanXinxi
-      ? items.filter(
-          (item) =>
-            item.sourceGroup !== BAOYANXINXI_SOURCE_GROUP &&
-            !baoyanXinxiSupplementedKeys.has(item.key)
-        )
-      : items;
-
-    if (shouldInitializeBaoyanXinxi) {
-      const baoyanXinxiInitializedItems = items.filter(
-        (item) =>
-          item.sourceGroup === BAOYANXINXI_SOURCE_GROUP || baoyanXinxiSupplementedKeys.has(item.key)
-      );
-      await upsertSnapshots(env, baoyanXinxiInitializedItems, now);
-      await setAppState(env, BAOYANXINXI_INIT_STATE_KEY, now, now);
-      baoyanXinxiInitializedThisRun = true;
-    }
-
-    const detected = detectChanges(itemsForChangeDetection, snapshots);
+    const detected = detectChanges(items, snapshots);
     addedCount = detected.filter((change) => change.kind === "added").length;
     changedCount = detected.filter((change) => change.kind === "changed").length;
     if (sendEmails) {
       newDeadlineItems = detected
         .filter((change) => change.kind === "added")
+        .filter((change) => !hasEquivalentSnapshot(change.item, snapshots))
         .map((change) => change.item);
     }
     await upsertSnapshots(env, items, now);
@@ -128,7 +96,7 @@ export async function runCheck(
 
   await setAppState(env, LAST_SYNC_STATE_KEY, now, now);
   const dailyDeadlineDigest = collectDailyDeadlineDigestItems(
-    items,
+    getEmailRelevantItems(items),
     DAILY_DEADLINE_DIGEST_DAYS,
     nowDate
   );
@@ -136,7 +104,7 @@ export async function runCheck(
     ? await sendDailyDeadlineDigestIfNeeded(env, baseUrl, dailyDeadlineDigest, today, now, nowDate)
     : { sent: 0, subscriberCount: 0 };
   const newDeadlineCandidates = sendEmails
-    ? collectNewDeadlineNotificationCandidates(newDeadlineItems, nowDate)
+    ? collectNewDeadlineNotificationCandidates(getEmailRelevantItems(newDeadlineItems), nowDate)
     : [];
   const newDeadlineDetected =
     newDeadlineCandidates.length === 0
@@ -167,12 +135,15 @@ export async function runCheck(
     staleVisibleCount: staleCounts.visible,
     staleHiddenCount: staleCounts.hidden,
     lastSyncedAt: now,
-    sourceStats: annotateSourceStats(
-      sourceStats,
-      baoyanXinxiState !== null || baoyanXinxiInitializedThisRun,
-      baoyanXinxiInitializedThisRun
-    )
+    sourceStats
   };
+}
+
+function getEmailRelevantItems(items: NormalizedItem[]): NormalizedItem[] {
+  return items.filter((item) => {
+    const areas = item.areas ?? getBaoyanXinxiAreas(item.name, item.institute);
+    return areas.some((area) => area !== "其他");
+  });
 }
 
 async function markMissingForSuccessfulSources(
@@ -230,23 +201,6 @@ function countStaleSnapshotRows(
   return { visible, hidden };
 }
 
-function annotateSourceStats(
-  sourceStats: SourceStats[],
-  baoyanXinxiInitialized: boolean,
-  baoyanXinxiInitializedThisRun: boolean
-): SourceStats[] {
-  return sourceStats.map((stats) => {
-    if (stats.sourceGroup !== BAOYANXINXI_SOURCE_GROUP) {
-      return stats;
-    }
-    return {
-      ...stats,
-      initialized: baoyanXinxiInitialized,
-      initializedThisRun: baoyanXinxiInitializedThisRun
-    };
-  });
-}
-
 export function detectChanges(
   items: NormalizedItem[],
   snapshots: Map<string, { content_hash: string }>
@@ -263,6 +217,31 @@ export function detectChanges(
     }
   }
   return changes;
+}
+
+function hasEquivalentSnapshot(
+  item: NormalizedItem,
+  snapshots: Map<string, { content_hash: string; payload?: string }>
+): boolean {
+  const targetUrl = canonicalizeNotificationUrl(item.website);
+  if (targetUrl === "") {
+    return false;
+  }
+
+  for (const [snapshotKey, snapshot] of snapshots.entries()) {
+    if (snapshotKey === item.key || snapshot.payload === undefined) {
+      continue;
+    }
+    try {
+      const existing = JSON.parse(snapshot.payload) as NormalizedItem;
+      if (canonicalizeNotificationUrl(existing.website) === targetUrl) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
 }
 
 export function collectDailyDeadlineDigestItems(

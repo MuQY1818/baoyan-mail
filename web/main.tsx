@@ -15,6 +15,7 @@ interface DdlItem {
   remainingText: string;
   status: DeadlineStatus;
   tier: TierFilter;
+  areas?: string[];
   sourceGroup: string;
   sourceLabel: string;
   website: string;
@@ -66,12 +67,37 @@ type TimelineExpansion = "collapsed" | "expanded";
 
 type TierFilter = "Top2" | "华五" | "C9" | "985" | "211" | "其他";
 type RangeFilter = "today" | "3" | "7" | "15" | "future";
-type SourceFilter = "all" | "cs" | "baoyanxinxi" | "manual";
+type SourceFilter = "all" | "baoyanxinxi" | "manual";
 type RecentFilter = "all" | "new" | "updated";
 type ViewMode = "cards" | "table";
 type ThemeMode = "light" | "dark";
+type AreaFilter =
+  | "计算机"
+  | "软件"
+  | "人工智能"
+  | "网络安全"
+  | "电子信息"
+  | "通信"
+  | "集成电路"
+  | "自动化控制"
+  | "数据科学"
+  | "机器人光电"
+  | "其他";
 
 const TIER_OPTIONS: TierFilter[] = ["Top2", "华五", "C9", "985", "211", "其他"];
+const AREA_OPTIONS: AreaFilter[] = [
+  "计算机",
+  "软件",
+  "人工智能",
+  "网络安全",
+  "电子信息",
+  "通信",
+  "集成电路",
+  "自动化控制",
+  "数据科学",
+  "机器人光电",
+  "其他"
+];
 const TIER_RANK: Record<TierFilter, number> = {
   Top2: 0,
   华五: 1,
@@ -97,7 +123,6 @@ const RANGE_WIDTH: Record<RangeFilter, number> = {
 };
 const SOURCE_OPTIONS: Array<{ value: SourceFilter; label: string }> = [
   { value: "all", label: "全部来源" },
-  { value: "cs", label: "CS-BAOYAN-DDL" },
   { value: "baoyanxinxi", label: "保研信息平台" },
   { value: "manual", label: "人工补充" }
 ];
@@ -141,6 +166,7 @@ function App(): React.ReactElement {
   const [recent, setRecent] = useState<RecentFilter>(initialFilters.recent);
   const [viewMode, setViewMode] = useState<ViewMode>(initialFilters.viewMode);
   const [activeTiers, setActiveTiers] = useState<Set<TierFilter>>(initialFilters.tiers);
+  const [activeAreas, setActiveAreas] = useState<Set<AreaFilter>>(initialFilters.areas);
   const [favorites, toggleFavorite] = useStoredKeySet(FAVORITE_STORAGE_KEY);
   const [readItems, toggleReadItem] = useStoredKeySet(READ_STORAGE_KEY);
   const scrollTargetRef = useRef<string | null>(null);
@@ -178,8 +204,8 @@ function App(): React.ReactElement {
   }, []);
 
   useEffect(() => {
-    writeFiltersToUrl({ activeTiers, query, range, recent, source, viewMode });
-  }, [activeTiers, query, range, recent, source, viewMode]);
+    writeFiltersToUrl({ activeAreas, activeTiers, query, range, recent, source, viewMode });
+  }, [activeAreas, activeTiers, query, range, recent, source, viewMode]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -196,20 +222,20 @@ function App(): React.ReactElement {
     [data]
   );
   const visibleItems = useMemo(
-    () => filterItems(futureItems, query, range, source, activeTiers, recent),
-    [activeTiers, futureItems, query, range, recent, source]
+    () => filterItems(futureItems, query, range, source, activeTiers, activeAreas, recent),
+    [activeAreas, activeTiers, futureItems, query, range, recent, source]
   );
   const stats = useMemo(() => buildStats(futureItems), [futureItems]);
   // 概览计数与跳转候选用同一套筛选（忽略范围），保证点击后一定能找到目标卡片
   const railCounts = useMemo(() => {
-    const scoped = filterItems(futureItems, query, "future", source, activeTiers, recent);
+    const scoped = filterItems(futureItems, query, "future", source, activeTiers, activeAreas, recent);
     return RAIL_BUCKETS.map(
       (bucket) => scoped.filter((item) => bucket.matches(item.remainingDays)).length
     );
-  }, [activeTiers, futureItems, query, recent, source]);
+  }, [activeAreas, activeTiers, futureItems, query, recent, source]);
   const timelineStops = useMemo(
-    () => buildTimeline(filterItems(futureItems, query, "7", source, activeTiers, recent)),
-    [activeTiers, futureItems, query, recent, source]
+    () => buildTimeline(filterItems(futureItems, query, "7", source, activeTiers, activeAreas, recent)),
+    [activeAreas, activeTiers, futureItems, query, recent, source]
   );
 
   // 点击概览后等列表渲染完成再滚动到目标卡片，滚动结束后再高亮（确保视线到位时才闪烁）
@@ -269,7 +295,7 @@ function App(): React.ReactElement {
   }, [highlightKey]);
 
   function jumpToBucket(bucket: RailBucket): void {
-    const candidates = filterItems(futureItems, query, "future", source, activeTiers, recent);
+    const candidates = filterItems(futureItems, query, "future", source, activeTiers, activeAreas, recent);
     const target = candidates.find((item) => bucket.matches(item.remainingDays));
     if (target === undefined) {
       return;
@@ -294,6 +320,18 @@ function App(): React.ReactElement {
     });
   }
 
+  function toggleArea(area: AreaFilter): void {
+    setActiveAreas((previous) => {
+      const next = new Set(previous);
+      if (next.has(area)) {
+        next.delete(area);
+      } else {
+        next.add(area);
+      }
+      return next;
+    });
+  }
+
   function resetFilters(): void {
     setQuery("");
     setRange("future");
@@ -301,6 +339,7 @@ function App(): React.ReactElement {
     setRecent("all");
     setViewMode("cards");
     setActiveTiers(new Set(TIER_OPTIONS));
+    setActiveAreas(new Set());
   }
 
   function toggleTheme(): void {
@@ -309,16 +348,17 @@ function App(): React.ReactElement {
 
   return (
     <main className="shell">
+      <ThemeToggle theme={theme} onToggle={toggleTheme} />
+
       <section className="hero" aria-labelledby="page-title">
         <div className="hero-copy">
           <p className="eyebrow">CS BAOYAN DEADLINES</p>
           <h1 id="page-title">保研 DDL 速查</h1>
           <p className="hero-text">
-            汇总计算机与电子信息方向通知，按截止时间、学校层次和来源快速筛选。
+            默认展示保研信息平台未截止通知，方向、层次和来源都交给你筛选。
           </p>
         </div>
         <div className="hero-actions">
-          <ThemeToggle theme={theme} onToggle={toggleTheme} />
           <a className="subscribe-link" href={SUBSCRIBE_URL}>
             订阅每日邮件
           </a>
@@ -383,6 +423,29 @@ function App(): React.ReactElement {
                   {tier}
                 </button>
               ))}
+            </div>
+
+            <div className="control-block">
+              <div className="control-label">方向</div>
+              <div className="control-row control-row-wrap" aria-label="方向筛选">
+                <button
+                  className={activeAreas.size === 0 ? "chip area-chip chip-active" : "chip area-chip"}
+                  onClick={() => setActiveAreas(new Set())}
+                  type="button"
+                >
+                  全部方向
+                </button>
+                {AREA_OPTIONS.map((area) => (
+                  <button
+                    className={activeAreas.has(area) ? "chip area-chip chip-active" : "chip area-chip"}
+                    key={area}
+                    onClick={() => toggleArea(area)}
+                    type="button"
+                  >
+                    {area}
+                  </button>
+                ))}
+              </div>
             </div>
 
             <label className="select-field">
@@ -518,16 +581,12 @@ function ThemeToggle({
   return (
     <button
       aria-label={isDark ? "切换到白昼模式" : "切换到夜间模式"}
-      className={isDark ? "theme-toggle theme-toggle-dark" : "theme-toggle"}
+      className={isDark ? "theme-float theme-float-dark" : "theme-float"}
       onClick={onToggle}
       type="button"
     >
-      <span className="theme-toggle-track" aria-hidden="true">
-        <span>昼</span>
-        <span>夜</span>
-        <span className="theme-toggle-thumb" />
-      </span>
-      <span className="theme-toggle-label">{isDark ? "夜间" : "白昼"}</span>
+      <span className="theme-float-icon" aria-hidden="true" />
+      <span className="theme-float-tooltip" aria-hidden="true">换主题</span>
     </button>
   );
 }
@@ -616,6 +675,7 @@ function DdlCard({
           </div>
           <span className="tier-badge">{item.tier}</span>
         </div>
+        <AreaBadges item={item} />
         <dl className="meta-grid">
           <div>
             <dt>截止时间</dt>
@@ -669,6 +729,7 @@ function DdlTable({
             <th>院系</th>
             <th>DDL</th>
             <th>层次</th>
+            <th>方向</th>
             <th>来源</th>
             <th>操作</th>
           </tr>
@@ -683,6 +744,13 @@ function DdlTable({
                 <span>{item.deadlineText}</span>
               </td>
               <td>{item.tier}</td>
+              <td>
+                <div className="table-area-list">
+                  {getItemAreas(item).map((area) => (
+                    <span className="table-area" key={area}>{area}</span>
+                  ))}
+                </div>
+              </td>
               <td>{item.sourceLabel}</td>
               <td>
                 <div className="table-actions">
@@ -701,6 +769,16 @@ function DdlTable({
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function AreaBadges({ item }: { item: DdlItem }): React.ReactElement {
+  return (
+    <div className="area-badges" aria-label="方向分类">
+      {getItemAreas(item).map((area) => (
+        <span className="area-badge" key={area}>{area}</span>
+      ))}
     </div>
   );
 }
@@ -929,6 +1007,7 @@ function filterItems(
   range: RangeFilter,
   source: SourceFilter,
   tiers: Set<TierFilter>,
+  areas: Set<AreaFilter>,
   recent: RecentFilter
 ): DdlItem[] {
   const keyword = query.trim().toLowerCase();
@@ -937,16 +1016,13 @@ function filterItems(
     if (!tiers.has(item.tier)) {
       return false;
     }
+    if (areas.size > 0 && !getItemAreas(item).some((area) => areas.has(area as AreaFilter))) {
+      return false;
+    }
     if (rangeConfig?.maxDays !== null && rangeConfig?.maxDays !== undefined) {
       if (item.remainingDays > rangeConfig.maxDays) {
         return false;
       }
-    }
-    if (
-      source === "cs" &&
-      (item.sourceGroup === "baoyanxinxi2026jsjby" || item.sourceGroup === "manual")
-    ) {
-      return false;
     }
     if (source === "baoyanxinxi" && item.sourceGroup !== "baoyanxinxi2026jsjby") {
       return false;
@@ -963,7 +1039,9 @@ function filterItems(
     if (keyword === "") {
       return true;
     }
-    return `${item.school} ${item.institute} ${item.description}`.toLowerCase().includes(keyword);
+    return `${item.school} ${item.institute} ${item.description} ${getItemAreas(item).join(" ")}`
+      .toLowerCase()
+      .includes(keyword);
   });
 }
 
@@ -1088,6 +1166,7 @@ function readFiltersFromUrl(): {
   recent: RecentFilter;
   viewMode: ViewMode;
   tiers: Set<TierFilter>;
+  areas: Set<AreaFilter>;
 } {
   const params = new URLSearchParams(window.location.search);
   return {
@@ -1096,11 +1175,13 @@ function readFiltersFromUrl(): {
     source: readOption(params.get("source"), SOURCE_OPTIONS.map((option) => option.value), "all"),
     recent: readOption(params.get("recent"), RECENT_OPTIONS.map((option) => option.value), "all"),
     viewMode: readOption(params.get("view"), ["cards", "table"], "cards"),
-    tiers: readTierSet(params.get("tiers"))
+    tiers: readTierSet(params.get("tiers")),
+    areas: readAreaSet(params.get("areas"))
   };
 }
 
 function writeFiltersToUrl(filters: {
+  activeAreas: Set<AreaFilter>;
   activeTiers: Set<TierFilter>;
   query: string;
   range: RangeFilter;
@@ -1127,6 +1208,9 @@ function writeFiltersToUrl(filters: {
   if (filters.activeTiers.size !== TIER_OPTIONS.length) {
     params.set("tiers", TIER_OPTIONS.filter((tier) => filters.activeTiers.has(tier)).join(","));
   }
+  if (filters.activeAreas.size > 0) {
+    params.set("areas", AREA_OPTIONS.filter((area) => filters.activeAreas.has(area)).join(","));
+  }
   const nextQuery = params.toString();
   const nextUrl = `${window.location.pathname}${nextQuery === "" ? "" : `?${nextQuery}`}`;
   if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
@@ -1146,6 +1230,24 @@ function readTierSet(value: string | null): Set<TierFilter> {
     .split(",")
     .filter((entry): entry is TierFilter => TIER_OPTIONS.includes(entry as TierFilter));
   return new Set(tiers.length === 0 ? TIER_OPTIONS : tiers);
+}
+
+function readAreaSet(value: string | null): Set<AreaFilter> {
+  if (value === null || value.trim() === "") {
+    return new Set();
+  }
+  return new Set(
+    value
+      .split(",")
+      .filter((entry): entry is AreaFilter => AREA_OPTIONS.includes(entry as AreaFilter))
+  );
+}
+
+function getItemAreas(item: DdlItem): AreaFilter[] {
+  const areas = (Array.isArray(item.areas) ? item.areas : []).filter((area): area is AreaFilter =>
+    AREA_OPTIONS.includes(area as AreaFilter)
+  );
+  return areas.length === 0 ? ["其他"] : areas;
 }
 
 function useStoredKeySet(key: string): [Set<string>, (value: string) => void] {

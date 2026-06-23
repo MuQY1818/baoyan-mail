@@ -178,6 +178,22 @@ export async function getSnapshotRows(env: Env): Promise<ItemSnapshotRow[]> {
   return result.results ?? [];
 }
 
+export async function getSnapshotRowsBySourceGroups(
+  env: Env,
+  sourceGroups: string[]
+): Promise<ItemSnapshotRow[]> {
+  if (sourceGroups.length === 0) {
+    return [];
+  }
+  const placeholders = sourceGroups.map(() => "?").join(", ");
+  const result = await env.DB.prepare(
+    `SELECT * FROM item_snapshots WHERE source_group IN (${placeholders})`
+  )
+    .bind(...sourceGroups)
+    .all<ItemSnapshotRow>();
+  return result.results ?? [];
+}
+
 export async function getSnapshotItems(env: Env): Promise<NormalizedItem[]> {
   return (await getSnapshotRows(env)).map((row) => JSON.parse(row.payload) as NormalizedItem);
 }
