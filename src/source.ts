@@ -88,6 +88,20 @@ const REVIEW_PATTERNS = [
   /信息支援部队/u
 ];
 
+export const BAOYAN_AREA_OPTIONS = [
+  "计算机",
+  "软件",
+  "人工智能",
+  "网络安全",
+  "电子信息",
+  "通信",
+  "集成电路",
+  "自动化控制",
+  "数据科学",
+  "机器人光电",
+  "其他"
+] as const;
+
 const AREA_RULES = [
   {
     label: "计算机",

@@ -61,6 +61,7 @@ class FakeD1Statement {
 class FakeD1Database {
   readonly itemSnapshots = new Map<string, FakeSnapshotRow>();
   readonly appState = new Map<string, string>();
+  readonly relevanceClassifications = new Map<string, unknown[]>();
   readonly newDeadlineNotifications: unknown[][] = [];
   readonly mailLogs: unknown[][] = [];
   activeSubscriberCount = 0;
@@ -135,6 +136,21 @@ class FakeD1Database {
         }))
         .filter((row) => row.sent_at === null && row.deadline_at > now) as T[];
     }
+    if (sql.includes("FROM item_relevance_classifications")) {
+      const urls = new Set(bindings.map(String));
+      return Array.from(this.relevanceClassifications.entries())
+        .filter(([url]) => urls.has(url))
+        .map(([url, entry]) => ({
+          normalized_url: url,
+          relevance: String(entry[1]),
+          areas: String(entry[2]),
+          reason: String(entry[3]),
+          classifier: String(entry[4]),
+          classified_at: String(entry[5]),
+          created_at: String(entry[6]),
+          updated_at: String(entry[7])
+        })) as T[];
+    }
     return [];
   }
 
@@ -178,6 +194,9 @@ class FakeD1Database {
       }
     } else if (sql.includes("INSERT INTO mail_logs")) {
       this.mailLogs.push(bindings);
+      changes = 1;
+    } else if (sql.includes("INSERT INTO item_relevance_classifications")) {
+      this.relevanceClassifications.set(String(bindings[0]), bindings);
       changes = 1;
     }
 
@@ -631,6 +650,67 @@ describe("source normalization", () => {
     }
   });
 
+  it("uses AI relevance classifications before email filtering", async () => {
+    const db = new FakeD1Database();
+    db.relevanceClassifications.set("https://example.com/public-health", [
+      "https://example.com/public-health",
+      "strong",
+      JSON.stringify(["数据科学"]),
+      "公共卫生项目包含医疗数据科学方向",
+      "codex-ai",
+      "2026-06-07T00:00:00.000Z",
+      "2026-06-07T00:00:00.000Z",
+      "2026-06-07T00:00:00.000Z"
+    ]);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-07T01:00:00.000Z"));
+    const html = `
+      <h2 id="复旦大学"><a href="#复旦大学"></a>复旦大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/public-health">公共卫生学院</a></p>
+    `;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(html, { status: 200, headers: { "content-type": "text/html" } });
+
+    try {
+      const result = await runCheck({
+        DB: db as unknown as D1Database,
+        BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
+        APP_BASE_URL: "https://example.com"
+      } as Env);
+      const publicResponse = buildDdlResponse(
+        Array.from(db.itemSnapshots.values()),
+        new Date(),
+        null,
+        new Map([
+          [
+            "https://example.com/public-health",
+            {
+              normalizedUrl: "https://example.com/public-health",
+              relevance: "strong",
+              areas: ["数据科学"],
+              reason: "公共卫生项目包含医疗数据科学方向",
+              classifier: "codex-ai",
+              classifiedAt: "2026-06-07T00:00:00.000Z"
+            }
+          ]
+        ])
+      );
+
+      expect(result.scanned).toBe(1);
+      expect(result.dailyDeadlineDetected).toBe(1);
+      expect(publicResponse.items[0]).toMatchObject({
+        institute: "公共卫生学院",
+        relevance: "strong",
+        areas: ["数据科学"],
+        relevanceReason: "公共卫生项目包含医疗数据科学方向"
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
   it("marks disappeared source records as missing without sending mail in sync-only mode", async () => {
     const db = new FakeD1Database();
     const originalFetch = globalThis.fetch;
@@ -974,5 +1054,69 @@ describe("DDL API", () => {
     expect(response.headers.get("cache-control")).toContain("max-age=300");
     expect(body.total).toBe(1);
     expect(body.items[0]?.sourceLabel).toBe("保研信息平台");
+  });
+
+  it("accepts admin relevance classifications and rejects invalid payloads", async () => {
+    const db = new FakeD1Database();
+    const context = {
+      waitUntil: () => undefined,
+      passThroughOnException: () => undefined
+    } as unknown as ExecutionContext;
+    const unauthorized = await handleRequest(
+      new Request("https://example.com/api/admin/relevance-classifications", {
+        method: "POST",
+        body: JSON.stringify({ items: [] })
+      }),
+      { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env,
+      context
+    );
+    const invalid = await handleRequest(
+      new Request("https://example.com/api/admin/relevance-classifications", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer secret"
+        },
+        body: JSON.stringify({
+          items: [
+            {
+              website: "https://example.com/notice",
+              relevance: "strong",
+              areas: ["心理学"],
+              reason: "非法方向"
+            }
+          ]
+        })
+      }),
+      { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env,
+      context
+    );
+    const accepted = await handleRequest(
+      new Request("https://example.com/api/admin/relevance-classifications", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer secret"
+        },
+        body: JSON.stringify({
+          items: [
+            {
+              website: "https://example.com/notice?utm_source=test",
+              relevance: "possible",
+              areas: ["自动化控制", "其他"],
+              reason: "电气系统方向，可能与控制相关",
+              classifier: "codex-ai"
+            }
+          ]
+        })
+      }),
+      { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env,
+      context
+    );
+    const body = (await accepted.json()) as { ok: boolean; accepted: number };
+
+    expect(unauthorized.status).toBe(401);
+    expect(invalid.status).toBe(400);
+    expect(accepted.status).toBe(200);
+    expect(body).toMatchObject({ ok: true, accepted: 1 });
+    expect(db.relevanceClassifications.has("https://example.com/notice")).toBe(true);
   });
 });

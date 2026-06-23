@@ -15,6 +15,27 @@ export interface Env {
 }
 
 export type SubscriberStatus = "pending" | "active" | "unsubscribed";
+export type Relevance = "strong" | "possible" | "unrelated";
+
+export interface ItemRelevanceClassification {
+  normalizedUrl: string;
+  relevance: Relevance;
+  areas: string[];
+  reason: string;
+  classifier: string;
+  classifiedAt: string;
+}
+
+export interface ItemRelevanceClassificationRow {
+  normalized_url: string;
+  relevance: Relevance;
+  areas: string;
+  reason: string;
+  classifier: string;
+  classified_at: string;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface SubscriberRow {
   id: number;
@@ -39,6 +60,10 @@ export interface NormalizedItem {
   website: string;
   tags: string[];
   areas?: string[];
+  relevance?: Relevance;
+  relevanceReason?: string;
+  relevanceClassifier?: string;
+  relevanceClassifiedAt?: string;
 }
 
 export interface ItemSnapshotRow {

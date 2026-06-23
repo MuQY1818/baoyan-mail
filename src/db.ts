@@ -1,5 +1,7 @@
 import type {
   Env,
+  ItemRelevanceClassification,
+  ItemRelevanceClassificationRow,
   ItemSnapshotRow,
   NewDeadlineNotificationRow,
   NewDeadlineNotificationWithItem,
@@ -196,6 +198,70 @@ export async function getSnapshotRowsBySourceGroups(
 
 export async function getSnapshotItems(env: Env): Promise<NormalizedItem[]> {
   return (await getSnapshotRows(env)).map((row) => JSON.parse(row.payload) as NormalizedItem);
+}
+
+export async function getItemRelevanceClassifications(
+  env: Env,
+  normalizedUrls: string[]
+): Promise<Map<string, ItemRelevanceClassification>> {
+  const uniqueUrls = Array.from(new Set(normalizedUrls.filter((url) => url !== "")));
+  const rows: ItemRelevanceClassificationRow[] = [];
+  for (let index = 0; index < uniqueUrls.length; index += SQL_BATCH_SIZE) {
+    const chunk = uniqueUrls.slice(index, index + SQL_BATCH_SIZE);
+    if (chunk.length === 0) {
+      continue;
+    }
+    const placeholders = chunk.map(() => "?").join(", ");
+    const result = await env.DB.prepare(
+      `SELECT * FROM item_relevance_classifications WHERE normalized_url IN (${placeholders})`
+    )
+      .bind(...chunk)
+      .all<ItemRelevanceClassificationRow>();
+    rows.push(...(result.results ?? []));
+  }
+  return new Map(rows.map((row) => [row.normalized_url, hydrateItemRelevanceClassification(row)]));
+}
+
+export async function upsertItemRelevanceClassifications(
+  env: Env,
+  entries: ItemRelevanceClassification[],
+  now: string
+): Promise<number> {
+  const statements = entries.map((entry) =>
+    env.DB.prepare(
+      `
+        INSERT INTO item_relevance_classifications (
+          normalized_url,
+          relevance,
+          areas,
+          reason,
+          classifier,
+          classified_at,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(normalized_url) DO UPDATE SET
+          relevance = excluded.relevance,
+          areas = excluded.areas,
+          reason = excluded.reason,
+          classifier = excluded.classifier,
+          classified_at = excluded.classified_at,
+          updated_at = excluded.updated_at
+      `
+    ).bind(
+      entry.normalizedUrl,
+      entry.relevance,
+      JSON.stringify(entry.areas),
+      entry.reason,
+      entry.classifier,
+      entry.classifiedAt,
+      now,
+      now
+    )
+  );
+  const results = await runBatchInChunks(env, statements);
+  return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
 }
 
 export async function upsertSnapshots(
@@ -522,4 +588,26 @@ function hydrateReviewCandidate(
     ...row,
     candidate: JSON.parse(row.payload) as ReviewCandidatePayload
   };
+}
+
+function hydrateItemRelevanceClassification(
+  row: ItemRelevanceClassificationRow
+): ItemRelevanceClassification {
+  return {
+    normalizedUrl: row.normalized_url,
+    relevance: row.relevance,
+    areas: parseStringArray(row.areas),
+    reason: row.reason,
+    classifier: row.classifier,
+    classifiedAt: row.classified_at
+  };
+}
+
+function parseStringArray(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
+  } catch {
+    return [];
+  }
 }

@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import "./styles.css";
 
 type DeadlineStatus = "today" | "future" | "expired";
+type Relevance = "strong" | "possible" | "unrelated";
 
 interface DdlItem {
   key: string;
@@ -16,6 +17,10 @@ interface DdlItem {
   status: DeadlineStatus;
   tier: TierFilter;
   areas?: string[];
+  relevance: Relevance;
+  relevanceReason: string | null;
+  relevanceClassifier: string;
+  relevanceClassifiedAt: string | null;
   sourceGroup: string;
   sourceLabel: string;
   website: string;
@@ -71,6 +76,7 @@ type SourceFilter = "all" | "baoyanxinxi" | "manual";
 type RecentFilter = "all" | "new" | "updated";
 type ViewMode = "cards" | "table";
 type ThemeMode = "light" | "dark";
+type RelevanceFilter = "strong" | "possible" | "all";
 type AreaFilter =
   | "计算机"
   | "软件"
@@ -131,6 +137,11 @@ const RECENT_OPTIONS: Array<{ value: RecentFilter; label: string }> = [
   { value: "new", label: "最近新增" },
   { value: "updated", label: "最近更新" }
 ];
+const RELEVANCE_OPTIONS: Array<{ value: RelevanceFilter; label: string }> = [
+  { value: "strong", label: "强相关" },
+  { value: "possible", label: "强相关+可能" },
+  { value: "all", label: "全部源站" }
+];
 const SUBSCRIBE_URL = "https://baoyan-mail.weijuebu.workers.dev/";
 const API_URL = "https://baoyan-mail.weijuebu.workers.dev/api/ddl";
 const LLMS_TXT_URL = "/llms.txt";
@@ -163,6 +174,7 @@ function App(): React.ReactElement {
   const [query, setQuery] = useState(initialFilters.query);
   const [range, setRange] = useState<RangeFilter>(initialFilters.range);
   const [source, setSource] = useState<SourceFilter>(initialFilters.source);
+  const [relevance, setRelevance] = useState<RelevanceFilter>(initialFilters.relevance);
   const [recent, setRecent] = useState<RecentFilter>(initialFilters.recent);
   const [viewMode, setViewMode] = useState<ViewMode>(initialFilters.viewMode);
   const [activeTiers, setActiveTiers] = useState<Set<TierFilter>>(initialFilters.tiers);
@@ -204,8 +216,17 @@ function App(): React.ReactElement {
   }, []);
 
   useEffect(() => {
-    writeFiltersToUrl({ activeAreas, activeTiers, query, range, recent, source, viewMode });
-  }, [activeAreas, activeTiers, query, range, recent, source, viewMode]);
+    writeFiltersToUrl({
+      activeAreas,
+      activeTiers,
+      query,
+      range,
+      recent,
+      relevance,
+      source,
+      viewMode
+    });
+  }, [activeAreas, activeTiers, query, range, recent, relevance, source, viewMode]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -221,21 +242,57 @@ function App(): React.ReactElement {
     () => data?.items.filter((item) => item.status !== "expired") ?? [],
     [data]
   );
-  const visibleItems = useMemo(
-    () => filterItems(futureItems, query, range, source, activeTiers, activeAreas, recent),
-    [activeAreas, activeTiers, futureItems, query, range, recent, source]
+  const relevanceScopedItems = useMemo(
+    () =>
+      filterItems(
+        futureItems,
+        "",
+        "future",
+        "all",
+        relevance,
+        new Set(TIER_OPTIONS),
+        new Set(),
+        "all"
+      ),
+    [futureItems, relevance]
   );
-  const stats = useMemo(() => buildStats(futureItems), [futureItems]);
+  const visibleItems = useMemo(
+    () =>
+      filterItems(
+        futureItems,
+        query,
+        range,
+        source,
+        relevance,
+        activeTiers,
+        activeAreas,
+        recent
+      ),
+    [activeAreas, activeTiers, futureItems, query, range, recent, relevance, source]
+  );
+  const stats = useMemo(() => buildStats(relevanceScopedItems), [relevanceScopedItems]);
   // 概览计数与跳转候选用同一套筛选（忽略范围），保证点击后一定能找到目标卡片
   const railCounts = useMemo(() => {
-    const scoped = filterItems(futureItems, query, "future", source, activeTiers, activeAreas, recent);
+    const scoped = filterItems(
+      futureItems,
+      query,
+      "future",
+      source,
+      relevance,
+      activeTiers,
+      activeAreas,
+      recent
+    );
     return RAIL_BUCKETS.map(
       (bucket) => scoped.filter((item) => bucket.matches(item.remainingDays)).length
     );
-  }, [activeAreas, activeTiers, futureItems, query, recent, source]);
+  }, [activeAreas, activeTiers, futureItems, query, recent, relevance, source]);
   const timelineStops = useMemo(
-    () => buildTimeline(filterItems(futureItems, query, "7", source, activeTiers, activeAreas, recent)),
-    [activeAreas, activeTiers, futureItems, query, recent, source]
+    () =>
+      buildTimeline(
+        filterItems(futureItems, query, "7", source, relevance, activeTiers, activeAreas, recent)
+      ),
+    [activeAreas, activeTiers, futureItems, query, recent, relevance, source]
   );
 
   // 点击概览后等列表渲染完成再滚动到目标卡片，滚动结束后再高亮（确保视线到位时才闪烁）
@@ -295,7 +352,16 @@ function App(): React.ReactElement {
   }, [highlightKey]);
 
   function jumpToBucket(bucket: RailBucket): void {
-    const candidates = filterItems(futureItems, query, "future", source, activeTiers, activeAreas, recent);
+    const candidates = filterItems(
+      futureItems,
+      query,
+      "future",
+      source,
+      relevance,
+      activeTiers,
+      activeAreas,
+      recent
+    );
     const target = candidates.find((item) => bucket.matches(item.remainingDays));
     if (target === undefined) {
       return;
@@ -336,6 +402,7 @@ function App(): React.ReactElement {
     setQuery("");
     setRange("future");
     setSource("all");
+    setRelevance("strong");
     setRecent("all");
     setViewMode("cards");
     setActiveTiers(new Set(TIER_OPTIONS));
@@ -355,7 +422,7 @@ function App(): React.ReactElement {
           <p className="eyebrow">CS BAOYAN DEADLINES</p>
           <h1 id="page-title">保研 DDL 速查</h1>
           <p className="hero-text">
-            默认展示保研信息平台未截止通知，方向、层次和来源都交给你筛选。
+            默认展示 AI 判定的计算机类强相关 DDL，可切换查看可能相关和源站全量。
           </p>
         </div>
         <div className="hero-actions">
@@ -398,6 +465,22 @@ function App(): React.ReactElement {
                 type="search"
               />
             </label>
+
+            <div className="control-block">
+              <div className="control-label">相关度</div>
+              <div className="control-row" aria-label="相关度筛选">
+                {RELEVANCE_OPTIONS.map((option) => (
+                  <button
+                    className={relevance === option.value ? "chip relevance-chip chip-active" : "chip relevance-chip"}
+                    key={option.value}
+                    onClick={() => setRelevance(option.value)}
+                    type="button"
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
 
             <div className="control-row" aria-label="时间范围">
               {RANGE_OPTIONS.map((option) => (
@@ -496,7 +579,7 @@ function App(): React.ReactElement {
           </section>
 
           <section className="summary-strip" aria-label="数据概览">
-            <SummaryCell label="未截止" value={futureItems.length} />
+            <SummaryCell label="未截止" value={relevanceScopedItems.length} />
             <SummaryCell label="今日截止" value={stats.today} />
             <SummaryCell label="15 天内" value={stats.fifteenDays} />
             <SummaryCell label="当前显示" value={visibleItems.length} />
@@ -676,6 +759,14 @@ function DdlCard({
           <span className="tier-badge">{item.tier}</span>
         </div>
         <AreaBadges item={item} />
+        <div className="relevance-line">
+          <span className={`relevance-badge relevance-${item.relevance}`}>
+            {formatRelevance(item.relevance)}
+          </span>
+          {item.relevanceReason !== null && item.relevanceReason !== "" && (
+            <span className="relevance-reason">{truncate(item.relevanceReason, 48)}</span>
+          )}
+        </div>
         <dl className="meta-grid">
           <div>
             <dt>截止时间</dt>
@@ -729,6 +820,7 @@ function DdlTable({
             <th>院系</th>
             <th>DDL</th>
             <th>层次</th>
+            <th>相关度</th>
             <th>方向</th>
             <th>来源</th>
             <th>操作</th>
@@ -744,6 +836,11 @@ function DdlTable({
                 <span>{item.deadlineText}</span>
               </td>
               <td>{item.tier}</td>
+              <td>
+                <span className={`table-relevance relevance-${item.relevance}`}>
+                  {formatRelevance(item.relevance)}
+                </span>
+              </td>
               <td>
                 <div className="table-area-list">
                   {getItemAreas(item).map((area) => (
@@ -1006,6 +1103,7 @@ function filterItems(
   query: string,
   range: RangeFilter,
   source: SourceFilter,
+  relevance: RelevanceFilter,
   tiers: Set<TierFilter>,
   areas: Set<AreaFilter>,
   recent: RecentFilter
@@ -1013,6 +1111,9 @@ function filterItems(
   const keyword = query.trim().toLowerCase();
   const rangeConfig = RANGE_OPTIONS.find((option) => option.value === range);
   return items.filter((item) => {
+    if (!matchesRelevance(item, relevance)) {
+      return false;
+    }
     if (!tiers.has(item.tier)) {
       return false;
     }
@@ -1043,6 +1144,16 @@ function filterItems(
       .toLowerCase()
       .includes(keyword);
   });
+}
+
+function matchesRelevance(item: DdlItem, relevance: RelevanceFilter): boolean {
+  if (relevance === "all") {
+    return true;
+  }
+  if (relevance === "possible") {
+    return item.relevance === "strong" || item.relevance === "possible";
+  }
+  return item.relevance === "strong";
 }
 
 function buildStats(items: DdlItem[]): {
@@ -1147,6 +1258,16 @@ function truncate(value: string, maxLength: number): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
 }
 
+function formatRelevance(value: Relevance): string {
+  if (value === "strong") {
+    return "强相关";
+  }
+  if (value === "possible") {
+    return "可能相关";
+  }
+  return "无关";
+}
+
 function readInitialTheme(): ThemeMode {
   try {
     const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
@@ -1163,6 +1284,7 @@ function readFiltersFromUrl(): {
   query: string;
   range: RangeFilter;
   source: SourceFilter;
+  relevance: RelevanceFilter;
   recent: RecentFilter;
   viewMode: ViewMode;
   tiers: Set<TierFilter>;
@@ -1173,6 +1295,11 @@ function readFiltersFromUrl(): {
     query: params.get("q") ?? "",
     range: readOption(params.get("range"), RANGE_OPTIONS.map((option) => option.value), "future"),
     source: readOption(params.get("source"), SOURCE_OPTIONS.map((option) => option.value), "all"),
+    relevance: readOption(
+      params.get("relevance"),
+      RELEVANCE_OPTIONS.map((option) => option.value),
+      "strong"
+    ),
     recent: readOption(params.get("recent"), RECENT_OPTIONS.map((option) => option.value), "all"),
     viewMode: readOption(params.get("view"), ["cards", "table"], "cards"),
     tiers: readTierSet(params.get("tiers")),
@@ -1186,6 +1313,7 @@ function writeFiltersToUrl(filters: {
   query: string;
   range: RangeFilter;
   recent: RecentFilter;
+  relevance: RelevanceFilter;
   source: SourceFilter;
   viewMode: ViewMode;
 }): void {
@@ -1198,6 +1326,9 @@ function writeFiltersToUrl(filters: {
   }
   if (filters.source !== "all") {
     params.set("source", filters.source);
+  }
+  if (filters.relevance !== "strong") {
+    params.set("relevance", filters.relevance);
   }
   if (filters.recent !== "all") {
     params.set("recent", filters.recent);

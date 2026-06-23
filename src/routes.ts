@@ -3,20 +3,23 @@ import {
   confirmSubscriberByToken,
   findSubscriberByEmail,
   getAppState,
+  getItemRelevanceClassifications,
   getPendingReviewCandidates,
   getReviewCandidateById,
   getSnapshotRowsBySourceGroups,
   insertReviewRule,
   rejectReviewCandidate,
   unsubscribeByToken,
+  upsertItemRelevanceClassifications,
   upsertManualItem,
   upsertPendingSubscriber
 } from "./db";
-import { buildDdlResponse } from "./ddl";
+import { buildDdlResponse, getDdlEntryNormalizedUrls } from "./ddl";
 import { sendConfirmationEmail } from "./email";
 import { runCheck } from "./checker";
 import { createToken, sha256Hex, tokenHash } from "./crypto";
 import {
+  BAOYAN_AREA_OPTIONS,
   BAOYANXINXI_SOURCE_GROUP,
   MANUAL_SOURCE_GROUP,
   canonicalizeNotificationUrl,
@@ -24,7 +27,7 @@ import {
   normalizeBaoyanXinxiDeadline
 } from "./source";
 import { upsertReviewCandidates, upsertSnapshots } from "./db";
-import type { Env, ReviewCandidatePayload } from "./types";
+import type { Env, ItemRelevanceClassification, Relevance, ReviewCandidatePayload } from "./types";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const REVIEW_COOKIE_NAME = "baoyan_review_auth";
@@ -69,6 +72,9 @@ export async function handleRequest(
     }
     if (request.method === "GET" && url.pathname === "/api/admin/sync-sources") {
       return await handleSyncSources(request, env, ctx);
+    }
+    if (request.method === "POST" && url.pathname === "/api/admin/relevance-classifications") {
+      return await handleRelevanceClassifications(request, env);
     }
     if (request.method === "GET" && url.pathname === "/api/admin/review") {
       return await handleReviewPage(request, env);
@@ -189,16 +195,54 @@ async function handleSyncSources(
 }
 
 async function handleDdl(env: Env): Promise<Response> {
+  const rows = await getSnapshotRowsBySourceGroups(env, [
+    BAOYANXINXI_SOURCE_GROUP,
+    MANUAL_SOURCE_GROUP
+  ]);
+  const classifications = await getItemRelevanceClassifications(
+    env,
+    getDdlEntryNormalizedUrls(rows)
+  );
   const response = buildDdlResponse(
-    await getSnapshotRowsBySourceGroups(env, [BAOYANXINXI_SOURCE_GROUP, MANUAL_SOURCE_GROUP]),
+    rows,
     new Date(),
-    await getAppState(env, "last_synced_at")
+    await getAppState(env, "last_synced_at"),
+    classifications
   );
   return jsonResponse(response, 200, {
     "cache-control": "public, max-age=300, s-maxage=900",
     // 允许 LLM / Agent 在浏览器端跨域抓取结构化数据
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, OPTIONS"
+  });
+}
+
+async function handleRelevanceClassifications(request: Request, env: Env): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+
+  const body = (await request.json()) as Record<string, unknown>;
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  if (rawItems.length === 0 || rawItems.length > 500) {
+    return jsonResponse({ ok: false, error: "invalid_items" }, 400);
+  }
+
+  const now = new Date().toISOString();
+  const entries = rawItems.map((entry) => readRelevanceClassification(entry, now));
+  if (entries.some((entry) => entry === null)) {
+    return jsonResponse({ ok: false, error: "invalid_classification" }, 400);
+  }
+
+  const changed = await upsertItemRelevanceClassifications(
+    env,
+    entries as ItemRelevanceClassification[],
+    now
+  );
+  return jsonResponse({
+    ok: true,
+    accepted: entries.length,
+    changed
   });
 }
 
@@ -787,6 +831,59 @@ function toNullableString(value: FormDataEntryValue | null): string | null {
 
 function readString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function readRelevanceClassification(
+  value: unknown,
+  now: string
+): ItemRelevanceClassification | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const normalizedUrl = canonicalizeNotificationUrl(
+    readString(record.normalizedUrl) || readString(record.website)
+  );
+  const relevance = readString(record.relevance);
+  const areas = Array.isArray(record.areas)
+    ? record.areas.filter((area): area is string => typeof area === "string")
+    : [];
+  const reason = readString(record.reason).trim();
+  const classifier = readString(record.classifier).trim() || "codex-ai";
+  const classifiedAt = readString(record.classifiedAt).trim() || now;
+
+  if (
+    normalizedUrl === "" ||
+    !isValidRelevance(relevance) ||
+    !areValidAreas(areas) ||
+    reason === "" ||
+    reason.length > 500 ||
+    classifier.length > 64 ||
+    Number.isNaN(new Date(classifiedAt).getTime())
+  ) {
+    return null;
+  }
+
+  return {
+    normalizedUrl,
+    relevance,
+    areas: dedupeAreas(areas),
+    reason,
+    classifier,
+    classifiedAt
+  };
+}
+
+function isValidRelevance(value: string): value is Relevance {
+  return value === "strong" || value === "possible" || value === "unrelated";
+}
+
+function areValidAreas(areas: string[]): boolean {
+  return areas.length > 0 && areas.every((area) => BAOYAN_AREA_OPTIONS.includes(area as never));
+}
+
+function dedupeAreas(areas: string[]): string[] {
+  return BAOYAN_AREA_OPTIONS.filter((area) => areas.includes(area));
 }
 
 function formatReviewTime(value: string): string {

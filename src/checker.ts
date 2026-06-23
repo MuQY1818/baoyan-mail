@@ -2,6 +2,7 @@ import {
   countActiveSubscribers,
   getActiveSubscribers,
   getAppState,
+  getItemRelevanceClassifications,
   getManualItems,
   getPendingNewDeadlineNotifications,
   getSnapshotCount,
@@ -17,6 +18,10 @@ import {
   upsertSnapshots
 } from "./db";
 import {
+  applyRelevanceClassificationsToItems,
+  getDdlEntryNormalizedUrls
+} from "./ddl";
+import {
   sendDailyDeadlineDigestEmails,
   sendNewDeadlineNotificationEmails
 } from "./email";
@@ -26,7 +31,13 @@ import {
   fetchSourceItemsWithStats,
   getBaoyanXinxiAreas
 } from "./source";
-import type { Env, NormalizedItem, RunCheckResult, SourceStats } from "./types";
+import type {
+  Env,
+  NewDeadlineNotificationWithItem,
+  NormalizedItem,
+  RunCheckResult,
+  SourceStats
+} from "./types";
 
 const DEFAULT_BATCH_SIZE = 50;
 const DAILY_DEADLINE_DIGEST_DAYS = 15;
@@ -66,6 +77,11 @@ export async function runCheck(
   const sourceResult = await fetchSourceItemsWithStats(env);
   const manualItems = await getManualItems(env);
   const items = [...sourceResult.items, ...manualItems];
+  const classifications = await getItemRelevanceClassifications(
+    env,
+    getDdlEntryNormalizedUrls(items)
+  );
+  const classifiedItems = applyRelevanceClassificationsToItems(items, classifications);
   const sourceStats = sourceResult.stats.map((stats) => ({ ...stats }));
   await upsertReviewCandidates(env, sourceResult.reviewCandidates, now);
   const snapshotCount = await getSnapshotCount(env);
@@ -85,10 +101,13 @@ export async function runCheck(
     addedCount = detected.filter((change) => change.kind === "added").length;
     changedCount = detected.filter((change) => change.kind === "changed").length;
     if (sendEmails) {
-      newDeadlineItems = detected
+      newDeadlineItems = applyRelevanceClassificationsToItems(
+        detected
         .filter((change) => change.kind === "added")
         .filter((change) => !hasEquivalentSnapshot(change.item, snapshots))
-        .map((change) => change.item);
+          .map((change) => change.item),
+        classifications
+      );
     }
     await upsertSnapshots(env, items, now);
     missingCount = await markMissingForSuccessfulSources(env, items, sourceStats, now);
@@ -96,7 +115,7 @@ export async function runCheck(
 
   await setAppState(env, LAST_SYNC_STATE_KEY, now, now);
   const dailyDeadlineDigest = collectDailyDeadlineDigestItems(
-    getEmailRelevantItems(items),
+    getEmailRelevantItems(classifiedItems),
     DAILY_DEADLINE_DIGEST_DAYS,
     nowDate
   );
@@ -141,6 +160,9 @@ export async function runCheck(
 
 function getEmailRelevantItems(items: NormalizedItem[]): NormalizedItem[] {
   return items.filter((item) => {
+    if (item.relevance !== undefined) {
+      return item.relevance === "strong";
+    }
     const areas = item.areas ?? getBaoyanXinxiAreas(item.name, item.institute);
     return areas.some((area) => area !== "其他");
   });
@@ -391,8 +413,25 @@ async function sendPendingNewDeadlineNotifications(
   now: string,
   nowDate: Date
 ): Promise<{ sent: number; subscriberCount: number }> {
-  const pending = await getPendingNewDeadlineNotifications(env, now);
+  const rawPending = await getPendingNewDeadlineNotifications(env, now);
+  const classifications = await getItemRelevanceClassifications(
+    env,
+    getDdlEntryNormalizedUrls(rawPending.map((entry) => entry.item))
+  );
+  const pending = rawPending
+    .map((entry) => ({
+      ...entry,
+      item: applyRelevanceClassificationsToItems([entry.item], classifications)[0] ?? entry.item
+    }))
+    .filter(isEmailRelevantNewDeadlineNotification);
+  const skippedIds = rawPending
+    .filter((entry) => pending.every((pendingEntry) => pendingEntry.id !== entry.id))
+    .map((entry) => entry.id);
   const subscriberCount = await countActiveSubscribers(env);
+  if (skippedIds.length > 0) {
+    await markNewDeadlineNotificationsSent(env, skippedIds, now);
+    await logMailSend(env, skippedIds, 0, "skipped", null, "非强相关 DDL 不发送", now);
+  }
   if (pending.length === 0) {
     return { sent: 0, subscriberCount };
   }
@@ -434,6 +473,12 @@ async function sendPendingNewDeadlineNotifications(
 
   await markNewDeadlineNotificationsSent(env, ids, now);
   return { sent: pending.length, subscriberCount };
+}
+
+function isEmailRelevantNewDeadlineNotification(
+  notification: NewDeadlineNotificationWithItem
+): boolean {
+  return getEmailRelevantItems([notification.item]).length === 1;
 }
 
 function resolveBaseUrl(env: Env, baseUrl: string | undefined): string {

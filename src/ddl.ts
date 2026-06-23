@@ -1,5 +1,15 @@
-import { canonicalizeNotificationUrl, getBaoyanXinxiAreas, getSchoolTierTags } from "./source";
-import type { ItemSnapshotRow, NormalizedItem } from "./types";
+import {
+  canonicalizeNotificationUrl,
+  classifyBaoyanXinxiRecord,
+  getBaoyanXinxiAreas,
+  getSchoolTierTags
+} from "./source";
+import type {
+  ItemRelevanceClassification,
+  ItemSnapshotRow,
+  NormalizedItem,
+  Relevance
+} from "./types";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const STALE_GRACE_HOURS = 48;
@@ -25,6 +35,10 @@ export interface DdlApiItem {
   status: "today" | "future" | "expired";
   tier: string;
   areas: string[];
+  relevance: Relevance;
+  relevanceReason: string | null;
+  relevanceClassifier: string;
+  relevanceClassifiedAt: string | null;
   sourceGroup: string;
   sourceLabel: string;
   website: string;
@@ -59,9 +73,10 @@ export interface DdlApiResponse {
 export function buildDdlResponse(
   entries: Array<NormalizedItem | ItemSnapshotRow>,
   now = new Date(),
-  lastSyncedAt: string | null = null
+  lastSyncedAt: string | null = null,
+  classifications: Map<string, ItemRelevanceClassification> = new Map()
 ): DdlApiResponse {
-  const contexts = entries.map(toDdlContext);
+  const contexts = entries.map((entry) => toDdlContext(entry, classifications));
   const serializedItems = contexts
     .map((context) => serializeDdlItem(context, now))
     .filter((item): item is DdlApiItem => item !== null)
@@ -177,6 +192,7 @@ export function serializeDdlItem(
   const remainingDays = getShanghaiCalendarDaysUntil(now, deadline);
   const status = getDeadlineStatus(deadline, remainingDays, now);
   const tier = getSchoolTierTags(item.name)[0] ?? "其他";
+  const relevance = getItemRelevance(item);
 
   return {
     key: item.key,
@@ -189,7 +205,11 @@ export function serializeDdlItem(
     remainingText: formatRemainingText(status, remainingDays),
     status,
     tier,
-    areas: item.areas ?? getBaoyanXinxiAreas(item.name, item.institute),
+    areas: normalizeDdlAreas(item.areas ?? getBaoyanXinxiAreas(item.name, item.institute)),
+    relevance,
+    relevanceReason: item.relevanceReason ?? null,
+    relevanceClassifier: item.relevanceClassifier ?? "rule-fallback",
+    relevanceClassifiedAt: item.relevanceClassifiedAt ?? null,
     sourceGroup: item.sourceGroup,
     sourceLabel: formatSourceGroup(item.sourceGroup),
     website: item.website,
@@ -198,6 +218,44 @@ export function serializeDdlItem(
     lastSeenAt: context.lastSeenAt,
     missingSince: context.missingSince,
     sourceVisibility: getSourceVisibility(context.missingSince, now)
+  };
+}
+
+export function getDdlEntryNormalizedUrls(entries: Array<NormalizedItem | ItemSnapshotRow>): string[] {
+  return entries
+    .map((entry) => canonicalizeNotificationUrl(toDdlContext(entry).item.website))
+    .filter((url) => url !== "");
+}
+
+export function applyRelevanceClassificationsToItems(
+  items: NormalizedItem[],
+  classifications: Map<string, ItemRelevanceClassification>
+): NormalizedItem[] {
+  return items.map((item) => applyRelevanceClassification(item, classifications));
+}
+
+export function applyRelevanceClassification(
+  item: NormalizedItem,
+  classifications: Map<string, ItemRelevanceClassification>
+): NormalizedItem {
+  const normalizedUrl = canonicalizeNotificationUrl(item.website);
+  const classification = classifications.get(normalizedUrl);
+  if (classification !== undefined) {
+    return {
+      ...item,
+      areas: normalizeDdlAreas(classification.areas),
+      relevance: classification.relevance,
+      relevanceReason: classification.reason,
+      relevanceClassifier: classification.classifier,
+      relevanceClassifiedAt: classification.classifiedAt
+    };
+  }
+
+  return {
+    ...item,
+    areas: normalizeDdlAreas(item.areas ?? getBaoyanXinxiAreas(item.name, item.institute)),
+    relevance: getRuleFallbackRelevance(item),
+    relevanceClassifier: "rule-fallback"
   };
 }
 
@@ -325,10 +383,14 @@ function toUtcDayNumber(parts: { year: number; month: number; day: number }): nu
   return Math.floor(Date.UTC(parts.year, parts.month - 1, parts.day) / MS_PER_DAY);
 }
 
-function toDdlContext(entry: NormalizedItem | ItemSnapshotRow): DdlContext {
+function toDdlContext(
+  entry: NormalizedItem | ItemSnapshotRow,
+  classifications: Map<string, ItemRelevanceClassification> = new Map()
+): DdlContext {
   if ("payload" in entry) {
+    const item = JSON.parse(entry.payload) as NormalizedItem;
     return {
-      item: JSON.parse(entry.payload) as NormalizedItem,
+      item: applyRelevanceClassification(item, classifications),
       firstSeenAt: entry.first_seen_at,
       updatedAt: entry.updated_at,
       lastSeenAt: entry.last_seen_at,
@@ -336,12 +398,32 @@ function toDdlContext(entry: NormalizedItem | ItemSnapshotRow): DdlContext {
     };
   }
   return {
-    item: entry,
+    item: applyRelevanceClassification(entry, classifications),
     firstSeenAt: null,
     updatedAt: null,
     lastSeenAt: null,
     missingSince: null
   };
+}
+
+function getItemRelevance(item: NormalizedItem): Relevance {
+  return item.relevance ?? getRuleFallbackRelevance(item);
+}
+
+function getRuleFallbackRelevance(item: NormalizedItem): Relevance {
+  const classification = classifyBaoyanXinxiRecord(item.name, item.institute);
+  if (classification === "accepted") {
+    return "strong";
+  }
+  if (classification === "review") {
+    return "possible";
+  }
+  return "unrelated";
+}
+
+function normalizeDdlAreas(areas: string[]): string[] {
+  const filtered = areas.map((area) => area.trim()).filter((area) => area !== "");
+  return filtered.length === 0 ? ["其他"] : Array.from(new Set(filtered));
 }
 
 function getSourceVisibility(
