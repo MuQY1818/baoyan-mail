@@ -37,3 +37,7 @@
 - 2026-06-23：将 DDL 自动数据源切换为仅使用保研信息平台，旧 CS-BAOYAN-DDL 快照不再进入公开 API、网站和邮件；保留人工补充源，并对旧快照同链接条目抑制重复新增 DDL 提醒。
 - 2026-06-23：保研信息平台自动源改为公开 API 和网站全量展示未截止源站条目，不再按专业方向服务端过滤；新增方向分类字段和前端方向筛选，邮件侧仍只发送计算机、电子信息等相关方向。
 - 2026-06-23：新增 Codex AI 相关度分类链路，D1 记录 `strong`、`possible`、`unrelated` 分类，公开 API 返回分类字段，网站默认展示强相关并保留可能相关和全部源站切换，邮件侧只发送强相关 DDL。
+
+## 部署经验
+
+- Vercel 部署若长时间显示 `Building`，但 `vercel inspect --format=json` 里 `readyState` 是 `BLOCKED`，先看 `readyStateReason`。本项目曾因 Git author 为 `muqy1818@users.noreply.github.com` 被 Vercel Team Access 拦截，提示该 author 没有团队部署权限；解决方法是把提交 author/committer 改为 Vercel 认可的 `2565324759@qq.com`，再重新 `vercel build --prod && vercel deploy --prebuilt --prod --yes`。
