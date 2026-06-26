@@ -142,7 +142,6 @@ const RELEVANCE_OPTIONS: Array<{ value: RelevanceFilter; label: string }> = [
   { value: "possible", label: "强相关+可能" },
   { value: "all", label: "全部源站" }
 ];
-const SUBSCRIBE_URL = "https://baoyan-mail.weijuebu.workers.dev/";
 const API_URL = "https://baoyan-mail.weijuebu.workers.dev/api/ddl";
 const LLMS_TXT_URL = "/llms.txt";
 const RECENT_DAYS = 7;
@@ -426,9 +425,6 @@ function App(): React.ReactElement {
           </p>
         </div>
         <div className="hero-actions">
-          <a className="subscribe-link" href={SUBSCRIBE_URL}>
-            订阅每日邮件
-          </a>
           <span className="updated">{formatGeneratedAt(data?.lastSyncedAt ?? data?.generatedAt)}</span>
         </div>
       </section>
