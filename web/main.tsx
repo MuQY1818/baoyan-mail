@@ -290,9 +290,9 @@ function App(): React.ReactElement {
   const timelineStops = useMemo(
     () =>
       buildTimeline(
-        filterItems(futureItems, query, "7", source, relevance, activeTiers, activeAreas, recent)
+        filterItems(futureItems, query, range, source, relevance, activeTiers, activeAreas, recent)
       ),
-    [activeAreas, activeTiers, futureItems, query, recent, relevance, source]
+    [activeAreas, activeTiers, futureItems, query, range, recent, relevance, source]
   );
 
   // 点击概览后等列表渲染完成再滚动到目标卡片，滚动结束后再高亮（确保视线到位时才闪烁）
@@ -433,7 +433,7 @@ function App(): React.ReactElement {
         </div>
       </section>
 
-      <Timeline stops={timelineStops} loading={isLoading} />
+      <Timeline range={range} stops={timelineStops} loading={isLoading} />
 
       <section className="dashboard" aria-label="DDL 查询工具">
         <aside className="rail" aria-label="截止时间概览">
@@ -798,6 +798,22 @@ function DdlCard({
   );
 }
 
+function getAreaClass(area: string): string {
+  switch (area) {
+    case "人工智能": return "area-ai";
+    case "数据科学": return "area-data";
+    case "计算机": return "area-cs";
+    case "软件": return "area-software";
+    case "网络安全": return "area-security";
+    case "电子信息": return "area-ee";
+    case "通信": return "area-telecom";
+    case "集成电路": return "area-ic";
+    case "自动化控制": return "area-control";
+    case "机器人光电": return "area-robot";
+    default: return "area-other";
+  }
+}
+
 function DdlTable({
   favorites,
   items,
@@ -844,7 +860,7 @@ function DdlTable({
               <td>
                 <div className="table-area-list">
                   {getItemAreas(item).map((area) => (
-                    <span className="table-area" key={area}>{area}</span>
+                    <span className={`table-area ${getAreaClass(area)}`} key={area}>{area}</span>
                   ))}
                 </div>
               </td>
@@ -874,7 +890,7 @@ function AreaBadges({ item }: { item: DdlItem }): React.ReactElement {
   return (
     <div className="area-badges" aria-label="方向分类">
       {getItemAreas(item).map((area) => (
-        <span className="area-badge" key={area}>{area}</span>
+        <span className={`area-badge ${getAreaClass(area)}`} key={area}>{area}</span>
       ))}
     </div>
   );
@@ -924,9 +940,11 @@ function SummaryCell({ label, value }: { label: string; value: number }): React.
 
 function Timeline({
   loading,
+  range,
   stops
 }: {
   loading: boolean;
+  range: RangeFilter;
   stops: TimelineStop[];
 }): React.ReactElement | null {
   const [expandedStops, setExpandedStops] = useState<Set<number>>(new Set());
@@ -944,6 +962,7 @@ function Timeline({
   const hasExpandableStops = expandableStopKeys.length > 0;
   const allExpandableStopsExpanded =
     hasExpandableStops && expandedStopCount === expandableStopKeys.length;
+  const rangeLabel = formatTimelineRangeLabel(range);
 
   useEffect(() => {
     setExpandedStops((previous) => {
@@ -976,10 +995,10 @@ function Timeline({
   }
 
   return (
-    <section className="timeline" aria-label="7 天内截止时间线">
+    <section className="timeline" aria-label={`${rangeLabel}截止时间线`}>
       <div className="timeline-head">
         <div className="timeline-head-text">
-          <span className="timeline-title">未来 7 天截止</span>
+          <span className="timeline-title">{rangeLabel}截止</span>
           <span className="timeline-hint">按筛选条件实时更新</span>
         </div>
         {hasExpandableStops && (
@@ -1004,7 +1023,7 @@ function Timeline({
         )}
       </div>
       {stops.length === 0 ? (
-        <p className="timeline-empty">未来 7 天内暂无符合条件的截止。</p>
+        <p className="timeline-empty">{rangeLabel}暂无符合条件的截止。</p>
       ) : (
         <ol className="timeline-track">
           {stops.map((stop) => (
@@ -1222,6 +1241,17 @@ function dayLabelFor(day: number): string {
     return "后天";
   }
   return `${day} 天后`;
+}
+
+function formatTimelineRangeLabel(range: RangeFilter): string {
+  const option = RANGE_OPTIONS.find((entry) => entry.value === range);
+  if (option === undefined || option.value === "future") {
+    return "全部未来";
+  }
+  if (option.value === "today") {
+    return "今日";
+  }
+  return `未来 ${option.label}`;
 }
 
 function formatTimelineDate(value: string): string {

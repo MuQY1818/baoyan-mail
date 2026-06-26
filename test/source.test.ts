@@ -711,6 +711,47 @@ describe("source normalization", () => {
     }
   });
 
+  it("guards relevant rule matches from unrelated AI classifications", () => {
+    const item: NormalizedItem = {
+      key: "nwpu-cs",
+      contentHash: "hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "西北工业大学",
+      institute: "计算机学院",
+      description: "保研信息平台补充源",
+      deadline: "2026-07-02T03:59:59.000Z",
+      website: "https://jsj.nwpu.edu.cn/info/1599/29795.htm",
+      tags: ["985"],
+      areas: ["计算机"]
+    };
+    const response = buildDdlResponse(
+      [item],
+      new Date("2026-06-26T04:00:00.000Z"),
+      null,
+      new Map([
+        [
+          "https://jsj.nwpu.edu.cn/info/1599/29795.htm",
+          {
+            normalizedUrl: "https://jsj.nwpu.edu.cn/info/1599/29795.htm",
+            relevance: "unrelated",
+            areas: ["其他"],
+            reason: "AI 误判为无关",
+            classifier: "codex-ai",
+            classifiedAt: "2026-06-26T00:00:00.000Z"
+          }
+        ]
+      ])
+    );
+
+    expect(response.items[0]).toMatchObject({
+      school: "西北工业大学",
+      institute: "计算机学院",
+      relevance: "strong",
+      areas: ["计算机"],
+      relevanceClassifier: "codex-ai+rule-guard"
+    });
+  });
+
   it("marks disappeared source records as missing without sending mail in sync-only mode", async () => {
     const db = new FakeD1Database();
     const originalFetch = globalThis.fetch;

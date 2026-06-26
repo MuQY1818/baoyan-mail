@@ -241,6 +241,18 @@ export function applyRelevanceClassification(
   const normalizedUrl = canonicalizeNotificationUrl(item.website);
   const classification = classifications.get(normalizedUrl);
   if (classification !== undefined) {
+    const fallbackRelevance = getRuleFallbackRelevance(item);
+    if (classification.relevance === "unrelated" && fallbackRelevance !== "unrelated") {
+      return {
+        ...item,
+        areas: normalizeDdlAreas(item.areas ?? getBaoyanXinxiAreas(item.name, item.institute)),
+        relevance: fallbackRelevance,
+        relevanceReason: `规则兜底：${classification.reason}`,
+        relevanceClassifier: `${classification.classifier}+rule-guard`,
+        relevanceClassifiedAt: classification.classifiedAt
+      };
+    }
+
     return {
       ...item,
       areas: normalizeDdlAreas(classification.areas),
