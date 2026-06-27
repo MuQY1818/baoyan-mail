@@ -7,6 +7,8 @@ import {
   getPendingReviewCandidates,
   getReviewCandidateById,
   getSnapshotRowsBySourceGroups,
+  getVisitDailyStats,
+  incrementVisitDailyStat,
   insertReviewRule,
   rejectReviewCandidate,
   unsubscribeByToken,
@@ -27,11 +29,36 @@ import {
   normalizeBaoyanXinxiDeadline
 } from "./source";
 import { upsertReviewCandidates, upsertSnapshots } from "./db";
-import type { Env, ItemRelevanceClassification, Relevance, ReviewCandidatePayload } from "./types";
+import type {
+  Env,
+  ItemRelevanceClassification,
+  Relevance,
+  ReviewCandidatePayload,
+  VisitDailyStatRow
+} from "./types";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const REVIEW_COOKIE_NAME = "baoyan_review_auth";
 const REVIEW_SESSION_MAX_AGE_SECONDS = 6 * 60 * 60;
+const COUNTRY_NAMES: Record<string, string> = {
+  AU: "澳大利亚",
+  CA: "加拿大",
+  CN: "中国大陆",
+  DE: "德国",
+  FR: "法国",
+  GB: "英国",
+  HK: "中国香港",
+  JP: "日本",
+  KR: "韩国",
+  MO: "中国澳门",
+  MY: "马来西亚",
+  NL: "荷兰",
+  NZ: "新西兰",
+  SG: "新加坡",
+  TH: "泰国",
+  TW: "中国台湾",
+  US: "美国"
+};
 
 export async function handleRequest(
   request: Request,
@@ -60,9 +87,18 @@ export async function handleRequest(
     }
     if (
       request.method === "OPTIONS" &&
-      (url.pathname === "/api/ddl" || url.pathname === "/api/missing-link")
+      (url.pathname === "/api/ddl" ||
+        url.pathname === "/api/missing-link" ||
+        url.pathname === "/api/analytics/visit" ||
+        url.pathname === "/api/analytics/summary")
     ) {
       return handleDdlPreflight();
+    }
+    if (request.method === "POST" && url.pathname === "/api/analytics/visit") {
+      return await handleAnalyticsVisit(request, env);
+    }
+    if (request.method === "GET" && url.pathname === "/api/analytics/summary") {
+      return await handleAnalyticsSummary(env);
     }
     if (request.method === "POST" && url.pathname === "/api/missing-link") {
       return await handleMissingLink(request, env);
@@ -214,6 +250,35 @@ async function handleDdl(env: Env): Promise<Response> {
     // 允许 LLM / Agent 在浏览器端跨域抓取结构化数据
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, OPTIONS"
+  });
+}
+
+async function handleAnalyticsVisit(request: Request, env: Env): Promise<Response> {
+  const now = new Date();
+  const geo = readRequestGeo(request);
+  await incrementVisitDailyStat(
+    env,
+    {
+      visitDate: formatShanghaiDate(now),
+      countryCode: geo.countryCode,
+      regionCode: geo.regionCode,
+      countryName: geo.countryName,
+      regionName: geo.regionName
+    },
+    now.toISOString()
+  );
+  return jsonResponse({ ok: true }, 200, {
+    "cache-control": "no-store",
+    ...corsHeaders()
+  });
+}
+
+async function handleAnalyticsSummary(env: Env): Promise<Response> {
+  const sinceDate = formatShanghaiDate(addDays(new Date(), -29));
+  const rows = await getVisitDailyStats(env, sinceDate);
+  return jsonResponse(buildAnalyticsSummary(rows), 200, {
+    "cache-control": "public, max-age=300, s-maxage=900",
+    ...corsHeaders()
   });
 }
 
@@ -523,6 +588,196 @@ function corsHeaders(): Record<string, string> {
   return {
     "access-control-allow-origin": "*"
   };
+}
+
+function buildAnalyticsSummary(rows: VisitDailyStatRow[]): {
+  ok: true;
+  generatedAt: string;
+  windowDays: number;
+  totalVisits: number;
+  todayVisits: number;
+  countryCount: number;
+  regionCount: number;
+  countries: Array<{
+    countryCode: string;
+    countryName: string;
+    visitCount: number;
+    share: number;
+  }>;
+  regions: Array<{
+    countryCode: string;
+    regionCode: string;
+    regionName: string;
+    visitCount: number;
+    share: number;
+  }>;
+  daily: Array<{ date: string; visitCount: number }>;
+} {
+  const today = formatShanghaiDate(new Date());
+  const countryCounts = new Map<string, { countryCode: string; countryName: string; count: number }>();
+  const regionCounts = new Map<
+    string,
+    { countryCode: string; regionCode: string; regionName: string; count: number }
+  >();
+  const dailyCounts = new Map<string, number>();
+  let totalVisits = 0;
+
+  for (const row of rows) {
+    const visitCount = readNonNegativeCount(row.visit_count);
+    totalVisits += visitCount;
+    dailyCounts.set(row.visit_date, (dailyCounts.get(row.visit_date) ?? 0) + visitCount);
+    const countryCode = normalizeCountryCode(row.country_code);
+    const countryName = row.country_name.trim() || getCountryName(countryCode);
+    const current = countryCounts.get(countryCode) ?? {
+      countryCode,
+      countryName,
+      count: 0
+    };
+    current.count += visitCount;
+    if (current.countryName === "未知地区" && countryName !== "未知地区") {
+      current.countryName = countryName;
+    }
+    countryCounts.set(countryCode, current);
+
+    const regionCode = normalizeRegionCode(row.region_code);
+    const regionName = formatRegionName(countryName, regionCode, row.region_name);
+    const regionKey = `${countryCode}:${regionCode}:${regionName}`;
+    const currentRegion = regionCounts.get(regionKey) ?? {
+      countryCode,
+      regionCode,
+      regionName,
+      count: 0
+    };
+    currentRegion.count += visitCount;
+    regionCounts.set(regionKey, currentRegion);
+  }
+
+  const countries = Array.from(countryCounts.values())
+    .sort((left, right) => right.count - left.count || left.countryCode.localeCompare(right.countryCode))
+    .slice(0, 24)
+    .map((entry) => ({
+      countryCode: entry.countryCode,
+      countryName: entry.countryName,
+      visitCount: entry.count,
+      share: totalVisits === 0 ? 0 : Math.round((entry.count / totalVisits) * 1000) / 10
+    }));
+
+  const regions = Array.from(regionCounts.values())
+    .sort((left, right) => right.count - left.count || left.regionName.localeCompare(right.regionName, "zh-CN"))
+    .slice(0, 12)
+    .map((entry) => ({
+      countryCode: entry.countryCode,
+      regionCode: entry.regionCode,
+      regionName: entry.regionName,
+      visitCount: entry.count,
+      share: totalVisits === 0 ? 0 : Math.round((entry.count / totalVisits) * 1000) / 10
+    }));
+
+  const daily = Array.from(dailyCounts.entries())
+    .sort(([leftDate], [rightDate]) => leftDate.localeCompare(rightDate))
+    .map(([date, visitCount]) => ({ date, visitCount }));
+
+  return {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    windowDays: 30,
+    totalVisits,
+    todayVisits: dailyCounts.get(today) ?? 0,
+    countryCount: countryCounts.size,
+    regionCount: regionCounts.size,
+    countries,
+    regions,
+    daily
+  };
+}
+
+function readRequestGeo(request: Request): {
+  countryCode: string;
+  regionCode: string;
+  countryName: string;
+  regionName: string;
+} {
+  const cf = request.cf as IncomingRequestCfProperties | undefined;
+  const countryCode = normalizeCountryCode(
+    readHeaderString(request, "x-vercel-ip-country") || readCfString(cf?.country)
+  );
+  const regionCode = normalizeRegionCode(
+    readHeaderString(request, "x-vercel-ip-country-region") || readCfString(cf?.regionCode)
+  );
+  const countryName = getCountryName(countryCode);
+  const regionName =
+    readVercelGeoHeader(request, "x-vercel-ip-city") ||
+    readCfString(cf?.region) ||
+    regionCode;
+  return {
+    countryCode,
+    regionCode,
+    countryName,
+    regionName
+  };
+}
+
+function readCfString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function readHeaderString(request: Request, name: string): string {
+  return request.headers.get(name)?.trim() ?? "";
+}
+
+function readVercelGeoHeader(request: Request, name: string): string {
+  const rawValue = readHeaderString(request, name);
+  if (rawValue === "") {
+    return "";
+  }
+  try {
+    return decodeURIComponent(rawValue).trim();
+  } catch {
+    return rawValue;
+  }
+}
+
+function normalizeCountryCode(value: string): string {
+  const normalized = value.trim().toUpperCase();
+  return /^[A-Z]{2}$/u.test(normalized) ? normalized : "XX";
+}
+
+function normalizeRegionCode(value: string): string {
+  const normalized = value.trim().toUpperCase();
+  return /^[A-Z0-9-]{1,16}$/u.test(normalized) ? normalized : "";
+}
+
+function getCountryName(countryCode: string): string {
+  const name = COUNTRY_NAMES[countryCode];
+  return name ?? (countryCode === "XX" ? "未知地区" : countryCode);
+}
+
+function formatRegionName(countryName: string, regionCode: string, regionName: string): string {
+  const name = regionName.trim();
+  if (name !== "") {
+    return `${countryName} / ${name}`;
+  }
+  if (regionCode !== "") {
+    return `${countryName} / ${regionCode}`;
+  }
+  return countryName;
+}
+
+function readNonNegativeCount(value: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function addDays(date: Date, days: number): Date {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+function formatShanghaiDate(date: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
 }
 
 function renderSubscribePage(): string {

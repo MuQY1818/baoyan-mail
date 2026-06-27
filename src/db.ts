@@ -9,7 +9,8 @@ import type {
   ReviewCandidatePayload,
   SourceReviewCandidateRow,
   SourceReviewCandidateWithPayload,
-  SubscriberRow
+  SubscriberRow,
+  VisitDailyStatRow
 } from "./types";
 
 const SQL_BATCH_SIZE = 50;
@@ -198,6 +199,74 @@ export async function getSnapshotRowsBySourceGroups(
 
 export async function getSnapshotItems(env: Env): Promise<NormalizedItem[]> {
   return (await getSnapshotRows(env)).map((row) => JSON.parse(row.payload) as NormalizedItem);
+}
+
+export async function incrementVisitDailyStat(
+  env: Env,
+  stat: {
+    visitDate: string;
+    countryCode: string;
+    regionCode: string;
+    countryName: string;
+    regionName: string;
+  },
+  now: string
+): Promise<void> {
+  await env.DB.prepare(
+    `
+      INSERT INTO visit_daily_stats (
+        visit_date,
+        country_code,
+        region_code,
+        country_name,
+        region_name,
+        visit_count,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(visit_date, country_code, region_code) DO UPDATE SET
+        country_name = excluded.country_name,
+        region_name = excluded.region_name,
+        visit_count = visit_count + 1,
+        updated_at = excluded.updated_at
+    `
+  )
+    .bind(
+      stat.visitDate,
+      stat.countryCode,
+      stat.regionCode,
+      stat.countryName,
+      stat.regionName,
+      now,
+      now
+    )
+    .run();
+}
+
+export async function getVisitDailyStats(
+  env: Env,
+  sinceDate: string
+): Promise<VisitDailyStatRow[]> {
+  const result = await env.DB.prepare(
+    `
+      SELECT
+        visit_date,
+        country_code,
+        region_code,
+        country_name,
+        region_name,
+        visit_count,
+        created_at,
+        updated_at
+      FROM visit_daily_stats
+      WHERE visit_date >= ?
+      ORDER BY visit_date DESC, visit_count DESC
+    `
+  )
+    .bind(sinceDate)
+    .all<VisitDailyStatRow>();
+  return result.results ?? [];
 }
 
 export async function getItemRelevanceClassifications(

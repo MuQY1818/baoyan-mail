@@ -19,6 +19,7 @@
 - DDL API 会标记源站可见性，默认隐藏已截止和超过 48 小时宽限期的 stale 条目。
 - 提供候选审核和人工补充能力，用户提交的缺漏链接审核通过后再公开。
 - DDL 查询网站支持相关度、方向、层次、时间、来源筛选，支持 URL 分享、最近新增/更新、收藏、已读、紧凑表格和白昼/夜间模式。
+- DDL 查询网站底部展示匿名访问统计，按浏览器每日一次计数，聚合近 30 天访问、国家或地区、细分地区和趋势，不保存 IP、邮箱或浏览器指纹。
 - 每封邮件包含数据来源、原始通知链接和退订链接。
 - 管理员可手动触发一次更新检查。
 
@@ -60,6 +61,8 @@ https://www.baoyanxinxi.cn/2026jsjby/
 | `GET` | `/api/unsubscribe?token=...` | 退订 |
 | `GET` | `/api/health` | 健康检查 |
 | `GET` | `/api/ddl` | 公开 DDL 列表，供前端网站读取 |
+| `POST` | `/api/analytics/visit` | 记录一次匿名聚合访问 |
+| `GET` | `/api/analytics/summary` | 获取近 30 天匿名访问统计 |
 | `GET` | `/api/admin/run-check` | 手动触发检查，需要管理员密钥 |
 | `GET` | `/api/admin/sync-sources` | 只同步源站和候选池，不发邮件，需要管理员密钥 |
 | `POST` | `/api/admin/relevance-classifications` | 批量写入 AI 相关度分类，需要管理员密钥 |
@@ -191,13 +194,15 @@ npm run deploy
 
 网站使用 Vite + React + TypeScript，入口在 `web/`，构建产物输出到 `dist/`。页面默认展示强相关未截止 DDL，支持切换强相关、强相关+可能、全部源站，也支持学校或院系搜索、方向筛选、学校层次筛选、时间范围筛选、来源筛选、最近新增/更新、收藏、已读、紧凑表格、白昼/夜间模式和原始通知跳转。
 
+网站底部展示匿名访问统计，风格采用轻量 analytics footer：指标卡、抽象地球热力、地区排行和 30 天趋势。统计写入 D1 `visit_daily_stats`，按北京时间日期聚合；生产访问优先读取 Vercel 地区请求头，回退到 Cloudflare `request.cf` 地理信息。
+
 构建：
 
 ```bash
 npm run build:web
 ```
 
-Vercel 部署使用 `vercel.json`，其中 `/api/ddl` 会转发到生产 Worker：
+Vercel 部署使用 `vercel.json`，其中 `/api/ddl` 和 `/api/analytics/*` 会转发到生产 Worker：
 
 ```text
 https://baoyan-mail.weijuebu.workers.dev/api/ddl

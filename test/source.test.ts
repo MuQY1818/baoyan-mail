@@ -63,6 +63,7 @@ class FakeD1Database {
   readonly appState = new Map<string, string>();
   readonly relevanceClassifications = new Map<string, unknown[]>();
   readonly newDeadlineNotifications: unknown[][] = [];
+  readonly visitDailyStats = new Map<string, unknown[]>();
   readonly mailLogs: unknown[][] = [];
   activeSubscriberCount = 0;
 
@@ -151,6 +152,21 @@ class FakeD1Database {
           updated_at: String(entry[7])
         })) as T[];
     }
+    if (sql.includes("FROM visit_daily_stats")) {
+      const sinceDate = String(bindings[0]);
+      return Array.from(this.visitDailyStats.values())
+        .map((entry) => ({
+          visit_date: String(entry[0]),
+          country_code: String(entry[1]),
+          region_code: String(entry[2]),
+          country_name: String(entry[3]),
+          region_name: String(entry[4]),
+          visit_count: Number(entry[5]),
+          created_at: String(entry[6]),
+          updated_at: String(entry[7])
+        }))
+        .filter((row) => row.visit_date >= sinceDate) as T[];
+    }
     return [];
   }
 
@@ -197,6 +213,27 @@ class FakeD1Database {
       changes = 1;
     } else if (sql.includes("INSERT INTO item_relevance_classifications")) {
       this.relevanceClassifications.set(String(bindings[0]), bindings);
+      changes = 1;
+    } else if (sql.includes("INSERT INTO visit_daily_stats")) {
+      const key = `${String(bindings[0])}:${String(bindings[1])}:${String(bindings[2])}`;
+      const existing = this.visitDailyStats.get(key);
+      if (existing === undefined) {
+        this.visitDailyStats.set(key, [
+          bindings[0],
+          bindings[1],
+          bindings[2],
+          bindings[3],
+          bindings[4],
+          1,
+          bindings[5],
+          bindings[6]
+        ]);
+      } else {
+        existing[3] = bindings[3];
+        existing[4] = bindings[4];
+        existing[5] = Number(existing[5]) + 1;
+        existing[7] = bindings[6];
+      }
       changes = 1;
     }
 
@@ -1159,5 +1196,67 @@ describe("DDL API", () => {
     expect(accepted.status).toBe(200);
     expect(body).toMatchObject({ ok: true, accepted: 1 });
     expect(db.relevanceClassifications.has("https://example.com/notice")).toBe(true);
+  });
+
+  it("aggregates anonymous visit stats from Vercel geo headers", async () => {
+    const db = new FakeD1Database();
+    const context = {
+      waitUntil: () => undefined,
+      passThroughOnException: () => undefined
+    } as unknown as ExecutionContext;
+    const env = { DB: db as unknown as D1Database } as Env;
+
+    const first = await handleRequest(
+      new Request("https://example.com/api/analytics/visit", {
+        method: "POST",
+        headers: {
+          "x-vercel-ip-country": "CN",
+          "x-vercel-ip-country-region": "SD",
+          "x-vercel-ip-city": "Jinan"
+        },
+        body: "{}"
+      }),
+      env,
+      context
+    );
+    const second = await handleRequest(
+      new Request("https://example.com/api/analytics/visit", {
+        method: "POST",
+        headers: {
+          "x-vercel-ip-country": "CN",
+          "x-vercel-ip-country-region": "SD",
+          "x-vercel-ip-city": "Jinan"
+        },
+        body: "{}"
+      }),
+      env,
+      context
+    );
+    const summary = await handleRequest(
+      new Request("https://example.com/api/analytics/summary"),
+      env,
+      context
+    );
+    const body = (await summary.json()) as {
+      totalVisits: number;
+      todayVisits: number;
+      countryCount: number;
+      regionCount: number;
+      countries: Array<{ countryCode: string; visitCount: number }>;
+      regions: Array<{ regionName: string; visitCount: number }>;
+    };
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(summary.status).toBe(200);
+    expect(summary.headers.get("cache-control")).toContain("max-age=300");
+    expect(body).toMatchObject({
+      totalVisits: 2,
+      todayVisits: 2,
+      countryCount: 1,
+      regionCount: 1
+    });
+    expect(body.countries[0]).toMatchObject({ countryCode: "CN", visitCount: 2 });
+    expect(body.regions[0]).toMatchObject({ regionName: "中国大陆 / Jinan", visitCount: 2 });
   });
 });

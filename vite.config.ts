@@ -6,7 +6,9 @@ export default defineConfig({
   server: {
     proxy: {
       "/api/ddl": "http://127.0.0.1:8787",
-      "/api/missing-link": "http://127.0.0.1:8787"
+      "/api/missing-link": "http://127.0.0.1:8787",
+      "/api/analytics/visit": "http://127.0.0.1:8787",
+      "/api/analytics/summary": "http://127.0.0.1:8787"
     }
   }
 });

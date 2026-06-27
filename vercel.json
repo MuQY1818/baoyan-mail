@@ -9,6 +9,14 @@
     {
       "source": "/api/missing-link",
       "destination": "https://baoyan-mail.weijuebu.workers.dev/api/missing-link"
+    },
+    {
+      "source": "/api/analytics/visit",
+      "destination": "https://baoyan-mail.weijuebu.workers.dev/api/analytics/visit"
+    },
+    {
+      "source": "/api/analytics/summary",
+      "destination": "https://baoyan-mail.weijuebu.workers.dev/api/analytics/summary"
     }
   ]
 }

@@ -59,3 +59,74 @@ GET 返回 `application/json; charset=utf-8`：
 - 按方向筛选用 `areas`；按层次筛选用 `tier`；按来源筛选用 `sourceGroup`；按紧迫度筛选用 `remainingDays`。
 - 默认面向计算机类检索时建议先筛选 `relevance === "strong"`；需要排查漏项时可放宽到 `possible` 或全部源站。
 - 数据在边缘约缓存 5 分钟，`generatedAt` 为该次生成时刻，`lastSyncedAt` 为最近源站同步时刻。
+
+## 本地申请管理数据
+
+网站的“我的申请”和“日历”只使用浏览器本地存储，不上传服务器。用户可以在页面里导出 JSON 给 Agent 分析，再导入 Patch 由用户确认后写回本地。
+
+### 导出数据 schema
+
+`localStorage` key 为 `baoyan-application-tracker`，导出 JSON 的 `schema` 为：
+
+```json
+{
+  "schema": "baoyan-application-tracker/v1",
+  "records": [],
+  "updatedAt": "ISO-8601 或 null"
+}
+```
+
+`records[]` 字段：
+
+- `id`: 本地申请记录 ID
+- `sourceDdlKey`: 对应 DDL 条目的 `key`
+- `school`, `institute`, `website`, `deadlineAt`, `deadlineText`, `tier`, `areas`, `relevance`: 从 DDL 条目复制的快照字段
+- `status`: `"watching"` | `"preparing"` | `"submitted"` | `"interview"` | `"waiting_result"` | `"admitted"` | `"waitlisted"` | `"rejected"` | `"withdrawn"`
+- `priority`: `"rush"` | `"target"` | `"safe"`
+- `materials[]`: `{ "id": string, "label": string, "status": "todo" | "done" | "not_required" }`
+- `events[]`: `{ "id": string, "type": "deadline" | "interview" | "camp" | "result" | "material" | "other", "title": string, "date": string, "note": string }`
+- `result`: `"pending"` | `"accepted"` | `"waitlisted"` | `"rejected"` | `"withdrawn"`
+- `notes`: 自由文本备注
+- `createdAt`, `updatedAt`: ISO-8601 时间
+
+### Agent Patch schema
+
+Agent 应输出 Patch，而不是直接覆盖整包数据。页面会先预览差异，用户确认后才应用：
+
+```json
+{
+  "schema": "baoyan-application-patch/v1",
+  "operations": [
+    { "op": "update", "id": "app-id", "values": { "status": "submitted" } },
+    { "op": "update_material", "id": "app-id", "materialId": "resume", "status": "done" },
+    { "op": "add_event", "id": "app-id", "event": { "id": "event-id", "type": "interview", "title": "面试", "date": "2026-07-05T09:00", "note": "" } },
+    { "op": "append_note", "id": "app-id", "note": "已提交系统" }
+  ]
+}
+```
+
+支持操作：`add`、`update`、`remove`、`add_event`、`update_material`、`append_note`。建议 Agent 优先使用 `update`、`update_material`、`add_event` 和 `append_note`，避免删除用户记录。
+
+### 浏览器内 Agent CRUD
+
+页面加载后会在当前浏览器上下文暴露 `window.BaoyanAgent`。该对象只读写本机 `localStorage`，不会上传申请记录到服务器。
+
+可用方法：
+
+- `getSchema()`: 返回 tracker schema、patch schema 和 storage key
+- `listApplications()`: 返回本地所有申请记录
+- `getApplication(id)`: 返回单条申请记录或 `null`
+- `createApplication(record)`: 新增或替换一条完整申请记录
+- `addFromDdlItem(item)`: 从 `/api/ddl` 的 `DdlItem` 创建本地申请记录
+- `updateApplication(id, values)`: 更新单条记录的可编辑字段
+- `deleteApplication(id)`: 删除单条本地记录
+- `applyPatch(patch)`: 应用 `baoyan-application-patch/v1`，返回 `{ data, errors, summary }`
+- `exportData()`: 导出完整本地申请数据
+- `clearAll()`: 清空当前浏览器里的申请记录
+
+Agent 操作建议：
+
+1. 先调用 `window.BaoyanAgent.exportData()` 获取当前数据。
+2. 只对明确的记录调用 `updateApplication` 或 `applyPatch`。
+3. 批量修改优先生成 `applyPatch`，并检查返回的 `errors`。
+4. 删除或清空前必须由用户明确确认。

@@ -137,6 +137,17 @@ export interface RunCheckResult {
   sourceStats?: SourceStats[];
 }
 
+export interface VisitDailyStatRow {
+  visit_date: string;
+  country_code: string;
+  region_code: string;
+  country_name: string;
+  region_name: string;
+  visit_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export type ReviewCandidateStatus = "pending" | "approved" | "rejected";
 
 export interface ReviewCandidatePayload {
