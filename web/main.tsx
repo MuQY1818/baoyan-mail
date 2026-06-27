@@ -1832,6 +1832,7 @@ function ApplicationCalendar({
     year: "numeric",
     month: "long"
   }).format(monthDate);
+  const todayLabel = formatTodayLabel();
 
   return (
     <section className="calendar-shell" aria-label="申请日历">
@@ -1856,17 +1857,23 @@ function ApplicationCalendar({
 
       <div className="calendar-grid">
         <section className="month-card" aria-label={monthTitle}>
-          <div className="month-title">{monthTitle}</div>
+          <div className="month-title-row">
+            <div className="month-title">{monthTitle}</div>
+            <span className="today-badge">今天 {todayLabel}</span>
+          </div>
           <div className="weekday-row" aria-hidden="true">
             {["一", "二", "三", "四", "五", "六", "日"].map((day) => <span key={day}>{day}</span>)}
           </div>
           <div className="month-grid">
             {calendarDays.map((day) => (
               <div
-                className={day.inMonth ? "day-cell" : "day-cell day-cell-muted"}
+                className={buildDayCellClass(day)}
                 key={day.key}
               >
-                <span className="day-number">{day.label}</span>
+                <div className="day-number-row">
+                  <span className="day-number">{day.label}</span>
+                  {day.isToday && <span className="day-today-label">今天</span>}
+                </div>
                 <div className="day-events">
                   {day.events.slice(0, 3).map((event) => (
                     <button
@@ -2594,12 +2601,14 @@ interface CalendarEventEntry {
 interface CalendarDay {
   events: CalendarEventEntry[];
   inMonth: boolean;
+  isToday: boolean;
   key: string;
   label: string;
 }
 
 function buildCalendarDays(monthDate: Date, records: ApplicationRecord[]): CalendarDay[] {
   const first = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
+  const todayKey = getShanghaiDateKey(new Date());
   const start = new Date(first);
   const day = first.getDay() === 0 ? 7 : first.getDay();
   start.setDate(first.getDate() - day + 1);
@@ -2621,10 +2630,31 @@ function buildCalendarDays(monthDate: Date, records: ApplicationRecord[]): Calen
     return {
       events: eventsByDate.get(key) ?? [],
       inMonth: current.getMonth() === monthDate.getMonth(),
+      isToday: key === todayKey,
       key,
       label: String(current.getDate())
     };
   });
+}
+
+function buildDayCellClass(day: CalendarDay): string {
+  const classes = ["day-cell"];
+  if (!day.inMonth) {
+    classes.push("day-cell-muted");
+  }
+  if (day.isToday) {
+    classes.push("day-cell-today");
+  }
+  return classes.join(" ");
+}
+
+function formatTodayLabel(): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "long",
+    day: "numeric",
+    weekday: "short"
+  }).format(new Date());
 }
 
 function buildUpcomingApplicationEvents(records: ApplicationRecord[]): CalendarEventEntry[] {
