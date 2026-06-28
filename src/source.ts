@@ -190,6 +190,9 @@ const PROJECT_985_SCHOOLS = [
   "重庆大学",
   "电子科技大学",
   "西北工业大学",
+  "西北农林科技大学",
+  "国防科学技术大学",
+  "中国人民解放军国防科学技术大学",
   "兰州大学"
 ];
 
@@ -240,6 +243,7 @@ const PROJECT_211_SCHOOLS = [
   "福州大学",
   "南昌大学",
   "中国石油大学",
+  "中国地质大学",
   "郑州大学",
   "武汉理工大学",
   "华中农业大学",
@@ -886,7 +890,10 @@ function schoolNameMatches(name: string, schools: string[]): boolean {
   if (name === "") {
     return false;
   }
-  return schools.some((school) => name.includes(school) || (name.length >= 4 && school.includes(name)));
+  return schools.some(
+    (school) =>
+      name === school || name.startsWith(school) || (name.length >= 4 && school.includes(name))
+  );
 }
 
 function isNonTierTag(tag: string): boolean {

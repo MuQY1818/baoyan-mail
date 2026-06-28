@@ -389,9 +389,26 @@ describe("source normalization", () => {
     expect(getSchoolTierTags("北京大学")).toEqual(["Top2"]);
     expect(getSchoolTierTags("中国科学技术大学")).toEqual(["华五"]);
     expect(getSchoolTierTags("哈尔滨工业大学")).toEqual(["C9"]);
+    expect(getSchoolTierTags("东北大学")).toEqual(["985"]);
+    expect(getSchoolTierTags("湖南大学")).toEqual(["985"]);
     expect(getSchoolTierTags("电子科技大学")).toEqual(["985"]);
+    expect(getSchoolTierTags("西北工业大学")).toEqual(["985"]);
+    expect(getSchoolTierTags("西北农林科技大学")).toEqual(["985"]);
+    expect(getSchoolTierTags("国防科学技术大学")).toEqual(["985"]);
     expect(getSchoolTierTags("北京邮电大学")).toEqual(["211"]);
+    expect(getSchoolTierTags("华北电力大学")).toEqual(["211"]);
+    expect(getSchoolTierTags("华北电力大学（保定）")).toEqual(["211"]);
+    expect(getSchoolTierTags("北京科技大学")).toEqual(["211"]);
+    expect(getSchoolTierTags("北京交通大学")).toEqual(["211"]);
+    expect(getSchoolTierTags("西安电子科技大学")).toEqual(["211"]);
+    expect(getSchoolTierTags("南京航空航天大学")).toEqual(["211"]);
+    expect(getSchoolTierTags("中国地质大学（武汉）")).toEqual(["211"]);
+    expect(getSchoolTierTags("中国政法大学")).toEqual(["211"]);
+    expect(getSchoolTierTags("中央财经大学")).toEqual(["211"]);
+    expect(getSchoolTierTags("郑州大学")).toEqual(["211"]);
+    expect(getSchoolTierTags("新疆大学")).toEqual(["211"]);
     expect(getSchoolTierTags("中国科学院大学")).toEqual(["其他"]);
+    expect(getSchoolTierTags("杭州电子科技大学")).toEqual(["其他"]);
   });
 
   it("canonicalizes notification URLs for cross-source dedupe", () => {
