@@ -1349,6 +1349,20 @@ h1 {
   text-decoration: underline;
 }
 
+.application-inline-source {
+  color: var(--primary-strong);
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 800;
+  margin-top: 6px;
+  text-decoration: none;
+  text-underline-offset: 3px;
+}
+
+.application-inline-source:hover {
+  text-decoration: underline;
+}
+
 .application-row-active {
   background: var(--primary-soft);
 }

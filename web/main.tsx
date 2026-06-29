@@ -1404,6 +1404,16 @@ function ApplicationTable({
               <td>
                 <strong>{formatApplicationRemaining(record)}</strong>
                 <span>{record.deadlineText || formatEventDate(record.deadlineAt)}</span>
+                {record.website.trim() !== "" && (
+                  <a
+                    className="application-inline-source"
+                    href={record.website}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    官方通知
+                  </a>
+                )}
               </td>
               <td><span className={`status-pill status-${record.status}`}>{formatApplicationStatus(record.status)}</span></td>
               <td>{formatPriority(record.priority)}</td>
@@ -1565,6 +1575,11 @@ function ApplicationEditor({
           <span className="section-kicker">DETAIL</span>
           <h3>{record.school}</h3>
           <p>{record.institute || "未提供院系"}</p>
+          {record.website.trim() !== "" && (
+            <a className="application-inline-source" href={record.website} rel="noreferrer" target="_blank">
+              官方通知
+            </a>
+          )}
         </div>
         <span className="tier-badge">{record.tier}</span>
       </div>
