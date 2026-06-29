@@ -77,6 +77,7 @@ export interface ApplicationLinkSource {
   institute: string;
   website: string;
   deadlineAt: string;
+  deadlineText?: string;
 }
 
 export interface ApplicationPatch {
@@ -571,55 +572,155 @@ function findApplicationWebsiteByLooseMatch(
   items: ApplicationLinkSource[]
 ): string | null {
   const recordSchool = normalizeApplicationMatchText(record.school);
-  const recordInstitute = normalizeApplicationMatchText(record.institute);
   const recordDeadline = normalizeDeadlineTimestamp(record.deadlineAt);
-  const recordDate = recordDeadline.slice(0, 10);
-  if (recordSchool === "" || recordInstitute === "") {
+  const recordDate = normalizeDeadlineCalendarDate(record.deadlineAt) || normalizeDeadlineCalendarDate(record.deadlineText);
+  if (recordSchool === "" || record.institute.trim() === "") {
     return null;
   }
-  const matches = items
-    .map((item) => ({
-      item,
-      school: normalizeApplicationMatchText(item.school),
-      institute: normalizeApplicationMatchText(item.institute),
-      deadline: normalizeDeadlineTimestamp(item.deadlineAt)
-    }))
-    .filter((entry) => {
-      if (entry.school !== recordSchool || entry.item.website.trim() === "") {
-        return false;
-      }
-      const sameDeadline = entry.deadline === recordDeadline || entry.deadline.slice(0, 10) === recordDate;
-      if (!sameDeadline) {
-        return false;
-      }
-      return (
-        entry.institute.includes(recordInstitute) ||
-        recordInstitute.includes(entry.institute) ||
-        hasSharedInstituteKeyword(recordInstitute, entry.institute)
-      );
-    })
-    .sort((left, right) => right.institute.length - left.institute.length);
 
-  return matches[0]?.item.website.trim() || null;
+  const candidates = items
+    .map((item) => {
+      const itemDeadline = normalizeDeadlineTimestamp(item.deadlineAt);
+      const itemDate =
+        normalizeDeadlineCalendarDate(item.deadlineAt) || normalizeDeadlineCalendarDate(item.deadlineText ?? "");
+      const instituteScore = scoreInstituteMatch(record.institute, item.institute);
+      const deadlineScore =
+        recordDeadline !== "" && itemDeadline === recordDeadline
+          ? 40
+          : recordDate !== "" && itemDate === recordDate
+            ? 30
+            : 0;
+      return {
+        item,
+        deadlineScore,
+        instituteScore,
+        school: normalizeApplicationMatchText(item.school),
+        totalScore: instituteScore + deadlineScore
+      };
+    })
+    .filter((entry) => entry.school === recordSchool && entry.item.website.trim() !== "" && entry.instituteScore >= 55)
+    .sort((left, right) => {
+      if (right.totalScore !== left.totalScore) {
+        return right.totalScore - left.totalScore;
+      }
+      return right.item.institute.length - left.item.institute.length;
+    });
+
+  const deadlineMatch = candidates.find((entry) => entry.deadlineScore > 0);
+  if (deadlineMatch !== undefined) {
+    return deadlineMatch.item.website.trim();
+  }
+
+  const selfNamedSchoolMatch = findUniqueSelfNamedSchoolWebsite(recordSchool, items);
+  if (selfNamedSchoolMatch !== null) {
+    return selfNamedSchoolMatch;
+  }
+
+  const strongMatches = candidates.filter((entry) => entry.instituteScore >= 85);
+  const [best, second] = strongMatches;
+  if (best === undefined) {
+    return null;
+  }
+  if (second !== undefined && second.instituteScore === best.instituteScore) {
+    return null;
+  }
+  return best.item.website.trim();
+}
+
+function findUniqueSelfNamedSchoolWebsite(recordSchool: string, items: ApplicationLinkSource[]): string | null {
+  const matches = items.filter((item) => {
+    const website = item.website.trim();
+    if (website === "") {
+      return false;
+    }
+    const school = normalizeApplicationMatchText(item.school);
+    const institute = normalizeApplicationMatchText(item.institute);
+    return school === recordSchool && institute === recordSchool;
+  });
+  return matches.length === 1 ? matches[0]?.website.trim() ?? null : null;
 }
 
 function hasSharedInstituteKeyword(left: string, right: string): boolean {
   const leftTokens = getInstituteKeywords(left);
   const rightTokens = getInstituteKeywords(right);
-  return leftTokens.some((token) => rightTokens.includes(token));
+  return leftTokens.some((token) =>
+    rightTokens.some((rightToken) => rightToken.includes(token) || token.includes(rightToken))
+  );
 }
 
 function getInstituteKeywords(value: string): string[] {
   return value
-    .replace(/夏令营|暑期学校|开放日|优秀大学生|学术交流营|科学营|学院|学部/gu, " ")
+    .replace(APPLICATION_ACTIVITY_WORDS, " ")
+    .replace(/学院|学部|研究院|中心|系/gu, " ")
     .split(/[-—_·、，,/\s]+/u)
     .map((token) => token.trim())
     .filter((token) => token.length >= 2);
 }
 
+function scoreInstituteMatch(left: string, right: string): number {
+  const normalizedLeft = normalizeApplicationMatchText(left);
+  const normalizedRight = normalizeApplicationMatchText(right);
+  if (normalizedLeft === "" || normalizedRight === "") {
+    return 0;
+  }
+  if (normalizedLeft === normalizedRight) {
+    return 100;
+  }
+
+  const comparableLeft = normalizeApplicationInstituteText(left);
+  const comparableRight = normalizeApplicationInstituteText(right);
+  if (comparableLeft === "" || comparableRight === "") {
+    return 0;
+  }
+  if (comparableLeft === comparableRight) {
+    return 98;
+  }
+  if (comparableLeft.includes(comparableRight) || comparableRight.includes(comparableLeft)) {
+    const shorterLength = Math.min(comparableLeft.length, comparableRight.length);
+    const longerLength = Math.max(comparableLeft.length, comparableRight.length);
+    if (shorterLength < 4) {
+      return 0;
+    }
+    return 82 + Math.round((shorterLength / longerLength) * 12);
+  }
+  return hasSharedInstituteKeyword(normalizedLeft, normalizedRight) ? 60 : 0;
+}
+
+const APPLICATION_ACTIVITY_WORDS =
+  /20\d{2}年?|第[一二三四五六七八九十\d]+届|优秀大学生暑期开放营|优秀大学生|全国大学生|大学生|暑期|夏季|夏令营|学术探索营|学术交流营|校园开放日|开放日|科学营|交流营|实践活动|活动|线上宣讲|预推免|硕士登记|报名|通知|官网|问卷|最终截止|系统截止|截止/gu;
+
+function normalizeApplicationInstituteText(value: string): string {
+  return normalizeApplicationMatchText(value)
+    .replace(APPLICATION_ACTIVITY_WORDS, "")
+    .replace(/[-—_·、，,/.=:=+|\\[\]【】{}<>《》"'“”‘’\s]+/gu, "")
+    .trim();
+}
+
 function normalizeDeadlineTimestamp(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value.trim() : date.toISOString();
+}
+
+function normalizeDeadlineCalendarDate(value: string): string {
+  const text = value.trim();
+  const explicitDate = text.match(/(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})/u);
+  if (explicitDate !== null) {
+    return `${explicitDate[1]}-${explicitDate[2]?.padStart(2, "0")}-${explicitDate[3]?.padStart(2, "0")}`;
+  }
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  return year !== undefined && month !== undefined && day !== undefined ? `${year}-${month}-${day}` : "";
 }
 
 function assertRecordExists(data: ApplicationTrackerData, id: string, prefix: string): void {

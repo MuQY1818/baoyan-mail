@@ -102,6 +102,193 @@ describe("application tracker", () => {
     expect(hydrated.records[0]?.website).toBe("https://example.com/xjtu-software");
   });
 
+  it("hydrates links when local records add activity suffixes", () => {
+    const record = createApplicationRecord(
+      {
+        ...SOURCE_ITEM,
+        key: "local-pku-sz-ece",
+        school: "北京大学",
+        institute: "深圳研究生院信息工程学院学术探索营",
+        website: "",
+        deadlineAt: "2026-06-25T15:59:59.000Z",
+        deadlineText: "2026/06/25 23:59"
+      },
+      "2026-06-27T00:00:00.000Z"
+    );
+    const data = addOrReplaceApplicationRecord(createEmptyTrackerData(), record, "2026-06-27T00:00:00.000Z");
+
+    const hydrated = hydrateApplicationRecordLinks(
+      data,
+      [
+        {
+          key: "archive-pku-sz-ece",
+          school: "北京大学",
+          institute: "深圳研究生院-信息工程学院",
+          website: "https://www.ece.pku.edu.cn/info/1027/3175.htm",
+          deadlineAt: "2026-06-25T15:59:59.000Z"
+        }
+      ],
+      "2026-06-29T00:00:00.000Z"
+    );
+
+    expect(hydrated.records[0]?.website).toBe("https://www.ece.pku.edu.cn/info/1027/3175.htm");
+  });
+
+  it("hydrates links from a unique strong school and institute match without a trusted deadline", () => {
+    const record = createApplicationRecord(
+      {
+        ...SOURCE_ITEM,
+        key: "local-bagi",
+        school: "北京通用人工智能研究院",
+        institute: "第四届“通计划”夏令营",
+        website: "",
+        deadlineAt: "待核官网/问卷截止",
+        deadlineText: "待核官网/问卷截止"
+      },
+      "2026-06-27T00:00:00.000Z"
+    );
+    const data = addOrReplaceApplicationRecord(createEmptyTrackerData(), record, "2026-06-27T00:00:00.000Z");
+
+    const hydrated = hydrateApplicationRecordLinks(
+      data,
+      [
+        {
+          key: "archive-bagi",
+          school: "北京通用人工智能研究院",
+          institute: "北京通用人工智能研究院",
+          website: "https://mp.weixin.qq.com/s/sunT94R76UZdQu5itf2lrw",
+          deadlineAt: "2026-06-30T15:59:59.000Z"
+        }
+      ],
+      "2026-06-29T00:00:00.000Z"
+    );
+
+    expect(hydrated.records[0]?.website).toBe("https://mp.weixin.qq.com/s/sunT94R76UZdQu5itf2lrw");
+  });
+
+  it("does not hydrate ambiguous same-school records without a deadline match", () => {
+    const record = createApplicationRecord(
+      {
+        ...SOURCE_ITEM,
+        key: "local-ambiguous-sysu",
+        school: "中山大学",
+        institute: "智能信息处理科学营",
+        website: "",
+        deadlineAt: "待核系统最终截止",
+        deadlineText: "待核系统最终截止"
+      },
+      "2026-06-27T00:00:00.000Z"
+    );
+    const data = addOrReplaceApplicationRecord(createEmptyTrackerData(), record, "2026-06-27T00:00:00.000Z");
+
+    const hydrated = hydrateApplicationRecordLinks(
+      data,
+      [
+        {
+          key: "archive-sysu-sece",
+          school: "中山大学",
+          institute: "电子与通信工程学院",
+          website: "https://sece.sysu.edu.cn/zs/zs01/1421673.htm",
+          deadlineAt: "2026-06-25T15:59:59.000Z"
+        },
+        {
+          key: "archive-sysu-ise",
+          school: "中山大学",
+          institute: "智能工程学院",
+          website: "https://ise.sysu.edu.cn/article/1707",
+          deadlineAt: "2026-07-10T15:59:59.000Z"
+        }
+      ],
+      "2026-06-29T00:00:00.000Z"
+    );
+
+    expect(hydrated.records[0]?.website).toBe("");
+  });
+
+  it("hydrates production-style archived links for visible local application rows", () => {
+    const rows = [
+      {
+        key: "local-sustech-automation",
+        school: "南方科技大学",
+        institute: "自动化与智能制造学院优秀大学生交流营",
+        deadlineAt: "2026-06-30T15:59:00.000Z",
+        deadlineText: "2026/06/30 23:59",
+        expected: "https://mp.weixin.qq.com/s/eo2vk1qYTIX6emzohBOpLw"
+      },
+      {
+        key: "local-whu-ai",
+        school: "武汉大学",
+        institute: "人工智能学院2026年优秀大学生开放日活动",
+        deadlineAt: "待核官网通知",
+        deadlineText: "待核官网通知",
+        expected: "https://sai.whu.edu.cn/info/1601/17351.htm"
+      },
+      {
+        key: "local-sysu-sece",
+        school: "中山大学",
+        institute: "电子与通信工程学院智能信息处理科学营",
+        deadlineAt: "待核系统最终截止",
+        deadlineText: "待核系统最终截止",
+        expected: "https://sece.sysu.edu.cn/zs/zs01/1421673.htm"
+      }
+    ];
+    const data = rows.reduce((current, row) => {
+      const record = createApplicationRecord(
+        {
+          ...SOURCE_ITEM,
+          key: row.key,
+          school: row.school,
+          institute: row.institute,
+          website: "",
+          deadlineAt: row.deadlineAt,
+          deadlineText: row.deadlineText
+        },
+        "2026-06-27T00:00:00.000Z"
+      );
+      return addOrReplaceApplicationRecord(current, record, "2026-06-27T00:00:00.000Z");
+    }, createEmptyTrackerData());
+
+    const hydrated = hydrateApplicationRecordLinks(
+      data,
+      [
+        {
+          key: "archive-sustech-automation",
+          school: "南方科技大学",
+          institute: "自动化与智能制造学院",
+          website: "https://mp.weixin.qq.com/s/eo2vk1qYTIX6emzohBOpLw",
+          deadlineAt: "2026-06-21T15:59:59.000Z"
+        },
+        {
+          key: "archive-whu-ai",
+          school: "武汉大学",
+          institute: "人工智能学院",
+          website: "https://sai.whu.edu.cn/info/1601/17351.htm",
+          deadlineAt: "2026-06-25T15:59:59.000Z"
+        },
+        {
+          key: "archive-sysu-sece",
+          school: "中山大学",
+          institute: "电子与通信工程学院",
+          website: "https://sece.sysu.edu.cn/zs/zs01/1421673.htm",
+          deadlineAt: "2026-06-25T15:59:59.000Z"
+        },
+        {
+          key: "archive-sysu-ise",
+          school: "中山大学",
+          institute: "智能工程学院",
+          website: "https://ise.sysu.edu.cn/article/1707",
+          deadlineAt: "2026-07-10T15:59:59.000Z"
+        }
+      ],
+      "2026-06-29T00:00:00.000Z"
+    );
+
+    const websitesBySchool = new Map(hydrated.records.map((record) => [record.school, record.website]));
+    rows.forEach((row) => {
+      expect(websitesBySchool.get(row.school)).toBe(row.expected);
+    });
+  });
+
   it("does not overwrite existing source links while hydrating", () => {
     const record = createApplicationRecord(SOURCE_ITEM, "2026-06-27T00:00:00.000Z");
     const data = addOrReplaceApplicationRecord(createEmptyTrackerData(), record, "2026-06-27T00:00:00.000Z");
