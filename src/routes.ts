@@ -83,7 +83,7 @@ export async function handleRequest(
       return jsonResponse({ ok: true, time: new Date().toISOString() });
     }
     if (request.method === "GET" && url.pathname === "/api/ddl") {
-      return await handleDdl(env);
+      return await handleDdl(env, url);
     }
     if (
       request.method === "OPTIONS" &&
@@ -230,7 +230,7 @@ async function handleSyncSources(
   return jsonResponse({ ok: true, result });
 }
 
-async function handleDdl(env: Env): Promise<Response> {
+async function handleDdl(env: Env, url: URL): Promise<Response> {
   const rows = await getSnapshotRowsBySourceGroups(env, [
     BAOYANXINXI_SOURCE_GROUP,
     MANUAL_SOURCE_GROUP
@@ -243,7 +243,8 @@ async function handleDdl(env: Env): Promise<Response> {
     rows,
     new Date(),
     await getAppState(env, "last_synced_at"),
-    classifications
+    classifications,
+    { includeExpired: isTruthyQueryParam(url.searchParams.get("includeExpired")) }
   );
   return jsonResponse(response, 200, {
     "cache-control": "public, max-age=300, s-maxage=900",
@@ -765,6 +766,10 @@ function formatRegionName(countryName: string, regionCode: string, regionName: s
 
 function readNonNegativeCount(value: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function isTruthyQueryParam(value: string | null): boolean {
+  return value === "1" || value === "true" || value === "yes";
 }
 
 function addDays(date: Date, days: number): Date {

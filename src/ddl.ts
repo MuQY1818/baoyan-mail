@@ -70,11 +70,16 @@ export interface DdlApiResponse {
   items: DdlApiItem[];
 }
 
+export interface BuildDdlResponseOptions {
+  includeExpired?: boolean;
+}
+
 export function buildDdlResponse(
   entries: Array<NormalizedItem | ItemSnapshotRow>,
   now = new Date(),
   lastSyncedAt: string | null = null,
-  classifications: Map<string, ItemRelevanceClassification> = new Map()
+  classifications: Map<string, ItemRelevanceClassification> = new Map(),
+  options: BuildDdlResponseOptions = {}
 ): DdlApiResponse {
   const contexts = entries.map((entry) => toDdlContext(entry, classifications));
   const serializedItems = contexts
@@ -83,7 +88,10 @@ export function buildDdlResponse(
     .reduce(dedupeDdlItems(), [])
     .sort(compareDdlItems);
   const ddlItems = serializedItems.filter(
-    (item) => item.status !== "expired" && item.sourceVisibility !== "stale"
+    (item) =>
+      (options.includeExpired === true && item.status === "expired") ||
+      (item.sourceVisibility !== "stale" &&
+        (options.includeExpired === true || item.status !== "expired"))
   );
 
   return {

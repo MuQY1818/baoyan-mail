@@ -1022,6 +1022,74 @@ describe("DDL API", () => {
     expect(response.items[0]).not.toHaveProperty("payload");
   });
 
+  it("can include expired items for local application link hydration", () => {
+    const expiredItem = {
+      key: "expired",
+      contentHash: "hash",
+      sourceGroup: "camp2026",
+      name: "西安交通大学",
+      institute: "软件学院",
+      description: "夏令营通知",
+      deadline: "2026-06-01T00:00:00+08:00",
+      website: "https://example.com/xjtu-software",
+      tags: []
+    };
+
+    const defaultResponse = buildDdlResponse([expiredItem], now);
+    const archiveResponse = buildDdlResponse(
+      [expiredItem],
+      now,
+      null,
+      new Map(),
+      { includeExpired: true }
+    );
+
+    expect(defaultResponse.items).toHaveLength(0);
+    expect(archiveResponse.items[0]).toMatchObject({
+      key: "expired",
+      status: "expired",
+      website: "https://example.com/xjtu-software"
+    });
+  });
+
+  it("keeps stale expired items available for archived link hydration", () => {
+    const response = buildDdlResponse(
+      [
+        {
+          item_key: "stale-expired",
+          content_hash: "hash",
+          payload: JSON.stringify({
+            key: "stale-expired",
+            contentHash: "hash",
+            sourceGroup: "baoyanxinxi2026jsjby",
+            name: "西安交通大学",
+            institute: "软件学院",
+            description: "夏令营通知",
+            deadline: "2026-06-01T00:00:00+08:00",
+            website: "https://example.com/stale-expired",
+            tags: []
+          }),
+          source_group: "baoyanxinxi2026jsjby",
+          first_seen_at: "2026-06-01T00:00:00.000Z",
+          updated_at: "2026-06-01T00:00:00.000Z",
+          last_seen_at: "2026-06-01T00:00:00.000Z",
+          missing_since: "2026-06-01T00:00:00.000Z"
+        }
+      ],
+      now,
+      null,
+      new Map(),
+      { includeExpired: true }
+    );
+
+    expect(response.items[0]).toMatchObject({
+      key: "stale-expired",
+      status: "expired",
+      sourceVisibility: "stale",
+      website: "https://example.com/stale-expired"
+    });
+  });
+
   it("dedupes existing snapshots with the same URL, school, institute, and deadline", () => {
     const response = buildDdlResponse(
       [
@@ -1149,6 +1217,59 @@ describe("DDL API", () => {
     expect(response.headers.get("cache-control")).toContain("max-age=300");
     expect(body.total).toBe(1);
     expect(body.items[0]?.sourceLabel).toBe("保研信息平台");
+  });
+
+  it("serves expired DDL items when includeExpired is requested", async () => {
+    const db = new FakeD1Database();
+    const expiredItem: NormalizedItem = {
+      key: "expired-baoyanxinxi",
+      contentHash: "hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "西安交通大学",
+      institute: "软件学院",
+      description: "夏令营通知",
+      deadline: "2026-06-01T00:00:00+08:00",
+      website: "https://example.com/xjtu-software",
+      tags: []
+    };
+    db.itemSnapshots.set(expiredItem.key, {
+      item_key: expiredItem.key,
+      content_hash: expiredItem.contentHash,
+      payload: JSON.stringify(expiredItem),
+      source_group: expiredItem.sourceGroup,
+      first_seen_at: "2026-06-01T00:00:00.000Z",
+      updated_at: "2026-06-01T00:00:00.000Z",
+      last_seen_at: "2026-06-01T00:00:00.000Z",
+      missing_since: null
+    });
+
+    const defaultResponse = await handleRequest(
+      new Request("https://example.com/api/ddl"),
+      { DB: db as unknown as D1Database } as Env,
+      {
+        waitUntil: () => undefined,
+        passThroughOnException: () => undefined
+      } as unknown as ExecutionContext
+    );
+    const archiveResponse = await handleRequest(
+      new Request("https://example.com/api/ddl?includeExpired=1"),
+      { DB: db as unknown as D1Database } as Env,
+      {
+        waitUntil: () => undefined,
+        passThroughOnException: () => undefined
+      } as unknown as ExecutionContext
+    );
+    const defaultBody = (await defaultResponse.json()) as { items: unknown[] };
+    const archiveBody = (await archiveResponse.json()) as {
+      items: Array<{ key: string; status: string; website: string }>;
+    };
+
+    expect(defaultBody.items).toHaveLength(0);
+    expect(archiveBody.items[0]).toMatchObject({
+      key: "expired-baoyanxinxi",
+      status: "expired",
+      website: "https://example.com/xjtu-software"
+    });
   });
 
   it("accepts admin relevance classifications and rejects invalid payloads", async () => {

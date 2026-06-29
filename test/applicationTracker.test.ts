@@ -7,6 +7,7 @@ import {
   createApplicationRecord,
   createEmptyTrackerData,
   getApplicationRecord,
+  hydrateApplicationRecordLinks,
   parseApplicationPatch,
   previewApplicationPatch,
   updateApplicationRecord
@@ -44,6 +45,53 @@ describe("application tracker", () => {
 
     expect(second.records).toHaveLength(1);
     expect(second.records[0]?.updatedAt).toBe("2026-06-27T01:00:00.000Z");
+  });
+
+  it("hydrates missing source links from archived DDL items", () => {
+    const record = {
+      ...createApplicationRecord({ ...SOURCE_ITEM, website: "" }, "2026-06-27T00:00:00.000Z"),
+      sourceDdlKey: "missing-from-current-api"
+    };
+    const data = addOrReplaceApplicationRecord(createEmptyTrackerData(), record, "2026-06-27T00:00:00.000Z");
+
+    const hydrated = hydrateApplicationRecordLinks(
+      data,
+      [
+        {
+          key: "different-key",
+          school: "测试大学",
+          institute: "计算机学院",
+          website: "https://example.com/archived-notice",
+          deadlineAt: "2026-07-01T15:59:00.000Z"
+        }
+      ],
+      "2026-06-29T00:00:00.000Z"
+    );
+
+    expect(hydrated.records[0]?.website).toBe("https://example.com/archived-notice");
+    expect(hydrated.updatedAt).toBe("2026-06-29T00:00:00.000Z");
+  });
+
+  it("does not overwrite existing source links while hydrating", () => {
+    const record = createApplicationRecord(SOURCE_ITEM, "2026-06-27T00:00:00.000Z");
+    const data = addOrReplaceApplicationRecord(createEmptyTrackerData(), record, "2026-06-27T00:00:00.000Z");
+
+    const hydrated = hydrateApplicationRecordLinks(
+      data,
+      [
+        {
+          key: "ddl-1",
+          school: "测试大学",
+          institute: "计算机学院",
+          website: "https://example.com/new-notice",
+          deadlineAt: "2026-07-01T15:59:00.000Z"
+        }
+      ],
+      "2026-06-29T00:00:00.000Z"
+    );
+
+    expect(hydrated.records[0]?.website).toBe("https://example.com/notice");
+    expect(hydrated.updatedAt).toBe("2026-06-27T00:00:00.000Z");
   });
 
   it("previews a valid Agent patch without mutating original data", () => {

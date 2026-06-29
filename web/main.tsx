@@ -10,6 +10,7 @@ import {
   createEmptyTrackerData,
   createAgentPatchFromOperation,
   getApplicationRecord,
+  hydrateApplicationRecordLinks,
   normalizeTrackerData,
   parseApplicationPatch,
   previewApplicationPatch,
@@ -302,6 +303,7 @@ function App(): React.ReactElement {
   const initialFilters = useMemo(readFiltersFromUrl, []);
   const [theme, setTheme] = useState<ThemeMode>(readInitialTheme);
   const [data, setData] = useState<DdlResponse | null>(null);
+  const [archivalData, setArchivalData] = useState<DdlResponse | null>(null);
   const [analytics, setAnalytics] = useState<AnalyticsSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -326,13 +328,18 @@ function App(): React.ReactElement {
     let ignore = false;
     async function loadData(): Promise<void> {
       try {
-        const response = await fetch("/api/ddl");
-        if (!response.ok) {
-          throw new Error(`数据接口返回 ${response.status}`);
+        const [currentResponse, archivalResponse] = await Promise.all([
+          fetch("/api/ddl"),
+          fetch("/api/ddl?includeExpired=1")
+        ]);
+        if (!currentResponse.ok) {
+          throw new Error(`数据接口返回 ${currentResponse.status}`);
         }
-        const body = (await response.json()) as DdlResponse;
+        const body = (await currentResponse.json()) as DdlResponse;
+        const archivalBody = archivalResponse.ok ? ((await archivalResponse.json()) as DdlResponse) : null;
         if (!ignore) {
           setData(body);
+          setArchivalData(archivalBody);
           setError(null);
         }
       } catch (loadError) {
@@ -446,6 +453,12 @@ function App(): React.ReactElement {
     () => new Set(applicationData.records.map((record) => record.sourceDdlKey).filter((key) => key !== "")),
     [applicationData.records]
   );
+  useEffect(() => {
+    if (archivalData === null) {
+      return;
+    }
+    setApplicationData((current) => hydrateApplicationRecordLinks(current, archivalData.items));
+  }, [archivalData, setApplicationData]);
   const applicationCount = applicationData.records.length;
   // 概览计数与跳转候选用同一套筛选（忽略范围），保证点击后一定能找到目标卡片
   const railCounts = useMemo(() => {

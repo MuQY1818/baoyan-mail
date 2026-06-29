@@ -71,6 +71,14 @@ export interface DdlApplicationSource {
   relevance: string;
 }
 
+export interface ApplicationLinkSource {
+  key: string;
+  school: string;
+  institute: string;
+  website: string;
+  deadlineAt: string;
+}
+
 export interface ApplicationPatch {
   schema: typeof APPLICATION_PATCH_SCHEMA;
   operations: ApplicationPatchOperation[];
@@ -239,6 +247,36 @@ export function removeApplicationRecord(
   return {
     schema: APPLICATION_TRACKER_SCHEMA,
     records: data.records.filter((record) => record.id !== id),
+    updatedAt: now
+  };
+}
+
+export function hydrateApplicationRecordLinks(
+  data: ApplicationTrackerData,
+  items: ApplicationLinkSource[],
+  now = new Date().toISOString()
+): ApplicationTrackerData {
+  const normalized = normalizeTrackerData(data);
+  const linkIndex = buildApplicationLinkIndex(items);
+  let changed = false;
+  const records = normalized.records.map((record) => {
+    if (record.website.trim() !== "") {
+      return record;
+    }
+    const website = findApplicationWebsite(record, linkIndex);
+    if (website === null) {
+      return record;
+    }
+    changed = true;
+    return { ...record, website, updatedAt: now };
+  });
+
+  if (!changed) {
+    return normalized;
+  }
+  return {
+    schema: APPLICATION_TRACKER_SCHEMA,
+    records,
     updatedAt: now
   };
 }
@@ -473,6 +511,60 @@ function sanitizeUpdateValues(values: Partial<ApplicationRecord>): Partial<Appli
   if (values.materials !== undefined) next.materials = normalizeMaterials(values.materials);
   if (values.events !== undefined) next.events = normalizeEvents(values.events);
   return next;
+}
+
+interface ApplicationLinkIndex {
+  byKey: Map<string, string>;
+  byFingerprint: Map<string, string>;
+}
+
+function buildApplicationLinkIndex(items: ApplicationLinkSource[]): ApplicationLinkIndex {
+  const byKey = new Map<string, string>();
+  const byFingerprint = new Map<string, string>();
+  for (const item of items) {
+    const website = readString(item.website).trim();
+    if (website === "") {
+      continue;
+    }
+    const key = readString(item.key).trim();
+    if (key !== "") {
+      byKey.set(key, website);
+    }
+    const fingerprint = getApplicationLinkFingerprint(item.school, item.institute, item.deadlineAt);
+    if (fingerprint !== "") {
+      byFingerprint.set(fingerprint, website);
+    }
+  }
+  return { byFingerprint, byKey };
+}
+
+function findApplicationWebsite(record: ApplicationRecord, index: ApplicationLinkIndex): string | null {
+  const byKey = index.byKey.get(record.sourceDdlKey);
+  if (byKey !== undefined) {
+    return byKey;
+  }
+  const fingerprint = getApplicationLinkFingerprint(record.school, record.institute, record.deadlineAt);
+  const byFingerprint = index.byFingerprint.get(fingerprint);
+  return byFingerprint ?? null;
+}
+
+function getApplicationLinkFingerprint(school: string, institute: string, deadlineAt: string): string {
+  const normalizedSchool = normalizeApplicationMatchText(school);
+  const normalizedInstitute = normalizeApplicationMatchText(institute);
+  const normalizedDeadline = normalizeDeadlineTimestamp(deadlineAt);
+  if (normalizedSchool === "" || normalizedDeadline === "") {
+    return "";
+  }
+  return [normalizedSchool, normalizedInstitute, normalizedDeadline].join("\u0000");
+}
+
+function normalizeApplicationMatchText(value: string): string {
+  return value.replace(/\s+/gu, "").replace(/[（(].*?[）)]/gu, "").toLowerCase();
+}
+
+function normalizeDeadlineTimestamp(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value.trim() : date.toISOString();
 }
 
 function assertRecordExists(data: ApplicationTrackerData, id: string, prefix: string): void {
