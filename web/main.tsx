@@ -1399,8 +1399,8 @@ function ApplicationTable({
               className={activeRecordId === record.id ? "application-row-active" : ""}
               key={record.id}
             >
-              <td>{record.school}</td>
-              <td>{record.institute || "未提供院系"}</td>
+              <td>{renderApplicationOfficialLink(record, record.school)}</td>
+              <td>{renderApplicationOfficialLink(record, record.institute || "未提供院系", true)}</td>
               <td>
                 <strong>{formatApplicationRemaining(record)}</strong>
                 <span>{record.deadlineText || formatEventDate(record.deadlineAt)}</span>
@@ -1447,8 +1447,8 @@ function ApplicationCards({
         >
           <div className="application-card-main">
             <span className={`status-pill status-${record.status}`}>{formatApplicationStatus(record.status)}</span>
-            <h3>{record.school}</h3>
-            <p>{record.institute || "未提供院系"}</p>
+            <h3>{renderApplicationOfficialLink(record, record.school)}</h3>
+            <p>{renderApplicationOfficialLink(record, record.institute || "未提供院系", true)}</p>
           </div>
           <dl className="application-card-meta">
             <div>
@@ -1470,6 +1470,28 @@ function ApplicationCards({
         </li>
       ))}
     </ol>
+  );
+}
+
+function renderApplicationOfficialLink(
+  record: ApplicationRecord,
+  label: string,
+  muted = false
+): React.ReactElement {
+  const trimmedLabel = label.trim() || "未提供";
+  if (record.website.trim() === "") {
+    return <span>{trimmedLabel}</span>;
+  }
+  return (
+    <a
+      className={muted ? "application-record-link application-record-link-muted" : "application-record-link"}
+      href={record.website}
+      rel="noreferrer"
+      target="_blank"
+      title={`${record.school} ${record.institute || ""} - 打开官方通知`}
+    >
+      {trimmedLabel}
+    </a>
   );
 }
 

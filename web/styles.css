@@ -1332,6 +1332,23 @@ h1 {
   min-width: 940px;
 }
 
+.application-record-link {
+  color: inherit;
+  display: inline;
+  font-weight: inherit;
+  text-decoration: none;
+  text-underline-offset: 3px;
+}
+
+.application-record-link-muted {
+  color: var(--ink-soft);
+}
+
+.application-record-link:hover {
+  color: var(--primary-strong);
+  text-decoration: underline;
+}
+
 .application-row-active {
   background: var(--primary-soft);
 }
