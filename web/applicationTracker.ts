@@ -516,6 +516,7 @@ function sanitizeUpdateValues(values: Partial<ApplicationRecord>): Partial<Appli
 interface ApplicationLinkIndex {
   byKey: Map<string, string>;
   byFingerprint: Map<string, string>;
+  items: ApplicationLinkSource[];
 }
 
 function buildApplicationLinkIndex(items: ApplicationLinkSource[]): ApplicationLinkIndex {
@@ -535,7 +536,7 @@ function buildApplicationLinkIndex(items: ApplicationLinkSource[]): ApplicationL
       byFingerprint.set(fingerprint, website);
     }
   }
-  return { byFingerprint, byKey };
+  return { byFingerprint, byKey, items };
 }
 
 function findApplicationWebsite(record: ApplicationRecord, index: ApplicationLinkIndex): string | null {
@@ -545,7 +546,10 @@ function findApplicationWebsite(record: ApplicationRecord, index: ApplicationLin
   }
   const fingerprint = getApplicationLinkFingerprint(record.school, record.institute, record.deadlineAt);
   const byFingerprint = index.byFingerprint.get(fingerprint);
-  return byFingerprint ?? null;
+  if (byFingerprint !== undefined) {
+    return byFingerprint;
+  }
+  return findApplicationWebsiteByLooseMatch(record, index.items);
 }
 
 function getApplicationLinkFingerprint(school: string, institute: string, deadlineAt: string): string {
@@ -560,6 +564,57 @@ function getApplicationLinkFingerprint(school: string, institute: string, deadli
 
 function normalizeApplicationMatchText(value: string): string {
   return value.replace(/\s+/gu, "").replace(/[（(].*?[）)]/gu, "").toLowerCase();
+}
+
+function findApplicationWebsiteByLooseMatch(
+  record: ApplicationRecord,
+  items: ApplicationLinkSource[]
+): string | null {
+  const recordSchool = normalizeApplicationMatchText(record.school);
+  const recordInstitute = normalizeApplicationMatchText(record.institute);
+  const recordDeadline = normalizeDeadlineTimestamp(record.deadlineAt);
+  const recordDate = recordDeadline.slice(0, 10);
+  if (recordSchool === "" || recordInstitute === "") {
+    return null;
+  }
+  const matches = items
+    .map((item) => ({
+      item,
+      school: normalizeApplicationMatchText(item.school),
+      institute: normalizeApplicationMatchText(item.institute),
+      deadline: normalizeDeadlineTimestamp(item.deadlineAt)
+    }))
+    .filter((entry) => {
+      if (entry.school !== recordSchool || entry.item.website.trim() === "") {
+        return false;
+      }
+      const sameDeadline = entry.deadline === recordDeadline || entry.deadline.slice(0, 10) === recordDate;
+      if (!sameDeadline) {
+        return false;
+      }
+      return (
+        entry.institute.includes(recordInstitute) ||
+        recordInstitute.includes(entry.institute) ||
+        hasSharedInstituteKeyword(recordInstitute, entry.institute)
+      );
+    })
+    .sort((left, right) => right.institute.length - left.institute.length);
+
+  return matches[0]?.item.website.trim() || null;
+}
+
+function hasSharedInstituteKeyword(left: string, right: string): boolean {
+  const leftTokens = getInstituteKeywords(left);
+  const rightTokens = getInstituteKeywords(right);
+  return leftTokens.some((token) => rightTokens.includes(token));
+}
+
+function getInstituteKeywords(value: string): string[] {
+  return value
+    .replace(/夏令营|暑期学校|开放日|优秀大学生|学术交流营|科学营|学院|学部/gu, " ")
+    .split(/[-—_·、，,/\s]+/u)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2);
 }
 
 function normalizeDeadlineTimestamp(value: string): string {

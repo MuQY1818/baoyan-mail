@@ -72,6 +72,36 @@ describe("application tracker", () => {
     expect(hydrated.updatedAt).toBe("2026-06-29T00:00:00.000Z");
   });
 
+  it("hydrates source links when local institute names are shortened", () => {
+    const source = {
+      ...SOURCE_ITEM,
+      key: "local-short-name",
+      school: "西安交通大学",
+      institute: "软件学院夏令营",
+      website: "",
+      deadlineAt: "2026-06-15T15:59:00.000Z",
+      deadlineText: "2026/06/15 23:59"
+    };
+    const record = createApplicationRecord(source, "2026-06-27T00:00:00.000Z");
+    const data = addOrReplaceApplicationRecord(createEmptyTrackerData(), record, "2026-06-27T00:00:00.000Z");
+
+    const hydrated = hydrateApplicationRecordLinks(
+      data,
+      [
+        {
+          key: "archive-long-name",
+          school: "西安交通大学",
+          institute: "电信学部—软件学院",
+          website: "https://example.com/xjtu-software",
+          deadlineAt: "2026-06-15T15:59:00.000Z"
+        }
+      ],
+      "2026-06-29T00:00:00.000Z"
+    );
+
+    expect(hydrated.records[0]?.website).toBe("https://example.com/xjtu-software");
+  });
+
   it("does not overwrite existing source links while hydrating", () => {
     const record = createApplicationRecord(SOURCE_ITEM, "2026-06-27T00:00:00.000Z");
     const data = addOrReplaceApplicationRecord(createEmptyTrackerData(), record, "2026-06-27T00:00:00.000Z");
