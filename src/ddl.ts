@@ -250,10 +250,10 @@ export function applyRelevanceClassification(
   const classification = classifications.get(normalizedUrl);
   if (classification !== undefined) {
     const fallbackRelevance = getRuleFallbackRelevance(item);
-    if (classification.relevance === "unrelated" && fallbackRelevance !== "unrelated") {
+    if (shouldUseRuleGuard(classification.relevance, fallbackRelevance)) {
       return {
         ...item,
-        areas: normalizeDdlAreas(item.areas ?? getBaoyanXinxiAreas(item.name, item.institute)),
+        areas: normalizeDdlAreas(getBaoyanXinxiAreas(item.name, item.institute)),
         relevance: fallbackRelevance,
         relevanceReason: `规则兜底：${classification.reason}`,
         relevanceClassifier: `${classification.classifier}+rule-guard`,
@@ -428,6 +428,13 @@ function toDdlContext(
 
 function getItemRelevance(item: NormalizedItem): Relevance {
   return item.relevance ?? getRuleFallbackRelevance(item);
+}
+
+function shouldUseRuleGuard(classificationRelevance: Relevance, fallbackRelevance: Relevance): boolean {
+  if (fallbackRelevance === "strong" && classificationRelevance !== "strong") {
+    return true;
+  }
+  return classificationRelevance === "unrelated" && fallbackRelevance === "possible";
 }
 
 function getRuleFallbackRelevance(item: NormalizedItem): Relevance {

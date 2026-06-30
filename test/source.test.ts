@@ -350,6 +350,8 @@ describe("source normalization", () => {
     expect(isBaoyanXinxiRelevant("中国科学技术大学", "网络空间安全学院")).toBe(true);
     expect(isBaoyanXinxiRelevant("哈尔滨工业大学", "电子与信息工程学院")).toBe(true);
     expect(isBaoyanXinxiRelevant("浙江大学", "信息与电子工程学院")).toBe(true);
+    expect(isBaoyanXinxiRelevant("中国人民大学", "信息学院")).toBe(true);
+    expect(isBaoyanXinxiRelevant("鹏城国家实验室", "鹏城国家实验室")).toBe(true);
     expect(isBaoyanXinxiRelevant("北京邮电大学", "未来学院")).toBe(true);
     expect(isBaoyanXinxiRelevant("复旦大学", "公共卫生学院")).toBe(false);
     expect(isBaoyanXinxiRelevant("浙江大学", "材料科学与工程学院")).toBe(false);
@@ -802,6 +804,87 @@ describe("source normalization", () => {
       institute: "计算机学院",
       relevance: "strong",
       areas: ["计算机"],
+      relevanceClassifier: "codex-ai+rule-guard"
+    });
+  });
+
+  it("promotes strong rule matches over possible AI classifications", () => {
+    const item: NormalizedItem = {
+      key: "ruc-info",
+      contentHash: "hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "中国人民大学",
+      institute: "信息学院",
+      description: "保研信息平台补充源",
+      deadline: "2026-07-05T13:59:59.000Z",
+      website: "http://info.ruc.edu.cn/xwgg/xygg/0917bac9d080474ba20e5f024e9344e5.htm",
+      tags: ["985"],
+      areas: ["电子信息"]
+    };
+    const response = buildDdlResponse(
+      [item],
+      new Date("2026-06-30T04:00:00.000Z"),
+      null,
+      new Map([
+        [
+          "http://info.ruc.edu.cn/xwgg/xygg/0917bac9d080474ba20e5f024e9344e5.htm",
+          {
+            normalizedUrl: "http://info.ruc.edu.cn/xwgg/xygg/0917bac9d080474ba20e5f024e9344e5.htm",
+            relevance: "possible",
+            areas: ["其他"],
+            reason: "标题含可能相关方向词，但缺少明确计算机类强相关院系表述",
+            classifier: "codex-ai",
+            classifiedAt: "2026-06-30T00:00:00.000Z"
+          }
+        ]
+      ])
+    );
+
+    expect(response.items[0]).toMatchObject({
+      school: "中国人民大学",
+      institute: "信息学院",
+      relevance: "strong",
+      areas: ["电子信息"],
+      relevanceClassifier: "codex-ai+rule-guard"
+    });
+  });
+
+  it("treats Pengcheng National Laboratory as a strong AI related source", () => {
+    const item: NormalizedItem = {
+      key: "pcl",
+      contentHash: "hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "鹏城国家实验室",
+      institute: "鹏城国家实验室",
+      description: "保研信息平台补充源",
+      deadline: "2026-06-30T07:00:00.000Z",
+      website: "https://mp.weixin.qq.com/s/9CWrI4ZAsc7kbcRRyPJxMw?scene=1&click_id=12",
+      tags: ["其他"],
+      areas: ["电子信息"]
+    };
+    const response = buildDdlResponse(
+      [item],
+      new Date("2026-06-30T04:00:00.000Z"),
+      null,
+      new Map([
+        [
+          "https://mp.weixin.qq.com/s/9CWrI4ZAsc7kbcRRyPJxMw",
+          {
+            normalizedUrl: "https://mp.weixin.qq.com/s/9CWrI4ZAsc7kbcRRyPJxMw",
+            relevance: "possible",
+            areas: ["电子信息"],
+            reason: "命中可能相关关键词：电子信息",
+            classifier: "codex-ai",
+            classifiedAt: "2026-06-30T00:00:00.000Z"
+          }
+        ]
+      ])
+    );
+
+    expect(response.items[0]).toMatchObject({
+      school: "鹏城国家实验室",
+      relevance: "strong",
+      areas: ["电子信息"],
       relevanceClassifier: "codex-ai+rule-guard"
     });
   });
