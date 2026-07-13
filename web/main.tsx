@@ -1,6 +1,35 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  ArrowUpRight,
+  Bookmark,
+  BookmarkCheck,
+  CalendarDays,
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ClipboardList,
+  Copy,
+  Database,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  Globe2,
+  LayoutGrid,
+  ListFilter,
+  Moon,
+  Plus,
+  RotateCcw,
+  Save,
+  Search,
+  SlidersHorizontal,
+  Sun,
+  Table2,
+  Trash2,
+  X
+} from "lucide-react";
+import {
   APPLICATION_PATCH_SCHEMA,
   APPLICATION_TRACKER_SCHEMA,
   APPLICATION_TRACKER_STORAGE_KEY,
@@ -16,6 +45,7 @@ import {
   previewApplicationPatch,
   removeApplicationRecord,
   updateApplicationRecord,
+  type ActivityType,
   type ApplicationEvent,
   type ApplicationEventType,
   type ApplicationMaterial,
@@ -30,7 +60,7 @@ import {
 import "./styles.css";
 import type { GlobeCountry } from "./GlobeScene";
 
-// three.js 较重,地球场景按需懒加载:仅当访问统计滚入可视区时才下载并挂载
+// three.js 较重，只有用户主动展开访问地图时才下载并挂载。
 const GlobeScene = lazy(() => import("./GlobeScene"));
 
 type DeadlineStatus = "today" | "future" | "expired";
@@ -52,6 +82,12 @@ interface DdlItem {
   relevanceReason: string | null;
   relevanceClassifier: string;
   relevanceClassifiedAt: string | null;
+  activityType: ActivityType;
+  activityTypeLabel: string;
+  activityTypeSource: "source" | "source_group" | "text" | "classification" | "unknown";
+  activityTypeReason: string | null;
+  activityTypeClassifier: string;
+  activityTypeClassifiedAt: string | null;
   sourceGroup: string;
   sourceLabel: string;
   website: string;
@@ -143,11 +179,17 @@ interface AnalyticsSummary {
   daily: AnalyticsDaily[];
 }
 
+interface ApplicationStorageIssue {
+  message: string;
+  rawValue: string;
+}
+
 interface TimelineEntry {
   key: string;
   school: string;
   institute: string;
   tier: TierFilter;
+  activityType: ActivityType;
   website: string;
 }
 
@@ -168,6 +210,7 @@ type RecentFilter = "all" | "new" | "updated";
 type ViewMode = "cards" | "table";
 type ThemeMode = "light" | "dark";
 type RelevanceFilter = "strong" | "possible" | "all";
+type ActivityTypeFilter = ActivityType | "all";
 type MainTab = "ddl" | "applications" | "calendar";
 type ApplicationViewMode = "cards" | "table";
 type ApplicationRangeFilter = "all" | "today" | "3" | "7" | "15" | "expired";
@@ -214,13 +257,6 @@ const RANGE_OPTIONS: Array<{ value: RangeFilter; label: string; maxDays: number 
   { value: "15", label: "15 天", maxDays: 15 },
   { value: "future", label: "全部未来", maxDays: null }
 ];
-const RANGE_WIDTH: Record<RangeFilter, number> = {
-  today: 0,
-  "3": 1,
-  "7": 2,
-  "15": 3,
-  future: 4
-};
 const SOURCE_OPTIONS: Array<{ value: SourceFilter; label: string }> = [
   { value: "all", label: "全部来源" },
   { value: "baoyanxinxi", label: "保研信息平台" },
@@ -236,6 +272,12 @@ const RELEVANCE_OPTIONS: Array<{ value: RelevanceFilter; label: string }> = [
   { value: "possible", label: "强相关+可能" },
   { value: "all", label: "全部源站" }
 ];
+const ACTIVITY_TYPE_OPTIONS: Array<{ value: ActivityTypeFilter; label: string }> = [
+  { value: "all", label: "全部类型" },
+  { value: "summer_camp", label: "夏令营" },
+  { value: "pre_recommendation", label: "预推免" },
+  { value: "unknown", label: "未标注" }
+];
 const API_URL = "https://baoyan-mail.weijuebu.workers.dev/api/ddl";
 const LLMS_TXT_URL = "/llms.txt";
 const ANALYTICS_VISIT_STORAGE_KEY = "baoyan-ddl-visit-date";
@@ -244,6 +286,11 @@ const FAVORITE_STORAGE_KEY = "baoyan-ddl-favorites";
 const READ_STORAGE_KEY = "baoyan-ddl-read";
 const THEME_STORAGE_KEY = "baoyan-ddl-theme";
 const MAIN_TAB_STORAGE_KEY = "baoyan-main-tab";
+const DDL_VIEW_DESKTOP_STORAGE_KEY = "baoyan-ui/v1/ddl-view-desktop";
+const DDL_VIEW_MOBILE_STORAGE_KEY = "baoyan-ui/v1/ddl-view-mobile";
+const APPLICATION_VIEW_DESKTOP_STORAGE_KEY = "baoyan-ui/v1/application-view-desktop";
+const APPLICATION_VIEW_MOBILE_STORAGE_KEY = "baoyan-ui/v1/application-view-mobile";
+const MOBILE_VIEW_MEDIA_QUERY = "(max-width: 720px)";
 const STATUS_OPTIONS: Array<{ value: ApplicationStatus; label: string }> = [
   { value: "watching", label: "关注中" },
   { value: "preparing", label: "准备中" },
@@ -284,23 +331,9 @@ const EVENT_TYPE_OPTIONS: Array<{ value: ApplicationEventType; label: string }> 
   { value: "other", label: "其他" }
 ];
 
-interface RailBucket {
-  label: string;
-  tone: "normal" | "danger";
-  minRange: RangeFilter;
-  matches: (remainingDays: number) => boolean;
-}
-
-const RAIL_BUCKETS: RailBucket[] = [
-  { label: "今日", tone: "danger", minRange: "today", matches: (d) => d <= 0 },
-  { label: "3 天", tone: "normal", minRange: "3", matches: (d) => d > 0 && d <= 3 },
-  { label: "7 天", tone: "normal", minRange: "7", matches: (d) => d > 3 && d <= 7 },
-  { label: "15 天", tone: "normal", minRange: "15", matches: (d) => d > 7 && d <= 15 },
-  { label: "更远", tone: "normal", minRange: "future", matches: (d) => d > 15 }
-];
-
 function App(): React.ReactElement {
   const initialFilters = useMemo(readFiltersFromUrl, []);
+  const isMobileViewport = useMediaQuery(MOBILE_VIEW_MEDIA_QUERY);
   const [theme, setTheme] = useState<ThemeMode>(readInitialTheme);
   const [data, setData] = useState<DdlResponse | null>(null);
   const [archivalData, setArchivalData] = useState<DdlResponse | null>(null);
@@ -311,18 +344,23 @@ function App(): React.ReactElement {
   const [range, setRange] = useState<RangeFilter>(initialFilters.range);
   const [source, setSource] = useState<SourceFilter>(initialFilters.source);
   const [relevance, setRelevance] = useState<RelevanceFilter>(initialFilters.relevance);
+  const [activityType, setActivityType] = useState<ActivityTypeFilter>(initialFilters.activityType);
   const [recent, setRecent] = useState<RecentFilter>(initialFilters.recent);
   const [viewMode, setViewMode] = useState<ViewMode>(initialFilters.viewMode);
-  const [mainTab, setMainTab] = useState<MainTab>(readInitialMainTab);
+  const [moreFiltersOpen, setMoreFiltersOpen] = useState(false);
+  const [mainTab, setMainTab] = useState<MainTab>(initialFilters.mainTab);
   const [activeApplicationId, setActiveApplicationId] = useState<string | null>(null);
   const [activeTiers, setActiveTiers] = useState<Set<TierFilter>>(initialFilters.tiers);
   const [activeAreas, setActiveAreas] = useState<Set<AreaFilter>>(initialFilters.areas);
   const [favorites, toggleFavorite] = useStoredKeySet(FAVORITE_STORAGE_KEY);
   const [readItems, toggleReadItem] = useStoredKeySet(READ_STORAGE_KEY);
-  const [applicationData, setApplicationData] = useApplicationTracker();
+  const [applicationData, setApplicationData, applicationStorageIssue, resetApplicationStorage] =
+    useApplicationTracker();
   const scrollTargetRef = useRef<string | null>(null);
   const [scrollNonce, setScrollNonce] = useState(0);
   const [highlightKey, setHighlightKey] = useState<string | null>(null);
+  const filterPanelRef = useRef<HTMLElement>(null);
+  const previousMobileViewport = useRef(isMobileViewport);
 
   useEffect(() => {
     let ignore = false;
@@ -394,9 +432,19 @@ function App(): React.ReactElement {
       recent,
       relevance,
       source,
-      viewMode
+      activityType,
+      viewMode,
+      mainTab
     });
-  }, [activeAreas, activeTiers, query, range, recent, relevance, source, viewMode]);
+  }, [activeAreas, activeTiers, activityType, mainTab, query, range, recent, relevance, source, viewMode]);
+
+  useEffect(() => {
+    if (previousMobileViewport.current === isMobileViewport) {
+      return;
+    }
+    previousMobileViewport.current = isMobileViewport;
+    setViewMode(readStoredViewMode("ddl", isMobileViewport));
+  }, [isMobileViewport]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -428,11 +476,12 @@ function App(): React.ReactElement {
         "future",
         "all",
         relevance,
+        activityType,
         new Set(TIER_OPTIONS),
         new Set(),
         "all"
       ),
-    [futureItems, relevance]
+    [activityType, futureItems, relevance]
   );
   const visibleItems = useMemo(
     () =>
@@ -442,13 +491,28 @@ function App(): React.ReactElement {
         range,
         source,
         relevance,
+        activityType,
         activeTiers,
         activeAreas,
         recent
       ),
-    [activeAreas, activeTiers, futureItems, query, range, recent, relevance, source]
+    [activeAreas, activeTiers, activityType, futureItems, query, range, recent, relevance, source]
   );
   const stats = useMemo(() => buildStats(relevanceScopedItems), [relevanceScopedItems]);
+  const activityStats = useMemo(
+    () => buildActivityTypeStats(visibleItems),
+    [visibleItems]
+  );
+  const activeFilterCount = getDdlActiveFilterCount({
+    activeAreas,
+    activeTiers,
+    activityType,
+    query,
+    range,
+    recent,
+    relevance,
+    source
+  });
   const applicationSourceKeys = useMemo(
     () => new Set(applicationData.records.map((record) => record.sourceDdlKey).filter((key) => key !== "")),
     [applicationData.records]
@@ -460,28 +524,22 @@ function App(): React.ReactElement {
     setApplicationData((current) => hydrateApplicationRecordLinks(current, archivalData.items));
   }, [archivalData, setApplicationData]);
   const applicationCount = applicationData.records.length;
-  // 概览计数与跳转候选用同一套筛选（忽略范围），保证点击后一定能找到目标卡片
-  const railCounts = useMemo(() => {
-    const scoped = filterItems(
-      futureItems,
-      query,
-      "future",
-      source,
-      relevance,
-      activeTiers,
-      activeAreas,
-      recent
-    );
-    return RAIL_BUCKETS.map(
-      (bucket) => scoped.filter((item) => bucket.matches(item.remainingDays)).length
-    );
-  }, [activeAreas, activeTiers, futureItems, query, recent, relevance, source]);
   const timelineStops = useMemo(
     () =>
       buildTimeline(
-        filterItems(futureItems, query, range, source, relevance, activeTiers, activeAreas, recent)
+        filterItems(
+          futureItems,
+          query,
+          range,
+          source,
+          relevance,
+          activityType,
+          activeTiers,
+          activeAreas,
+          recent
+        )
       ),
-    [activeAreas, activeTiers, futureItems, query, range, recent, relevance, source]
+    [activeAreas, activeTiers, activityType, futureItems, query, range, recent, relevance, source]
   );
 
   // 点击概览后等列表渲染完成再滚动到目标卡片，滚动结束后再高亮（确保视线到位时才闪烁）
@@ -540,26 +598,8 @@ function App(): React.ReactElement {
     return () => window.clearTimeout(timer);
   }, [highlightKey]);
 
-  function jumpToBucket(bucket: RailBucket): void {
-    const candidates = filterItems(
-      futureItems,
-      query,
-      "future",
-      source,
-      relevance,
-      activeTiers,
-      activeAreas,
-      recent
-    );
-    const target = candidates.find((item) => bucket.matches(item.remainingDays));
-    if (target === undefined) {
-      return;
-    }
-    // 仅在当前范围过窄时放宽，避免把用户已选的更宽范围改窄
-    if (RANGE_WIDTH[range] < RANGE_WIDTH[bucket.minRange]) {
-      setRange(bucket.minRange);
-    }
-    scrollTargetRef.current = target.key;
+  function jumpToItem(itemKey: string): void {
+    scrollTargetRef.current = itemKey;
     setScrollNonce((value) => value + 1);
   }
 
@@ -592,10 +632,20 @@ function App(): React.ReactElement {
     setRange("future");
     setSource("all");
     setRelevance("strong");
+    setActivityType("all");
     setRecent("all");
-    setViewMode("cards");
     setActiveTiers(new Set(TIER_OPTIONS));
     setActiveAreas(new Set());
+  }
+
+  function changeViewMode(nextViewMode: ViewMode): void {
+    setViewMode(nextViewMode);
+    persistViewMode("ddl", isMobileViewport, nextViewMode);
+  }
+
+  function openFiltersFromMobileBar(): void {
+    setMoreFiltersOpen(true);
+    filterPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   function toggleTheme(): void {
@@ -711,108 +761,138 @@ function App(): React.ReactElement {
   }, [setApplicationData]);
 
   return (
-    <main className="shell">
-      <ThemeToggle theme={theme} onToggle={toggleTheme} />
-
-      <section className="hero" aria-labelledby="page-title">
-        <div className="hero-copy">
-          <p className="eyebrow">CS BAOYAN DEADLINES</p>
-          <h1 id="page-title">保研 DDL 速查</h1>
-          <p className="hero-text">
-            默认展示 AI 判定的计算机类强相关 DDL，可切换查看可能相关和源站全量。
-          </p>
-        </div>
-        <div className="hero-actions">
-          <span className="updated">{formatGeneratedAt(data?.lastSyncedAt ?? data?.generatedAt)}</span>
-        </div>
-      </section>
-
-      <MainTabs
+    <div className="app-frame">
+      <AppHeader
         activeTab={mainTab}
         applicationCount={applicationCount}
         ddlCount={relevanceScopedItems.length}
+        lastSyncedAt={data?.lastSyncedAt ?? data?.generatedAt}
         onSelect={setMainTab}
       />
 
-      {mainTab === "ddl" && (
-        <>
-          <Timeline range={range} stops={timelineStops} loading={isLoading} />
+      <main className="shell" id="main-content">
+        {mainTab === "ddl" && (
+          <section className="ddl-workspace" aria-labelledby="page-title">
+            <header className="workspace-intro">
+              <div>
+                <span className="section-kicker">DEADLINE DESK</span>
+                <h1 id="page-title">找到下一场值得投的项目</h1>
+                <p>默认展示计算机类强相关通知，筛选、收藏并直接加入本地申请计划。</p>
+              </div>
+              <div className="workspace-intro-meta">
+                <strong>{relevanceScopedItems.length}</strong>
+                <span>条强相关 DDL</span>
+              </div>
+            </header>
 
-          <section className="dashboard" aria-label="DDL 查询工具">
-            <aside className="rail" aria-label="截止时间概览">
-              <span className="rail-label">截止概览</span>
-              {RAIL_BUCKETS.map((bucket, index) => {
-                const count = railCounts[index] ?? 0;
-                return (
-                  <RailMarker
-                    count={count}
-                    key={bucket.label}
-                    label={bucket.label}
-                    onJump={count > 0 ? () => jumpToBucket(bucket) : undefined}
-                    tone={bucket.tone}
-                  />
-                );
-              })}
-            </aside>
-
-            <div className="workbench">
-              <section className="toolbar" aria-label="筛选条件">
-                <label className="search-field">
-                  <span>搜索学校或院系</span>
+            <section className="discovery-panel" aria-label="DDL 筛选" ref={filterPanelRef}>
+              <label className="search-field search-field-main">
+                <span>搜索学校、院系或研究方向</span>
+                <div className="search-control">
+                  <Search aria-hidden="true" size={20} strokeWidth={2} />
                   <input
                     value={query}
                     onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
                       setQuery(event.currentTarget.value)
                     }
-                    placeholder="例如 浙江大学 / 网络空间安全"
+                    placeholder="例如：浙江大学、网络空间安全、人工智能"
                     type="search"
                   />
-                </label>
+                  {query !== "" && (
+                    <button aria-label="清除搜索词" onClick={() => setQuery("")} type="button">
+                      <X aria-hidden="true" size={18} />
+                    </button>
+                  )}
+                </div>
+              </label>
 
+              <div className="quick-filter-grid">
+                <FilterSegment
+                  label="项目类型"
+                  onChange={(value) => setActivityType(value as ActivityTypeFilter)}
+                  options={ACTIVITY_TYPE_OPTIONS}
+                  value={activityType}
+                />
+                <FilterSegment
+                  label="相关度"
+                  onChange={(value) => setRelevance(value as RelevanceFilter)}
+                  options={RELEVANCE_OPTIONS}
+                  value={relevance}
+                />
+                <FilterSegment
+                  label="截止范围"
+                  onChange={(value) => setRange(value as RangeFilter)}
+                  options={RANGE_OPTIONS}
+                  value={range}
+                />
+              </div>
+
+              <div className="filter-overview">
+                <div className="result-summary" aria-live="polite">
+                  <strong>{visibleItems.length}</strong>
+                  <span>条符合当前条件</span>
+                </div>
+                <div className="activity-summary" aria-label="项目类型统计">
+                  <span><strong>{activityStats.summer_camp}</strong> 夏令营</span>
+                  <span><strong>{activityStats.pre_recommendation}</strong> 预推免</span>
+                  <span><strong>{activityStats.unknown}</strong> 未标注</span>
+                </div>
+                <button
+                  aria-expanded={moreFiltersOpen}
+                  className={moreFiltersOpen ? "secondary-action secondary-action-active" : "secondary-action"}
+                  onClick={() => setMoreFiltersOpen((value) => !value)}
+                  type="button"
+                >
+                  <SlidersHorizontal aria-hidden="true" size={17} />
+                  高级筛选
+                  {getAdvancedFilterCount({ activeAreas, activeTiers, recent, source }) > 0 && (
+                    <span className="action-count">
+                      {getAdvancedFilterCount({ activeAreas, activeTiers, recent, source })}
+                    </span>
+                  )}
+                  <ChevronDown aria-hidden="true" className={moreFiltersOpen ? "chevron-open" : ""} size={16} />
+                </button>
+              </div>
+
+              <DdlActiveFilters
+                activeAreas={activeAreas}
+                activeTiers={activeTiers}
+                activityType={activityType}
+                count={activeFilterCount}
+                onClearAll={resetFilters}
+                onClearAreas={() => setActiveAreas(new Set())}
+                onClearQuery={() => setQuery("")}
+                onClearRecent={() => setRecent("all")}
+                onClearSource={() => setSource("all")}
+                onClearTiers={() => setActiveTiers(new Set(TIER_OPTIONS))}
+                onResetActivityType={() => setActivityType("all")}
+                onResetRange={() => setRange("future")}
+                onResetRelevance={() => setRelevance("strong")}
+                query={query}
+                range={range}
+                recent={recent}
+                relevance={relevance}
+                source={source}
+              />
+
+              <div className={moreFiltersOpen ? "advanced-filters advanced-filters-open" : "advanced-filters"}>
                 <div className="control-block">
-                  <div className="control-label">相关度</div>
-                  <div className="control-row" aria-label="相关度筛选">
-                    {RELEVANCE_OPTIONS.map((option) => (
+                  <div className="control-label">学校层次</div>
+                  <div className="control-row control-row-wrap" aria-label="学校层次">
+                    {TIER_OPTIONS.map((tier) => (
                       <button
-                        className={relevance === option.value ? "chip relevance-chip chip-active" : "chip relevance-chip"}
-                        key={option.value}
-                        onClick={() => setRelevance(option.value)}
+                        className={activeTiers.has(tier) ? "chip tier-chip chip-active" : "chip tier-chip"}
+                        key={tier}
+                        onClick={() => toggleTier(tier)}
                         type="button"
                       >
-                        {option.label}
+                        {tier}
                       </button>
                     ))}
                   </div>
                 </div>
-
-                <div className="control-row" aria-label="时间范围">
-                  {RANGE_OPTIONS.map((option) => (
-                    <button
-                      className={range === option.value ? "chip chip-active" : "chip"}
-                      key={option.value}
-                      onClick={() => setRange(option.value)}
-                      type="button"
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="control-row control-row-wrap" aria-label="学校层次">
-                  {TIER_OPTIONS.map((tier) => (
-                    <button
-                      className={activeTiers.has(tier) ? "chip tier-chip chip-active" : "chip tier-chip"}
-                      key={tier}
-                      onClick={() => toggleTier(tier)}
-                      type="button"
-                    >
-                      {tier}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="control-block">
-                  <div className="control-label">方向</div>
+                <div className="control-block advanced-area-filter">
+                  <div className="control-label">研究方向</div>
                   <div className="control-row control-row-wrap" aria-label="方向筛选">
                     <button
                       className={activeAreas.size === 0 ? "chip area-chip chip-active" : "chip area-chip"}
@@ -833,9 +913,8 @@ function App(): React.ReactElement {
                     ))}
                   </div>
                 </div>
-
                 <label className="select-field">
-                  <span>来源</span>
+                  <span>数据来源</span>
                   <select
                     value={source}
                     onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
@@ -843,50 +922,51 @@ function App(): React.ReactElement {
                     }
                   >
                     {SOURCE_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
+                      <option key={option.value} value={option.value}>{option.label}</option>
                     ))}
                   </select>
                 </label>
+                <FilterSegment
+                  label="信息变化"
+                  onChange={(value) => setRecent(value as RecentFilter)}
+                  options={RECENT_OPTIONS}
+                  value={recent}
+                />
+              </div>
+            </section>
 
-                <div className="control-row" aria-label="最近状态">
-                  {RECENT_OPTIONS.map((option) => (
-                    <button
-                      className={recent === option.value ? "chip chip-active" : "chip"}
-                      key={option.value}
-                      onClick={() => setRecent(option.value)}
-                      type="button"
-                    >
-                      {option.label}
-                    </button>
-                  ))}
+            <div className="mobile-filter-bar">
+              <button onClick={openFiltersFromMobileBar} type="button">
+                <SlidersHorizontal aria-hidden="true" size={18} />
+                筛选{activeFilterCount > 0 ? ` ${activeFilterCount}` : ""}
+              </button>
+              <span>{visibleItems.length} 条结果</span>
+              {activeFilterCount > 0 && (
+                <button aria-label="清除全部筛选" onClick={resetFilters} type="button">
+                  <RotateCcw aria-hidden="true" size={17} />
+                </button>
+              )}
+            </div>
+
+            <Timeline
+              loading={isLoading}
+              onSelectItem={jumpToItem}
+              range={range}
+              stops={timelineStops}
+            />
+
+            <section className="results-panel" aria-labelledby="results-title">
+              <header className="results-head">
+                <div>
+                  <span className="section-kicker">RESULTS</span>
+                  <h2 id="results-title">DDL 结果</h2>
+                  <p>
+                    今日截止 {stats.today} 条，未来 15 天 {stats.fifteenDays} 条，
+                    {formatGeneratedAt(data?.lastSyncedAt ?? data?.generatedAt)}。
+                  </p>
                 </div>
-
-                <div className="control-row" aria-label="视图模式">
-                  <button
-                    className={viewMode === "cards" ? "chip chip-active" : "chip"}
-                    onClick={() => setViewMode("cards")}
-                    type="button"
-                  >
-                    卡片
-                  </button>
-                  <button
-                    className={viewMode === "table" ? "chip chip-active" : "chip"}
-                    onClick={() => setViewMode("table")}
-                    type="button"
-                  >
-                    表格
-                  </button>
-                </div>
-              </section>
-
-              <section className="summary-strip" aria-label="数据概览">
-                <SummaryCell label="未截止" value={relevanceScopedItems.length} />
-                <SummaryCell label="今日截止" value={stats.today} />
-                <SummaryCell label="15 天内" value={stats.fifteenDays} />
-                <SummaryCell label="当前显示" value={visibleItems.length} />
-              </section>
+                <ViewSwitcher onChange={changeViewMode} value={viewMode} />
+              </header>
 
               {isLoading ? (
                 <DdlSkeleton />
@@ -895,8 +975,8 @@ function App(): React.ReactElement {
               ) : visibleItems.length === 0 ? (
                 <StateMessage
                   title="当前筛选没有结果"
-                  message="放宽时间范围、学校层次或搜索词后再试。"
-                  actionLabel="重置筛选"
+                  message="放宽截止范围、相关度或搜索词后再试。"
+                  actionLabel="清除筛选"
                   onAction={resetFilters}
                 />
               ) : (
@@ -918,34 +998,44 @@ function App(): React.ReactElement {
                   viewMode={viewMode}
                 />
               )}
-            </div>
+            </section>
           </section>
-        </>
-      )}
+        )}
 
-      {mainTab === "applications" && (
-        <ApplicationWorkspace
-          activeRecordId={activeApplicationId}
-          data={applicationData}
-          onRemoveRecord={removeApplication}
-          onReplaceData={replaceApplicationData}
-          onSelectRecord={setActiveApplicationId}
-          onUpdateRecord={updateApplication}
-        />
-      )}
+        {mainTab === "applications" && (
+          <ApplicationWorkspace
+            activeRecordId={activeApplicationId}
+            data={applicationData}
+            onRemoveRecord={removeApplication}
+            onReplaceData={replaceApplicationData}
+            onSelectRecord={setActiveApplicationId}
+            onUpdateRecord={updateApplication}
+            onResetStorage={resetApplicationStorage}
+            storageIssue={applicationStorageIssue}
+          />
+        )}
 
-      {mainTab === "calendar" && (
-        <ApplicationCalendar
-          activeRecordId={activeApplicationId}
-          records={applicationData.records}
-          onOpenRecord={openApplication}
-          onSelectApplications={() => setMainTab("applications")}
-        />
-      )}
+        {mainTab === "calendar" && (
+          <ApplicationCalendar
+            activeRecordId={activeApplicationId}
+            records={applicationData.records}
+            onOpenRecord={openApplication}
+            onSelectApplications={() => setMainTab("applications")}
+          />
+        )}
 
-      <ApiHint />
-      <AnalyticsPanel summary={analytics} theme={theme} />
-    </main>
+        <ApiHint />
+        <AnalyticsPanel summary={analytics} theme={theme} />
+      </main>
+
+      <MobileNavigation
+        activeTab={mainTab}
+        applicationCount={applicationCount}
+        ddlCount={relevanceScopedItems.length}
+        onSelect={setMainTab}
+      />
+      <ThemeToggle theme={theme} onToggle={toggleTheme} />
+    </div>
   );
 }
 
@@ -976,6 +1066,41 @@ function sendDailyVisitPing(): void {
   }).catch(() => undefined);
 }
 
+function AppHeader({
+  activeTab,
+  applicationCount,
+  ddlCount,
+  lastSyncedAt,
+  onSelect
+}: {
+  activeTab: MainTab;
+  applicationCount: number;
+  ddlCount: number;
+  lastSyncedAt: string | undefined;
+  onSelect: (tab: MainTab) => void;
+}): React.ReactElement {
+  return (
+    <header className="app-header">
+      <div className="app-header-inner">
+        <button className="brand" onClick={() => onSelect("ddl")} type="button">
+          <span className="brand-mark" aria-hidden="true">DDL</span>
+          <span className="brand-copy">
+            <strong>保研进度台</strong>
+            <small>发现、规划、跟进</small>
+          </span>
+        </button>
+        <MainTabs
+          activeTab={activeTab}
+          applicationCount={applicationCount}
+          ddlCount={ddlCount}
+          onSelect={onSelect}
+        />
+        <span className="updated header-updated">{formatGeneratedAt(lastSyncedAt)}</span>
+      </div>
+    </header>
+  );
+}
+
 function MainTabs({
   activeTab,
   applicationCount,
@@ -987,13 +1112,9 @@ function MainTabs({
   ddlCount: number;
   onSelect: (tab: MainTab) => void;
 }): React.ReactElement {
-  const tabs: Array<{ value: MainTab; label: string; count: number; hint: string }> = [
-    { value: "ddl", label: "DDL 列表", count: ddlCount, hint: "发现通知" },
-    { value: "applications", label: "我的申请", count: applicationCount, hint: "本地记录" },
-    { value: "calendar", label: "日历", count: applicationCount, hint: "关键日期" }
-  ];
+  const tabs = buildMainTabs(ddlCount, applicationCount);
   return (
-    <nav className="main-tabs" aria-label="平台功能">
+    <nav className="main-tabs desktop-tabs" aria-label="平台功能">
       {tabs.map((tab) => (
         <button
           className={activeTab === tab.value ? "main-tab main-tab-active" : "main-tab"}
@@ -1001,12 +1122,230 @@ function MainTabs({
           onClick={() => onSelect(tab.value)}
           type="button"
         >
+          <NavigationIcon tab={tab.value} />
           <span>{tab.label}</span>
-          <strong>{tab.count}</strong>
-          <em>{tab.hint}</em>
+          {tab.count > 0 && <strong>{tab.count}</strong>}
         </button>
       ))}
     </nav>
+  );
+}
+
+function MobileNavigation({
+  activeTab,
+  applicationCount,
+  ddlCount,
+  onSelect
+}: {
+  activeTab: MainTab;
+  applicationCount: number;
+  ddlCount: number;
+  onSelect: (tab: MainTab) => void;
+}): React.ReactElement {
+  return (
+    <nav className="mobile-navigation" aria-label="平台功能">
+      {buildMainTabs(ddlCount, applicationCount).map((tab) => (
+        <button
+          aria-current={activeTab === tab.value ? "page" : undefined}
+          className={activeTab === tab.value ? "mobile-nav-item mobile-nav-item-active" : "mobile-nav-item"}
+          key={tab.value}
+          onClick={() => onSelect(tab.value)}
+          type="button"
+        >
+          <span className="mobile-nav-icon">
+            <NavigationIcon tab={tab.value} />
+            {tab.value === "applications" && tab.count > 0 && <em>{tab.count}</em>}
+          </span>
+          <span>{tab.mobileLabel}</span>
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+function buildMainTabs(
+  ddlCount: number,
+  applicationCount: number
+): Array<{ value: MainTab; label: string; mobileLabel: string; count: number }> {
+  return [
+    { value: "ddl", label: "DDL 列表", mobileLabel: "DDL", count: ddlCount },
+    { value: "applications", label: "我的申请", mobileLabel: "申请", count: applicationCount },
+    { value: "calendar", label: "申请日历", mobileLabel: "日历", count: applicationCount }
+  ];
+}
+
+function NavigationIcon({ tab }: { tab: MainTab }): React.ReactElement {
+  if (tab === "applications") {
+    return <ClipboardList aria-hidden="true" size={18} strokeWidth={2} />;
+  }
+  if (tab === "calendar") {
+    return <CalendarDays aria-hidden="true" size={18} strokeWidth={2} />;
+  }
+  return <ListFilter aria-hidden="true" size={18} strokeWidth={2} />;
+}
+
+function FilterSegment({
+  label,
+  onChange,
+  options,
+  value
+}: {
+  label: string;
+  onChange: (value: string) => void;
+  options: ReadonlyArray<{ value: string; label: string }>;
+  value: string;
+}): React.ReactElement {
+  return (
+    <div className="control-block filter-segment">
+      <div className="control-label">{label}</div>
+      <div className="segmented-control" aria-label={label} role="group">
+        {options.map((option) => (
+          <button
+            aria-pressed={value === option.value}
+            className={value === option.value ? "segment-button segment-button-active" : "segment-button"}
+            key={option.value}
+            onClick={() => onChange(option.value)}
+            type="button"
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ViewSwitcher({
+  onChange,
+  value
+}: {
+  onChange: (value: ViewMode) => void;
+  value: ViewMode;
+}): React.ReactElement {
+  return (
+    <div className="view-switcher" aria-label="显示方式" role="group">
+      <button
+        aria-label="卡片视图"
+        aria-pressed={value === "cards"}
+        className={value === "cards" ? "view-button view-button-active" : "view-button"}
+        onClick={() => onChange("cards")}
+        title="卡片视图"
+        type="button"
+      >
+        <LayoutGrid aria-hidden="true" size={18} />
+      </button>
+      <button
+        aria-label="表格视图"
+        aria-pressed={value === "table"}
+        className={value === "table" ? "view-button view-button-active" : "view-button"}
+        onClick={() => onChange("table")}
+        title="表格视图"
+        type="button"
+      >
+        <Table2 aria-hidden="true" size={18} />
+      </button>
+    </div>
+  );
+}
+
+function DdlActiveFilters({
+  activeAreas,
+  activeTiers,
+  activityType,
+  count,
+  onClearAll,
+  onClearAreas,
+  onClearQuery,
+  onClearRecent,
+  onClearSource,
+  onClearTiers,
+  onResetActivityType,
+  onResetRange,
+  onResetRelevance,
+  query,
+  range,
+  recent,
+  relevance,
+  source
+}: {
+  activeAreas: Set<AreaFilter>;
+  activeTiers: Set<TierFilter>;
+  activityType: ActivityTypeFilter;
+  count: number;
+  onClearAll: () => void;
+  onClearAreas: () => void;
+  onClearQuery: () => void;
+  onClearRecent: () => void;
+  onClearSource: () => void;
+  onClearTiers: () => void;
+  onResetActivityType: () => void;
+  onResetRange: () => void;
+  onResetRelevance: () => void;
+  query: string;
+  range: RangeFilter;
+  recent: RecentFilter;
+  relevance: RelevanceFilter;
+  source: SourceFilter;
+}): React.ReactElement | null {
+  if (count === 0) {
+    return null;
+  }
+  const tags: Array<{ key: string; label: string; onRemove: () => void }> = [];
+  if (query.trim() !== "") {
+    tags.push({ key: "query", label: `搜索：${truncate(query.trim(), 18)}`, onRemove: onClearQuery });
+  }
+  if (activityType !== "all") {
+    tags.push({ key: "activity", label: formatActivityType(activityType), onRemove: onResetActivityType });
+  }
+  if (relevance !== "strong") {
+    tags.push({
+      key: "relevance",
+      label: RELEVANCE_OPTIONS.find((option) => option.value === relevance)?.label ?? relevance,
+      onRemove: onResetRelevance
+    });
+  }
+  if (range !== "future") {
+    tags.push({
+      key: "range",
+      label: `截止：${RANGE_OPTIONS.find((option) => option.value === range)?.label ?? range}`,
+      onRemove: onResetRange
+    });
+  }
+  if (activeTiers.size !== TIER_OPTIONS.length) {
+    tags.push({ key: "tiers", label: `层次：${activeTiers.size} 项`, onRemove: onClearTiers });
+  }
+  if (activeAreas.size > 0) {
+    tags.push({ key: "areas", label: `方向：${activeAreas.size} 项`, onRemove: onClearAreas });
+  }
+  if (source !== "all") {
+    tags.push({
+      key: "source",
+      label: SOURCE_OPTIONS.find((option) => option.value === source)?.label ?? source,
+      onRemove: onClearSource
+    });
+  }
+  if (recent !== "all") {
+    tags.push({
+      key: "recent",
+      label: RECENT_OPTIONS.find((option) => option.value === recent)?.label ?? recent,
+      onRemove: onClearRecent
+    });
+  }
+
+  return (
+    <div className="active-filter-row" aria-label="已启用筛选">
+      <span className="active-filter-label">已筛选</span>
+      {tags.map((tag) => (
+        <button className="active-filter-tag" key={tag.key} onClick={tag.onRemove} type="button">
+          {tag.label}
+          <X aria-hidden="true" size={14} />
+        </button>
+      ))}
+      <button className="clear-filter-button" onClick={onClearAll} type="button">
+        <RotateCcw aria-hidden="true" size={14} />
+        全部清除
+      </button>
+    </div>
   );
 }
 
@@ -1026,7 +1365,7 @@ function ApiHint(): React.ReactElement {
   return (
     <section className="api-hint" aria-label="面向 LLM 与 Agent 的数据接口">
       <div className="api-hint-body">
-        <span className="api-hint-badge">LLM / Agent</span>
+        <span className="api-hint-badge"><Database aria-hidden="true" size={14} /> Agent API</span>
         <div className="api-hint-text">
           <strong>结构化数据接口</strong>
           <p>
@@ -1038,9 +1377,11 @@ function ApiHint(): React.ReactElement {
       <div className="api-hint-actions">
         <code className="api-hint-url">{API_URL}</code>
         <button className="api-hint-copy" onClick={copyApiUrl} type="button">
+          <Copy aria-hidden="true" size={15} />
           {copied ? "已复制" : "复制接口地址"}
         </button>
         <a className="api-hint-open" href={API_URL} rel="noreferrer" target="_blank">
+          <ExternalLink aria-hidden="true" size={15} />
           打开 JSON
         </a>
       </div>
@@ -1055,63 +1396,86 @@ function AnalyticsPanel({
   summary: AnalyticsSummary | null;
   theme: ThemeMode;
 }): React.ReactElement {
+  const [mapOpen, setMapOpen] = useState(false);
   const countries = summary?.countries ?? [];
-  const topCountries = countries.slice(0, 6);
+  const topCountries = countries.slice(0, 5);
   const topRegions = summary?.regions.slice(0, 5) ?? [];
   const maxVisits = Math.max(1, ...countries.map((country) => country.visitCount));
   return (
-    <section className="analytics-panel" aria-label="访问统计">
-      <div className="analytics-head">
+    <footer className="analytics-panel" aria-label="访问统计">
+      <div className="analytics-summary-row">
         <div className="analytics-copy">
           <span className="analytics-eyebrow">VISIT ATLAS</span>
-          <h2>匿名访问统计</h2>
-          <p>按浏览器每日一次计数，只保存日期和地区，不保存 IP、邮箱或浏览器指纹。</p>
+          <strong>匿名访问统计</strong>
+          <p>每日一次匿名计数，不保存 IP、邮箱或浏览器指纹。</p>
         </div>
         <div className="analytics-metrics">
           <Metric label="近 30 天访问" value={summary?.totalVisits ?? 0} />
           <Metric label="今日访问" value={summary?.todayVisits ?? 0} />
-          <Metric label="国家或地区" value={summary?.countryCount ?? 0} />
-          <Metric label="细分地区" value={summary?.regionCount ?? 0} />
+          <Metric label="覆盖地区" value={summary?.regionCount ?? 0} />
+        </div>
+        <div className="analytics-region-summary" aria-label="主要访问地区">
+          <span>主要地区</span>
+          {topRegions.length === 0 ? (
+            <em>等待数据积累</em>
+          ) : (
+            topRegions.slice(0, 3).map((region) => (
+              <strong key={`${region.countryCode}-${region.regionCode}-${region.regionName}`}>
+                {region.regionName} {region.visitCount}
+              </strong>
+            ))
+          )}
         </div>
       </div>
 
-      <div className="analytics-board">
-        <VisitGlobe countries={countries} maxVisits={maxVisits} theme={theme} />
-
-        <div className="analytics-rank-card" aria-label="访问地区排行">
-          <div className="rank-section">
-            <strong className="analytics-list-title">Top 国家或地区</strong>
-            {topCountries.length === 0 ? (
-              <p className="country-empty">等待访问数据积累。</p>
-            ) : (
-              topCountries.map((country) => (
-                <div className="country-row" key={country.countryCode}>
-                  <span className="country-name">{country.countryName}</span>
-                  <span className="country-bar" aria-hidden="true">
-                    <span style={{ width: `${Math.max(8, (country.visitCount / maxVisits) * 100)}%` }} />
-                  </span>
-                  <strong>{country.visitCount}</strong>
-                </div>
-              ))
-            )}
+      <details
+        className="analytics-details"
+        onToggle={(event) => setMapOpen(event.currentTarget.open)}
+        open={mapOpen}
+      >
+        <summary>
+          <Globe2 aria-hidden="true" size={17} />
+          {mapOpen ? "收起访问地图" : "展开访问地图与地区排行"}
+          <ChevronDown aria-hidden="true" className={mapOpen ? "chevron-open" : ""} size={16} />
+        </summary>
+        {mapOpen && (
+          <div className="analytics-board">
+            <VisitGlobe countries={countries} maxVisits={maxVisits} theme={theme} />
+            <div className="analytics-rank-card" aria-label="访问地区排行">
+              <div className="rank-section">
+                <strong className="analytics-list-title">国家或地区</strong>
+                {topCountries.length === 0 ? (
+                  <p className="country-empty">等待访问数据积累。</p>
+                ) : (
+                  topCountries.map((country) => (
+                    <div className="country-row" key={country.countryCode}>
+                      <span className="country-name">{country.countryName}</span>
+                      <span className="country-bar" aria-hidden="true">
+                        <span style={{ width: `${Math.max(8, (country.visitCount / maxVisits) * 100)}%` }} />
+                      </span>
+                      <strong>{country.visitCount}</strong>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="rank-section">
+                <strong className="analytics-list-title">细分地区</strong>
+                {topRegions.length === 0 ? (
+                  <p className="country-empty">暂无细分地区。</p>
+                ) : (
+                  topRegions.map((region) => (
+                    <div className="region-row" key={`${region.countryCode}-${region.regionCode}-${region.regionName}`}>
+                      <span>{region.regionName}</span>
+                      <strong>{region.visitCount}</strong>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
           </div>
-
-          <div className="rank-section">
-            <strong className="analytics-list-title">Top 细分地区</strong>
-            {topRegions.length === 0 ? (
-              <p className="country-empty">暂无细分地区。</p>
-            ) : (
-              topRegions.map((region) => (
-                <div className="region-row" key={`${region.countryCode}-${region.regionCode}-${region.regionName}`}>
-                  <span>{region.regionName}</span>
-                  <strong>{region.visitCount}</strong>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-      </div>
-    </section>
+        )}
+      </details>
+    </footer>
   );
 }
 
@@ -1133,43 +1497,14 @@ function VisitGlobe({
   maxVisits: number;
   theme: ThemeMode;
 }): React.ReactElement {
-  const hostRef = useRef<HTMLDivElement>(null);
-  const [inView, setInView] = useState(false);
   const leader = countries[0];
-
-  // 滚入可视区才挂载地球,避免页面底部的 three.js 拖累首屏
-  useEffect(() => {
-    const el = hostRef.current;
-    if (el === null) {
-      return;
-    }
-    if (typeof IntersectionObserver === "undefined") {
-      setInView(true);
-      return;
-    }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          setInView(true);
-          observer.disconnect();
-        }
-      },
-      { rootMargin: "200px" }
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
 
   return (
     <div className="visit-globe-card" aria-label="世界访问热度">
-      <div className="visit-globe-stage" ref={hostRef}>
-        {inView ? (
-          <Suspense fallback={<GlobeFallback />}>
-            <GlobeScene countries={countries} maxVisits={maxVisits} theme={theme} />
-          </Suspense>
-        ) : (
-          <GlobeFallback />
-        )}
+      <div className="visit-globe-stage">
+        <Suspense fallback={<GlobeFallback />}>
+          <GlobeScene countries={countries} maxVisits={maxVisits} theme={theme} />
+        </Suspense>
         <div className="globe-legend" aria-hidden="true">
           <span className="globe-legend-dot globe-legend-hot" />
           <span>访问热度</span>
@@ -1207,7 +1542,11 @@ function ThemeToggle({
       onClick={onToggle}
       type="button"
     >
-      <span className="theme-float-icon" aria-hidden="true" />
+      {isDark ? (
+        <Sun aria-hidden="true" className="theme-float-icon" size={25} strokeWidth={1.9} />
+      ) : (
+        <Moon aria-hidden="true" className="theme-float-icon" size={25} strokeWidth={1.9} />
+      )}
       <span className="theme-float-tooltip" aria-hidden="true">换主题</span>
     </button>
   );
@@ -1218,68 +1557,113 @@ function ApplicationWorkspace({
   data,
   onRemoveRecord,
   onReplaceData,
+  onResetStorage,
   onSelectRecord,
-  onUpdateRecord
+  onUpdateRecord,
+  storageIssue
 }: {
   activeRecordId: string | null;
   data: ApplicationTrackerData;
   onRemoveRecord: (id: string) => void;
   onReplaceData: (data: ApplicationTrackerData) => void;
-  onSelectRecord: (id: string) => void;
+  onResetStorage: () => void;
+  onSelectRecord: (id: string | null) => void;
   onUpdateRecord: (id: string, values: Partial<ApplicationRecord>) => void;
+  storageIssue: ApplicationStorageIssue | null;
 }): React.ReactElement {
+  const isMobileViewport = useMediaQuery(MOBILE_VIEW_MEDIA_QUERY);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<ApplicationStatus | "all">("all");
   const [priority, setPriority] = useState<ApplicationPriority | "all">("all");
   const [result, setResult] = useState<ApplicationResult | "all">("all");
   const [range, setRange] = useState<ApplicationRangeFilter>("all");
-  const [viewMode, setViewMode] = useState<ApplicationViewMode>("table");
+  const [viewMode, setViewMode] = useState<ApplicationViewMode>(() =>
+    readStoredViewMode("application", isMobileViewport)
+  );
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [agentOpen, setAgentOpen] = useState(false);
+  const previousMobileViewport = useRef(isMobileViewport);
   const records = useMemo(
     () => filterApplicationRecords(data.records, { priority, query, range, result, status }),
     [data.records, priority, query, range, result, status]
   );
   const stats = useMemo(() => buildApplicationStats(data.records), [data.records]);
-  const activeRecord = data.records.find((record) => record.id === activeRecordId) ?? records[0] ?? null;
+  const activeRecord = data.records.find((record) => record.id === activeRecordId) ?? null;
+  const advancedFilterCount =
+    Number(priority !== "all") + Number(result !== "all") + Number(range !== "all");
+
+  useEffect(() => {
+    if (previousMobileViewport.current === isMobileViewport) {
+      return;
+    }
+    previousMobileViewport.current = isMobileViewport;
+    setViewMode(readStoredViewMode("application", isMobileViewport));
+  }, [isMobileViewport]);
+
+  function changeViewMode(nextViewMode: ViewMode): void {
+    setViewMode(nextViewMode);
+    persistViewMode("application", isMobileViewport, nextViewMode);
+  }
+
+  function resetApplicationFilters(): void {
+    setQuery("");
+    setStatus("all");
+    setPriority("all");
+    setResult("all");
+    setRange("all");
+  }
 
   return (
     <section className="application-shell" aria-label="我的申请">
-      <div className="application-head">
+      <header className="workspace-intro application-intro">
         <div>
           <span className="section-kicker">APPLICATION DESK</span>
           <h2>我的申请</h2>
           <p>投递状态、材料进度和面试日程只保存在当前浏览器。</p>
         </div>
         <div className="application-head-actions">
-          <button className="chip" onClick={() => setAgentOpen((value) => !value)} type="button">
-            Agent 数据
+          <button
+            aria-expanded={agentOpen}
+            className={agentOpen ? "secondary-action secondary-action-active" : "secondary-action"}
+            onClick={() => setAgentOpen((value) => !value)}
+            type="button"
+          >
+            <Database aria-hidden="true" size={17} />
+            数据工具
+            <ChevronDown aria-hidden="true" className={agentOpen ? "chevron-open" : ""} size={16} />
           </button>
-          <span className="local-badge">本地存储</span>
+          <span className="local-badge">仅存本地</span>
         </div>
-      </div>
+      </header>
+
+      {storageIssue !== null && (
+        <StorageRecoveryBanner issue={storageIssue} onReset={onResetStorage} />
+      )}
 
       <section className="application-metrics" aria-label="申请概览">
-        <SummaryCell label="关注中" value={stats.watching} />
-        <SummaryCell label="准备中" value={stats.preparing} />
-        <SummaryCell label="已投递" value={stats.submitted} />
-        <SummaryCell label="待结果" value={stats.waitingResult} />
-        <SummaryCell label="已录取" value={stats.admitted} />
+        <ApplicationMetric label="全部申请" value={stats.total} />
+        <ApplicationMetric label="准备中" value={stats.preparing} />
+        <ApplicationMetric label="已投递" value={stats.submitted} />
+        <ApplicationMetric label="待处理" tone="attention" value={stats.pendingAction} />
       </section>
 
       {agentOpen && <AgentDataPanel data={data} onReplaceData={onReplaceData} />}
 
       <section className="application-toolbar" aria-label="申请筛选">
-        <label className="search-field">
+        <label className="search-field application-search">
           <span>搜索申请</span>
-          <input
-            value={query}
-            onChange={(event: React.ChangeEvent<HTMLInputElement>) => setQuery(event.currentTarget.value)}
-            placeholder="学校、院系、备注"
-            type="search"
-          />
+          <div className="search-control">
+            <Search aria-hidden="true" size={19} />
+            <input
+              value={query}
+              onChange={(event: React.ChangeEvent<HTMLInputElement>) => setQuery(event.currentTarget.value)}
+              placeholder="学校、院系或备注"
+              type="search"
+            />
+          </div>
         </label>
         <label className="select-field">
-          <span>状态</span>
+          <span>当前状态</span>
           <select
             value={status}
             onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
@@ -1292,91 +1676,157 @@ function ApplicationWorkspace({
             ))}
           </select>
         </label>
-        <label className="select-field">
-          <span>优先级</span>
-          <select
-            value={priority}
-            onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
-              setPriority(event.currentTarget.value as ApplicationPriority | "all")
-            }
-          >
-            <option value="all">全部优先级</option>
-            {PRIORITY_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-        </label>
-        <label className="select-field">
-          <span>结果</span>
-          <select
-            value={result}
-            onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
-              setResult(event.currentTarget.value as ApplicationResult | "all")
-            }
-          >
-            <option value="all">全部结果</option>
-            {RESULT_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-        </label>
-        <div className="control-row application-range" aria-label="截止范围">
-          {APPLICATION_RANGE_OPTIONS.map((option) => (
-            <button
-              className={range === option.value ? "chip chip-active" : "chip"}
-              key={option.value}
-              onClick={() => setRange(option.value)}
-              type="button"
-            >
-              {option.label}
-            </button>
-          ))}
+        <button
+          aria-expanded={advancedOpen}
+          className={advancedOpen ? "secondary-action secondary-action-active" : "secondary-action"}
+          onClick={() => setAdvancedOpen((value) => !value)}
+          type="button"
+        >
+          <SlidersHorizontal aria-hidden="true" size={17} />
+          更多条件
+          {advancedFilterCount > 0 && <span className="action-count">{advancedFilterCount}</span>}
+          <ChevronDown aria-hidden="true" className={advancedOpen ? "chevron-open" : ""} size={16} />
+        </button>
+        <div className="application-toolbar-result">
+          <strong>{records.length}</strong>
+          <span>条记录</span>
         </div>
-        <div className="control-row" aria-label="申请视图">
-          <button
-            className={viewMode === "table" ? "chip chip-active" : "chip"}
-            onClick={() => setViewMode("table")}
-            type="button"
-          >
-            表格
-          </button>
-          <button
-            className={viewMode === "cards" ? "chip chip-active" : "chip"}
-            onClick={() => setViewMode("cards")}
-            type="button"
-          >
-            卡片
-          </button>
+        <ViewSwitcher onChange={changeViewMode} value={viewMode} />
+
+        <div className={advancedOpen ? "application-advanced application-advanced-open" : "application-advanced"}>
+          <label className="select-field">
+            <span>优先级</span>
+            <select
+              value={priority}
+              onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
+                setPriority(event.currentTarget.value as ApplicationPriority | "all")
+              }
+            >
+              <option value="all">全部优先级</option>
+              {PRIORITY_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+          <label className="select-field">
+            <span>申请结果</span>
+            <select
+              value={result}
+              onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
+                setResult(event.currentTarget.value as ApplicationResult | "all")
+              }
+            >
+              <option value="all">全部结果</option>
+              {RESULT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+          <FilterSegment
+            label="截止范围"
+            onChange={(value) => setRange(value as ApplicationRangeFilter)}
+            options={APPLICATION_RANGE_OPTIONS}
+            value={range}
+          />
+          {advancedFilterCount > 0 && (
+            <button className="clear-filter-button application-filter-clear" onClick={resetApplicationFilters} type="button">
+              <RotateCcw aria-hidden="true" size={14} />
+              清除筛选
+            </button>
+          )}
         </div>
       </section>
 
-      <div className="application-grid">
-        <section className="application-list-panel" aria-label="申请列表">
-          {records.length === 0 ? (
-            <StateMessage
-              title="还没有符合条件的申请"
-              message={data.records.length === 0 ? "从 DDL 列表里点击加入申请后，这里会生成本地记录。" : "调整筛选条件后再试。"}
-            />
-          ) : viewMode === "table" ? (
-            <ApplicationTable
-              activeRecordId={activeRecord?.id ?? null}
-              records={records}
-              onChooseRecord={onSelectRecord}
-            />
-          ) : (
-            <ApplicationCards
-              activeRecordId={activeRecord?.id ?? null}
-              records={records}
-              onChooseRecord={onSelectRecord}
-            />
-          )}
-        </section>
+      <section className="application-list-panel" aria-label="申请列表">
+        {records.length === 0 ? (
+          <StateMessage
+            title="还没有符合条件的申请"
+            message={data.records.length === 0 ? "从 DDL 列表里点击加入申请后，这里会生成本地记录。" : "调整筛选条件后再试。"}
+          />
+        ) : viewMode === "table" ? (
+          <ApplicationTable
+            activeRecordId={activeRecord?.id ?? null}
+            records={records}
+            onChooseRecord={onSelectRecord}
+          />
+        ) : (
+          <ApplicationCards
+            activeRecordId={activeRecord?.id ?? null}
+            records={records}
+            onChooseRecord={onSelectRecord}
+          />
+        )}
+      </section>
 
-        <ApplicationEditor
-          record={activeRecord}
-          onRemoveRecord={onRemoveRecord}
-          onUpdateRecord={onUpdateRecord}
-        />
+      <ApplicationEditor
+        onClose={() => onSelectRecord(null)}
+        record={activeRecord}
+        onRemoveRecord={onRemoveRecord}
+        onUpdateRecord={onUpdateRecord}
+      />
+    </section>
+  );
+}
+
+function ApplicationMetric({
+  label,
+  tone = "normal",
+  value
+}: {
+  label: string;
+  tone?: "normal" | "attention";
+  value: number;
+}): React.ReactElement {
+  return (
+    <div className={tone === "attention" ? "application-metric application-metric-attention" : "application-metric"}>
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function StorageRecoveryBanner({
+  issue,
+  onReset
+}: {
+  issue: ApplicationStorageIssue;
+  onReset: () => void;
+}): React.ReactElement {
+  const [copied, setCopied] = useState(false);
+
+  function copyRawData(): void {
+    void navigator.clipboard?.writeText(issue.rawValue).then(
+      () => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1600);
+      },
+      () => setCopied(false)
+    );
+  }
+
+  return (
+    <section className="storage-recovery" role="alert">
+      <div>
+        <strong>本地申请数据暂时无法读取</strong>
+        <p>{issue.message}。原始内容仍保留在浏览器中，请先备份，再决定是否重置。</p>
+      </div>
+      <div className="storage-recovery-actions">
+        <button className="secondary-action" onClick={copyRawData} type="button">
+          <Copy aria-hidden="true" size={16} />
+          {copied ? "已复制" : "复制原始数据"}
+        </button>
+        <button
+          className="danger-action"
+          onClick={() => {
+            if (window.confirm("重置后将清空当前浏览器中的异常申请数据，是否继续？")) {
+              onReset();
+            }
+          }}
+          type="button"
+        >
+          <Trash2 aria-hidden="true" size={16} />
+          重置本地数据
+        </button>
       </div>
     </section>
   );
@@ -1435,11 +1885,13 @@ function ApplicationTable({
               <td>
                 <div className="table-actions">
                   <button onClick={() => onChooseRecord(record.id)} type="button">
+                    <ArrowUpRight aria-hidden="true" size={15} />
                     编辑
                   </button>
                   {record.website !== "" && (
-                    <a href={record.website} rel="noreferrer" target="_blank">
-                      原文
+                    <a href={record.website} rel="noreferrer" target="_blank" title="官方通知">
+                      <ExternalLink aria-hidden="true" size={15} />
+                      官方通知
                     </a>
                   )}
                 </div>
@@ -1488,6 +1940,7 @@ function ApplicationCards({
             </div>
           </dl>
           <button className="icon-action" onClick={() => onChooseRecord(record.id)} type="button">
+            <ArrowUpRight aria-hidden="true" size={17} />
             编辑申请
           </button>
         </li>
@@ -1519,38 +1972,107 @@ function renderApplicationOfficialLink(
 }
 
 function ApplicationEditor({
+  onClose,
   onRemoveRecord,
   onUpdateRecord,
   record
 }: {
+  onClose: () => void;
   onRemoveRecord: (id: string) => void;
   onUpdateRecord: (id: string, values: Partial<ApplicationRecord>) => void;
   record: ApplicationRecord | null;
-}): React.ReactElement {
+}): React.ReactElement | null {
+  const [draft, setDraft] = useState<ApplicationRecord | null>(null);
+  const [baseline, setBaseline] = useState<ApplicationRecord | null>(null);
   const [newEventType, setNewEventType] = useState<ApplicationEventType>("interview");
   const [newEventTitle, setNewEventTitle] = useState("");
   const [newEventDate, setNewEventDate] = useState("");
   const [newEventNote, setNewEventNote] = useState("");
+  const [saved, setSaved] = useState(false);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<HTMLElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const hasChanges =
+    draft !== null && baseline !== null && serializeEditableRecord(draft) !== serializeEditableRecord(baseline);
+  const hasChangesRef = useRef(hasChanges);
+  hasChangesRef.current = hasChanges;
 
   useEffect(() => {
+    const nextRecord = record === null ? null : cloneApplicationRecord(record);
+    setDraft(nextRecord);
+    setBaseline(nextRecord === null ? null : cloneApplicationRecord(nextRecord));
     setNewEventType("interview");
     setNewEventTitle("");
     setNewEventDate("");
     setNewEventNote("");
+    setSaved(false);
   }, [record?.id]);
 
-  if (record === null) {
-    return (
-      <aside className="application-editor application-editor-empty">
-        <h3>申请详情</h3>
-        <p>从左侧选择一条申请后编辑状态、材料和日程。</p>
-      </aside>
-    );
+  useEffect(() => {
+    if (record === null) {
+      return;
+    }
+    previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.setTimeout(() => closeButtonRef.current?.focus(), 0);
+
+    function handleKeyDown(event: KeyboardEvent): void {
+      if (event.key === "Tab") {
+        const focusable = Array.from(
+          drawerRef.current?.querySelectorAll<HTMLElement>(
+            'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+          ) ?? []
+        ).filter((element) => element.getClientRects().length > 0);
+        const first = focusable[0];
+        const last = focusable.at(-1);
+        if (first !== undefined && last !== undefined) {
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }
+        return;
+      }
+      if (event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      if (!hasChangesRef.current || window.confirm("当前修改尚未保存，确定关闭吗？")) {
+        onClose();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+      previousFocusRef.current?.focus();
+    };
+  }, [record?.id]);
+
+  if (record === null || draft === null) {
+    return null;
   }
-  const activeRecord = record;
+  const activeRecord = draft;
+
+  function requestClose(): void {
+    if (hasChanges && !window.confirm("当前修改尚未保存，确定关闭吗？")) {
+      return;
+    }
+    onClose();
+  }
+
+  function updateDraft(values: Partial<ApplicationRecord>): void {
+    setSaved(false);
+    setDraft((current) => (current === null ? current : { ...current, ...values }));
+  }
 
   function updateMaterial(material: ApplicationMaterial, status: MaterialStatus): void {
-    onUpdateRecord(activeRecord.id, {
+    updateDraft({
       materials: activeRecord.materials.map((entry) =>
         entry.id === material.id ? { ...entry, status } : entry
       )
@@ -1558,7 +2080,7 @@ function ApplicationEditor({
   }
 
   function removeEvent(eventId: string): void {
-    onUpdateRecord(activeRecord.id, {
+    updateDraft({
       events: activeRecord.events.filter((event) => event.id !== eventId)
     });
   }
@@ -1572,185 +2094,290 @@ function ApplicationEditor({
       id: `event-${Date.now().toString(36)}`,
       type: newEventType,
       title,
-      date: newEventDate,
+      date: dateTimeLocalToIso(newEventDate),
       note: newEventNote.trim()
     };
-    onUpdateRecord(activeRecord.id, { events: [...activeRecord.events, event] });
+    updateDraft({ events: [...activeRecord.events, event] });
     setNewEventTitle("");
     setNewEventDate("");
     setNewEventNote("");
   }
 
+  function saveChanges(): void {
+    if (!hasChanges) {
+      return;
+    }
+    onUpdateRecord(activeRecord.id, activeRecord);
+    setBaseline(cloneApplicationRecord(activeRecord));
+    setSaved(true);
+    window.setTimeout(() => setSaved(false), 1800);
+  }
+
+  function deleteApplication(): void {
+    if (!window.confirm(`确定删除“${activeRecord.school}”的申请记录吗？`)) {
+      return;
+    }
+    onRemoveRecord(activeRecord.id);
+    onClose();
+  }
+
   return (
-    <aside className="application-editor" aria-label="申请详情">
-      <div className="editor-head">
-        <div>
-          <span className="section-kicker">DETAIL</span>
-          <h3>{record.school}</h3>
-          <p>{record.institute || "未提供院系"}</p>
-          {record.website.trim() !== "" && (
-            <a className="application-inline-source" href={record.website} rel="noreferrer" target="_blank">
-              官方通知
-            </a>
-          )}
-        </div>
-        <span className="tier-badge">{record.tier}</span>
-      </div>
+    <div className="application-drawer-layer">
+      <button aria-label="关闭申请详情" className="drawer-backdrop" onClick={requestClose} type="button" />
+      <aside
+        aria-labelledby="application-editor-title"
+        aria-modal="true"
+        className="application-editor"
+        ref={drawerRef}
+        role="dialog"
+      >
+        <header className="editor-head">
+          <div>
+            <span className="section-kicker">APPLICATION DETAIL</span>
+            <h3 id="application-editor-title">{activeRecord.school}</h3>
+            <p>{activeRecord.institute || "未提供院系"}</p>
+          </div>
+          <div className="editor-head-actions">
+            <span className="tier-badge">{activeRecord.tier}</span>
+            <button
+              aria-label="关闭申请详情"
+              className="icon-button"
+              onClick={requestClose}
+              ref={closeButtonRef}
+              title="关闭"
+              type="button"
+            >
+              <X aria-hidden="true" size={20} />
+            </button>
+          </div>
+        </header>
 
-      <div className="editor-fields">
-        <label className="select-field">
-          <span>状态</span>
-          <select
-            value={record.status}
-            onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
-              onUpdateRecord(record.id, { status: event.currentTarget.value as ApplicationStatus })
-            }
-          >
-            {STATUS_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-        </label>
-        <label className="select-field">
-          <span>优先级</span>
-          <select
-            value={record.priority}
-            onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
-              onUpdateRecord(record.id, { priority: event.currentTarget.value as ApplicationPriority })
-            }
-          >
-            {PRIORITY_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-        </label>
-        <label className="select-field">
-          <span>结果</span>
-          <select
-            value={record.result}
-            onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
-              onUpdateRecord(record.id, { result: event.currentTarget.value as ApplicationResult })
-            }
-          >
-            {RESULT_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      <section className="material-panel" aria-label="材料进度">
-        <h4>材料进度</h4>
-        <div className="material-list">
-          {record.materials.map((material) => (
-            <div className="material-row" key={material.id}>
-              <span>{material.label}</span>
-              <div className="material-actions">
-                <button
-                  className={material.status === "todo" ? "material-chip material-chip-active" : "material-chip"}
-                  onClick={() => updateMaterial(material, "todo")}
-                  type="button"
-                >
-                  待办
-                </button>
-                <button
-                  className={material.status === "done" ? "material-chip material-chip-active" : "material-chip"}
-                  onClick={() => updateMaterial(material, "done")}
-                  type="button"
-                >
-                  完成
-                </button>
-                <button
-                  className={material.status === "not_required" ? "material-chip material-chip-active" : "material-chip"}
-                  onClick={() => updateMaterial(material, "not_required")}
-                  type="button"
-                >
-                  不需要
-                </button>
-              </div>
+        <div className="editor-scroll">
+          <section className="editor-section" aria-labelledby="editor-basic-title">
+            <div className="editor-section-title">
+              <span>01</span>
+              <h4 id="editor-basic-title">基本信息</h4>
             </div>
-          ))}
-        </div>
-      </section>
+            <div className="editor-form-grid editor-form-grid-two">
+              <label className="text-field">
+                <span>学校</span>
+                <input value={activeRecord.school} onChange={(event) => updateDraft({ school: event.currentTarget.value })} />
+              </label>
+              <label className="text-field">
+                <span>院系或项目</span>
+                <input value={activeRecord.institute} onChange={(event) => updateDraft({ institute: event.currentTarget.value })} />
+              </label>
+              <label className="text-field">
+                <span>官方通知</span>
+                <input
+                  inputMode="url"
+                  placeholder="https://"
+                  type="url"
+                  value={activeRecord.website}
+                  onChange={(event) => updateDraft({ website: event.currentTarget.value })}
+                />
+              </label>
+              <label className="text-field">
+                <span>截止时间</span>
+                <input
+                  type="datetime-local"
+                  value={dateTimeIsoToLocal(activeRecord.deadlineAt)}
+                  onChange={(event) => {
+                    const deadlineAt = dateTimeLocalToIso(event.currentTarget.value);
+                    updateDraft({ deadlineAt, deadlineText: formatEventDate(deadlineAt) });
+                  }}
+                />
+              </label>
+              <label className="select-field">
+                <span>项目类型</span>
+                <select
+                  value={activeRecord.activityType}
+                  onChange={(event) => updateDraft({ activityType: event.currentTarget.value as ActivityType })}
+                >
+                  {ACTIVITY_TYPE_OPTIONS.filter((option) => option.value !== "all").map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </section>
 
-      <section className="events-panel" aria-label="关键日程">
-        <h4>关键日程</h4>
-        <div className="event-list">
-          {record.events.length === 0 ? (
-            <p className="empty-hint">暂无日程。</p>
-          ) : (
-            record.events
-              .slice()
-              .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
-              .map((event) => (
-                <div className="event-row" key={event.id}>
-                  <span className={`event-type event-${event.type}`}>{formatEventType(event.type)}</span>
-                  <div>
-                    <strong>{event.title}</strong>
-                    <span>{formatEventDate(event.date)}{event.note === "" ? "" : ` · ${event.note}`}</span>
-                  </div>
-                  <button onClick={() => removeEvent(event.id)} type="button">删除</button>
+          <section className="editor-section" aria-labelledby="editor-progress-title">
+            <div className="editor-section-title">
+              <span>02</span>
+              <h4 id="editor-progress-title">申请进度</h4>
+            </div>
+            <div className="editor-fields">
+              <label className="select-field">
+                <span>状态</span>
+                <select
+                  value={activeRecord.status}
+                  onChange={(event) => updateDraft({ status: event.currentTarget.value as ApplicationStatus })}
+                >
+                  {STATUS_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="select-field">
+                <span>优先级</span>
+                <select
+                  value={activeRecord.priority}
+                  onChange={(event) => updateDraft({ priority: event.currentTarget.value as ApplicationPriority })}
+                >
+                  {PRIORITY_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="select-field">
+                <span>结果</span>
+                <select
+                  value={activeRecord.result}
+                  onChange={(event) => updateDraft({ result: event.currentTarget.value as ApplicationResult })}
+                >
+                  {RESULT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <section className="editor-section material-panel" aria-labelledby="editor-material-title">
+            <div className="editor-section-title">
+              <span>03</span>
+              <h4 id="editor-material-title">材料清单</h4>
+            </div>
+            <div className="material-list">
+              {activeRecord.materials.map((material) => (
+                <div className="material-row" key={material.id}>
+                  <label className="material-checkbox">
+                    <input
+                      checked={material.status === "done"}
+                      disabled={material.status === "not_required"}
+                      onChange={(event) => updateMaterial(material, event.currentTarget.checked ? "done" : "todo")}
+                      type="checkbox"
+                    />
+                    <span>{material.label}</span>
+                  </label>
+                  <button
+                    aria-pressed={material.status === "not_required"}
+                    className={material.status === "not_required" ? "material-skip material-skip-active" : "material-skip"}
+                    onClick={() => updateMaterial(material, material.status === "not_required" ? "todo" : "not_required")}
+                    type="button"
+                  >
+                    {material.status === "not_required" ? "恢复待办" : "不需要"}
+                  </button>
                 </div>
-              ))
-          )}
-        </div>
-        <div className="event-form">
-          <select
-            value={newEventType}
-            onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
-              setNewEventType(event.currentTarget.value as ApplicationEventType)
-            }
-          >
-            {EVENT_TYPE_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </select>
-          <input
-            value={newEventTitle}
-            onChange={(event: React.ChangeEvent<HTMLInputElement>) => setNewEventTitle(event.currentTarget.value)}
-            placeholder="日程名称"
-            type="text"
-          />
-          <input
-            value={newEventDate}
-            onChange={(event: React.ChangeEvent<HTMLInputElement>) => setNewEventDate(event.currentTarget.value)}
-            type="datetime-local"
-          />
-          <input
-            value={newEventNote}
-            onChange={(event: React.ChangeEvent<HTMLInputElement>) => setNewEventNote(event.currentTarget.value)}
-            placeholder="备注"
-            type="text"
-          />
-          <button className="chip chip-active" onClick={addEvent} type="button">
-            添加
-          </button>
-        </div>
-      </section>
+              ))}
+            </div>
+          </section>
 
-      <label className="notes-field">
-        <span>备注</span>
-        <textarea
-          value={record.notes}
-          onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) =>
-            onUpdateRecord(record.id, { notes: event.currentTarget.value })
-          }
-          placeholder="记录导师、材料要求、面试准备、结果等。"
-          rows={5}
-        />
-      </label>
+          <section className="editor-section events-panel" aria-labelledby="editor-events-title">
+            <div className="editor-section-title">
+              <span>04</span>
+              <h4 id="editor-events-title">关键日期</h4>
+            </div>
+            <div className="event-list">
+              {activeRecord.events.length === 0 ? (
+                <p className="empty-hint">暂无日程。</p>
+              ) : (
+                activeRecord.events
+                  .slice()
+                  .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
+                  .map((event) => (
+                    <div className="event-row" key={event.id}>
+                      <span className={`event-type event-${event.type}`}>{formatEventType(event.type)}</span>
+                      <div>
+                        <strong>{event.title}</strong>
+                        <span>{formatEventDate(event.date)}{event.note === "" ? "" : ` · ${event.note}`}</span>
+                      </div>
+                      <button aria-label={`删除日程 ${event.title}`} onClick={() => removeEvent(event.id)} title="删除日程" type="button">
+                        <Trash2 aria-hidden="true" size={16} />
+                      </button>
+                    </div>
+                  ))
+              )}
+            </div>
+            <div className="event-form">
+              <select
+                aria-label="日程类型"
+                value={newEventType}
+                onChange={(event) => setNewEventType(event.currentTarget.value as ApplicationEventType)}
+              >
+                {EVENT_TYPE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <input
+                aria-label="日程名称"
+                value={newEventTitle}
+                onChange={(event) => setNewEventTitle(event.currentTarget.value)}
+                placeholder="日程名称"
+                type="text"
+              />
+              <input
+                aria-label="日程时间"
+                value={newEventDate}
+                onChange={(event) => setNewEventDate(event.currentTarget.value)}
+                type="datetime-local"
+              />
+              <input
+                aria-label="日程备注"
+                value={newEventNote}
+                onChange={(event) => setNewEventNote(event.currentTarget.value)}
+                placeholder="备注"
+                type="text"
+              />
+              <button className="secondary-action event-add-button" onClick={addEvent} type="button">
+                <Plus aria-hidden="true" size={17} />
+                添加日程
+              </button>
+            </div>
+          </section>
 
-      <div className="editor-actions">
-        {record.website !== "" && (
-          <a className="source-link" href={record.website} rel="noreferrer" target="_blank">
-            原始通知
-          </a>
-        )}
-        <button className="danger-action" onClick={() => onRemoveRecord(record.id)} type="button">
-          删除申请
-        </button>
-      </div>
-    </aside>
+          <section className="editor-section" aria-labelledby="editor-notes-title">
+            <div className="editor-section-title">
+              <span>05</span>
+              <h4 id="editor-notes-title">结果与备注</h4>
+            </div>
+            <label className="notes-field">
+              <span>备注</span>
+              <textarea
+                value={activeRecord.notes}
+                onChange={(event) => updateDraft({ notes: event.currentTarget.value })}
+                placeholder="记录导师、材料要求、面试准备和结果。"
+                rows={6}
+              />
+            </label>
+            <button className="danger-action editor-delete" onClick={deleteApplication} type="button">
+              <Trash2 aria-hidden="true" size={16} />
+              删除申请记录
+            </button>
+          </section>
+        </div>
+
+        <footer className="editor-savebar">
+          <span aria-live="polite">
+            {saved ? "已保存到当前浏览器" : hasChanges ? "有未保存的修改" : "本地数据已保存"}
+          </span>
+          <div>
+            {activeRecord.website.trim() !== "" && (
+              <a className="secondary-action" href={activeRecord.website} rel="noreferrer" target="_blank">
+                <ExternalLink aria-hidden="true" size={16} />
+                官方通知
+              </a>
+            )}
+            <button className="secondary-action" onClick={requestClose} type="button">关闭</button>
+            <button className="primary-action" disabled={!hasChanges} onClick={saveChanges} type="button">
+              <Save aria-hidden="true" size={17} />
+              保存修改
+            </button>
+          </div>
+        </footer>
+      </aside>
+    </div>
   );
 }
 
@@ -1813,6 +2440,7 @@ function AgentDataPanel({
           <div className="agent-box-head">
             <strong>{APPLICATION_TRACKER_SCHEMA}</strong>
             <button className="icon-action" onClick={copyExport} type="button">
+              <Copy aria-hidden="true" size={16} />
               {copied ? "已复制" : "复制 JSON"}
             </button>
           </div>
@@ -1822,6 +2450,7 @@ function AgentDataPanel({
           <div className="agent-box-head">
             <strong>导入 Patch</strong>
             <button className="icon-action" onClick={buildPreview} type="button">
+              <Eye aria-hidden="true" size={16} />
               预览
             </button>
           </div>
@@ -1845,6 +2474,7 @@ function AgentDataPanel({
                 <>
                   <ul>{preview.summary.slice(0, 6).map((entry) => <li key={entry}>{entry}</li>)}</ul>
                   <button className="chip chip-active" onClick={applyPreview} type="button">
+                    <Check aria-hidden="true" size={16} />
                     确认应用
                   </button>
                 </>
@@ -1886,23 +2516,43 @@ function ApplicationCalendar({
 
   return (
     <section className="calendar-shell" aria-label="申请日历">
-      <div className="application-head">
+      <header className="workspace-intro calendar-intro">
         <div>
           <span className="section-kicker">CALENDAR</span>
           <h2>申请日历</h2>
-          <p>只展示已加入“我的申请”的 DDL、面试、开营、结果和补材料日程。</p>
+          <p>聚合已加入申请的 DDL、面试、开营、结果和补材料日程。</p>
         </div>
         <div className="calendar-actions">
-          <button className="chip" onClick={() => setMonthOffset((value) => value - 1)} type="button">
-            上月
+          <button
+            aria-label="查看上月"
+            className="icon-button"
+            onClick={() => setMonthOffset((value) => value - 1)}
+            title="上月"
+            type="button"
+          >
+            <ChevronLeft aria-hidden="true" size={20} />
           </button>
-          <button className="chip chip-active" onClick={() => setMonthOffset(0)} type="button">
-            本月
+          <button className="secondary-action" onClick={() => setMonthOffset(0)} type="button">
+            回到今天
           </button>
-          <button className="chip" onClick={() => setMonthOffset((value) => value + 1)} type="button">
-            下月
+          <button
+            aria-label="查看下月"
+            className="icon-button"
+            onClick={() => setMonthOffset((value) => value + 1)}
+            title="下月"
+            type="button"
+          >
+            <ChevronRight aria-hidden="true" size={20} />
           </button>
         </div>
+      </header>
+
+      <div className="calendar-legend" aria-label="日程类型">
+        {EVENT_TYPE_OPTIONS.map((option) => (
+          <span className={`calendar-legend-item event-${option.value}`} key={option.value}>
+            {option.label}
+          </span>
+        ))}
       </div>
 
       <div className="calendar-grid">
@@ -1927,7 +2577,11 @@ function ApplicationCalendar({
                 <div className="day-events">
                   {day.events.slice(0, 3).map((event) => (
                     <button
-                      className={event.record.id === activeRecordId ? "day-event day-event-active" : "day-event"}
+                      className={
+                        event.record.id === activeRecordId
+                          ? `day-event day-event-${event.event.type} day-event-active`
+                          : `day-event day-event-${event.event.type}`
+                      }
                       key={event.event.id}
                       onClick={() => {
                         onOpenRecord(event.record.id);
@@ -1962,7 +2616,7 @@ function ApplicationCalendar({
                   >
                     <span className={`event-type event-${event.type}`}>{formatEventType(event.type)}</span>
                     <strong>{record.school}</strong>
-                    <em>{formatEventDate(event.date)}</em>
+                    <em>{formatRelativeEventDate(event.date)}</em>
                   </button>
                 </li>
               ))}
@@ -2001,6 +2655,7 @@ function DdlResults({
     return (
       <DdlTable
         favorites={favorites}
+        highlightedKey={highlightedKey}
         items={items}
         applicationSourceKeys={applicationSourceKeys}
         onAddApplication={onAddApplication}
@@ -2071,10 +2726,17 @@ function DdlCard({
       <article>
         <div className="card-head">
           <div>
-            <h2>{item.school}</h2>
+            <h2>
+              <a href={item.website} rel="noreferrer" target="_blank">{item.school}</a>
+            </h2>
             <p>{item.institute || "未提供院系"}</p>
           </div>
-          <span className="tier-badge">{item.tier}</span>
+          <div className="card-badges">
+            <span className={`activity-badge activity-${item.activityType}`}>
+              {item.activityTypeLabel}
+            </span>
+            <span className="tier-badge">{item.tier}</span>
+          </div>
         </div>
         <AreaBadges item={item} />
         <div className="relevance-line">
@@ -2102,19 +2764,37 @@ function DdlCard({
         {item.description !== "" && <p className="description">{truncate(item.description, 96)}</p>}
         <div className="card-actions">
           <a className="source-link" href={item.website} rel="noreferrer" target="_blank">
-            查看原始通知
+            <ExternalLink aria-hidden="true" size={16} />
+            官方通知
           </a>
-          <button className="icon-action" onClick={onToggleFavorite} type="button">
-            {favorite ? "已收藏" : "收藏"}
+          <button
+            aria-label={favorite ? "取消收藏" : "收藏"}
+            aria-pressed={favorite}
+            className="icon-action compact-icon-action"
+            onClick={onToggleFavorite}
+            title={favorite ? "取消收藏" : "收藏"}
+            type="button"
+          >
+            {favorite ? <BookmarkCheck aria-hidden="true" size={17} /> : <Bookmark aria-hidden="true" size={17} />}
+            <span>{favorite ? "已收藏" : "收藏"}</span>
           </button>
-          <button className="icon-action" onClick={onToggleRead} type="button">
-            {read ? "未读" : "已读"}
+          <button
+            aria-label={read ? "标记为未读" : "标记为已读"}
+            aria-pressed={read}
+            className="icon-action compact-icon-action"
+            onClick={onToggleRead}
+            title={read ? "标记为未读" : "标记为已读"}
+            type="button"
+          >
+            {read ? <EyeOff aria-hidden="true" size={17} /> : <Eye aria-hidden="true" size={17} />}
+            <span>{read ? "已读" : "标为已读"}</span>
           </button>
           <button
             className={addedToApplications ? "icon-action application-action application-action-added" : "icon-action application-action"}
             onClick={addedToApplications ? onOpenApplication : onAddApplication}
             type="button"
           >
+            {addedToApplications ? <Check aria-hidden="true" size={17} /> : <Plus aria-hidden="true" size={17} />}
             {addedToApplications ? "已加入申请" : "加入申请"}
           </button>
         </div>
@@ -2142,6 +2822,7 @@ function getAreaClass(area: string): string {
 function DdlTable({
   applicationSourceKeys,
   favorites,
+  highlightedKey,
   items,
   onAddApplication,
   onOpenApplication,
@@ -2151,6 +2832,7 @@ function DdlTable({
 }: {
   applicationSourceKeys: Set<string>;
   favorites: Set<string>;
+  highlightedKey: string | null;
   items: DdlItem[];
   onAddApplication: (item: DdlItem) => void;
   onOpenApplication: (item: DdlItem) => void;
@@ -2163,31 +2845,45 @@ function DdlTable({
       <table className="ddl-table">
         <thead>
           <tr>
+            <th>截止时间</th>
             <th>学校</th>
             <th>院系</th>
-            <th>DDL</th>
+            <th>类型</th>
             <th>层次</th>
-            <th>相关度</th>
             <th>方向</th>
-            <th>来源</th>
+            <th>相关度</th>
             <th>操作</th>
           </tr>
         </thead>
         <tbody>
           {items.map((item) => (
-            <tr className={readItems.has(item.key) ? "table-row-read" : ""} key={item.key}>
-              <td>{item.school}</td>
-              <td>{item.institute || "未提供院系"}</td>
+            <tr
+              className={[
+                readItems.has(item.key) ? "table-row-read" : "",
+                highlightedKey === item.key ? "table-row-flash" : ""
+              ].filter(Boolean).join(" ")}
+              id={`ddl-${item.key}`}
+              key={item.key}
+            >
               <td>
                 <strong>{item.remainingText}</strong>
                 <span>{item.deadlineText}</span>
               </td>
-              <td>{item.tier}</td>
               <td>
-                <span className={`table-relevance relevance-${item.relevance}`}>
-                  {formatRelevance(item.relevance)}
+                <a className="table-primary-link" href={item.website} rel="noreferrer" target="_blank">
+                  {item.school}
+                </a>
+              </td>
+              <td>
+                {item.institute || "未提供院系"}
+                <span>{item.sourceLabel}</span>
+              </td>
+              <td>
+                <span className={`table-activity activity-${item.activityType}`}>
+                  {item.activityTypeLabel}
                 </span>
               </td>
+              <td>{item.tier}</td>
               <td>
                 <div className="table-area-list">
                   {getItemAreas(item).map((area) => (
@@ -2195,25 +2891,41 @@ function DdlTable({
                   ))}
                 </div>
               </td>
-              <td>{item.sourceLabel}</td>
+              <td>
+                <span className={`table-relevance relevance-${item.relevance}`}>
+                  {formatRelevance(item.relevance)}
+                </span>
+              </td>
               <td>
                 <div className="table-actions">
-                  <a href={item.website} rel="noreferrer" target="_blank">
-                    原文
+                  <a aria-label="打开官方通知" href={item.website} rel="noreferrer" target="_blank" title="官方通知">
+                    <ExternalLink aria-hidden="true" size={15} />
                   </a>
-                  <button onClick={() => onToggleFavorite(item.key)} type="button">
-                    {favorites.has(item.key) ? "已藏" : "收藏"}
-                  </button>
-                  <button onClick={() => onToggleRead(item.key)} type="button">
-                    {readItems.has(item.key) ? "未读" : "已读"}
+                  <button
+                    aria-label={favorites.has(item.key) ? "取消收藏" : "收藏"}
+                    onClick={() => onToggleFavorite(item.key)}
+                    title={favorites.has(item.key) ? "取消收藏" : "收藏"}
+                    type="button"
+                  >
+                    {favorites.has(item.key) ? <BookmarkCheck aria-hidden="true" size={15} /> : <Bookmark aria-hidden="true" size={15} />}
                   </button>
                   <button
+                    aria-label={readItems.has(item.key) ? "标记为未读" : "标记为已读"}
+                    onClick={() => onToggleRead(item.key)}
+                    title={readItems.has(item.key) ? "标记为未读" : "标记为已读"}
+                    type="button"
+                  >
+                    {readItems.has(item.key) ? <EyeOff aria-hidden="true" size={15} /> : <Eye aria-hidden="true" size={15} />}
+                  </button>
+                  <button
+                    aria-label={applicationSourceKeys.has(item.key) ? "打开申请" : "加入申请"}
                     onClick={() =>
                       applicationSourceKeys.has(item.key) ? onOpenApplication(item) : onAddApplication(item)
                     }
+                    title={applicationSourceKeys.has(item.key) ? "打开申请" : "加入申请"}
                     type="button"
                   >
-                    {applicationSourceKeys.has(item.key) ? "申请" : "加入"}
+                    {applicationSourceKeys.has(item.key) ? <Check aria-hidden="true" size={15} /> : <Plus aria-hidden="true" size={15} />}
                   </button>
                 </div>
               </td>
@@ -2235,58 +2947,22 @@ function AreaBadges({ item }: { item: DdlItem }): React.ReactElement {
   );
 }
 
-function RailMarker({
-  count,
-  label,
-  onJump,
-  tone = "normal"
-}: {
-  count: number;
-  label: string;
-  onJump?: (() => void) | undefined;
-  tone?: "normal" | "danger";
-}): React.ReactElement {
-  const className = tone === "danger" ? "rail-marker rail-marker-danger" : "rail-marker";
-  if (onJump === undefined) {
-    return (
-      <div className={`${className} rail-marker-empty`}>
-        <span>{label}</span>
-        <strong>{count}</strong>
-      </div>
-    );
-  }
-  return (
-    <button
-      className={`${className} rail-marker-link`}
-      onClick={onJump}
-      title={`跳转到最近的「${label}」截止`}
-      type="button"
-    >
-      <span>{label}</span>
-      <strong>{count}</strong>
-    </button>
-  );
-}
-
-function SummaryCell({ label, value }: { label: string; value: number }): React.ReactElement {
-  return (
-    <div>
-      <strong>{value}</strong>
-      <span>{label}</span>
-    </div>
-  );
-}
-
 function Timeline({
   loading,
+  onSelectItem,
   range,
   stops
 }: {
   loading: boolean;
+  onSelectItem: (itemKey: string) => void;
   range: RangeFilter;
   stops: TimelineStop[];
 }): React.ReactElement | null {
   const [expandedStops, setExpandedStops] = useState<Set<number>>(new Set());
+  const [hasHorizontalOverflow, setHasHorizontalOverflow] = useState(false);
+  const timelineTrackRef = useRef<HTMLOListElement>(null);
+  const timelineScrollbarRef = useRef<HTMLDivElement>(null);
+  const timelineScrollbarContentRef = useRef<HTMLDivElement>(null);
   const expandableStopKeys = useMemo(
     () =>
       stops
@@ -2310,6 +2986,47 @@ function Timeline({
       return next.size === previous.size ? previous : next;
     });
   }, [expandableStopKeys]);
+
+  useEffect(() => {
+    const track = timelineTrackRef.current;
+    const scrollbar = timelineScrollbarRef.current;
+    const scrollbarContent = timelineScrollbarContentRef.current;
+    if (track === null || scrollbar === null || scrollbarContent === null) {
+      return;
+    }
+
+    const updateScrollbar = (): void => {
+      scrollbarContent.style.width = `${track.scrollWidth}px`;
+      setHasHorizontalOverflow(track.scrollWidth > track.clientWidth + 1);
+      if (scrollbar.scrollLeft !== track.scrollLeft) {
+        scrollbar.scrollLeft = track.scrollLeft;
+      }
+    };
+
+    const syncFromTrack = (): void => {
+      if (scrollbar.scrollLeft !== track.scrollLeft) {
+        scrollbar.scrollLeft = track.scrollLeft;
+      }
+    };
+    const syncFromScrollbar = (): void => {
+      if (track.scrollLeft !== scrollbar.scrollLeft) {
+        track.scrollLeft = scrollbar.scrollLeft;
+      }
+    };
+
+    updateScrollbar();
+    track.addEventListener("scroll", syncFromTrack, { passive: true });
+    scrollbar.addEventListener("scroll", syncFromScrollbar, { passive: true });
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateScrollbar);
+    observer?.observe(track);
+
+    return () => {
+      observer?.disconnect();
+      track.removeEventListener("scroll", syncFromTrack);
+      scrollbar.removeEventListener("scroll", syncFromScrollbar);
+    };
+  }, [expandedStops, loading, stops]);
 
   if (loading) {
     return null;
@@ -2361,14 +3078,31 @@ function Timeline({
           </div>
         )}
       </div>
+      <div
+        aria-label="时间线横向滚动"
+        className={
+          hasHorizontalOverflow
+            ? "timeline-scrollbar"
+            : "timeline-scrollbar timeline-scrollbar-hidden"
+        }
+        ref={timelineScrollbarRef}
+        tabIndex={hasHorizontalOverflow ? 0 : -1}
+      >
+        <div
+          aria-hidden="true"
+          className="timeline-scrollbar-content"
+          ref={timelineScrollbarContentRef}
+        />
+      </div>
       {stops.length === 0 ? (
         <p className="timeline-empty">{rangeLabel}暂无符合条件的截止。</p>
       ) : (
-        <ol className="timeline-track">
+        <ol className="timeline-track" ref={timelineTrackRef}>
           {stops.map((stop) => (
             <TimelineColumn
               expanded={expandedStops.has(stop.remainingDays)}
               key={stop.remainingDays}
+              onSelectItem={onSelectItem}
               onToggleExpanded={() => toggleStopExpansion(stop.remainingDays)}
               stop={stop}
             />
@@ -2381,10 +3115,12 @@ function Timeline({
 
 function TimelineColumn({
   expanded,
+  onSelectItem,
   onToggleExpanded,
   stop
 }: {
   expanded: boolean;
+  onSelectItem: (itemKey: string) => void;
   onToggleExpanded: () => void;
   stop: TimelineStop;
 }): React.ReactElement {
@@ -2397,11 +3133,22 @@ function TimelineColumn({
       className={stop.isToday ? "timeline-stop timeline-stop-today" : "timeline-stop"}
     >
       <div className="timeline-node" aria-hidden="true" />
-      <div className="timeline-when">
+      <button
+        className="timeline-when"
+        disabled={stop.entries.length === 0}
+        onClick={() => {
+          const firstEntry = stop.entries[0];
+          if (firstEntry !== undefined) {
+            onSelectItem(firstEntry.key);
+          }
+        }}
+        title="定位到当天第一条 DDL"
+        type="button"
+      >
         <strong>{stop.dayLabel}</strong>
         <span>{stop.dateLabel}</span>
         <span className="timeline-count">{stop.entries.length} 所</span>
-      </div>
+      </button>
       <ul className="timeline-entries">
         {visible.map((entry) => (
           <li key={entry.key}>
@@ -2414,6 +3161,9 @@ function TimelineColumn({
             >
               <span className="timeline-school">{entry.school}</span>
               <span className="timeline-institute">{entry.institute || "未提供院系"}</span>
+              <span className={`timeline-activity activity-${entry.activityType}`}>
+                {formatActivityType(entry.activityType)}
+              </span>
               <span className="timeline-tier">{entry.tier}</span>
             </a>
           </li>
@@ -2549,18 +3299,22 @@ function compareApplicationRecords(a: ApplicationRecord, b: ApplicationRecord): 
 }
 
 function buildApplicationStats(records: ApplicationRecord[]): {
-  admitted: number;
+  pendingAction: number;
   preparing: number;
   submitted: number;
-  waitingResult: number;
-  watching: number;
+  total: number;
 } {
   return {
-    watching: records.filter((record) => record.status === "watching").length,
-    preparing: records.filter((record) => record.status === "preparing").length,
-    submitted: records.filter((record) => record.status === "submitted").length,
-    waitingResult: records.filter((record) => record.status === "waiting_result").length,
-    admitted: records.filter((record) => record.status === "admitted").length
+    total: records.length,
+    preparing: records.filter((record) => record.status === "watching" || record.status === "preparing").length,
+    submitted: records.filter((record) => record.status === "submitted" || record.status === "interview").length,
+    pendingAction: records.filter((record) => {
+      if (["admitted", "rejected", "withdrawn"].includes(record.status)) {
+        return false;
+      }
+      const days = getRemainingDays(record.deadlineAt);
+      return (days >= 0 && days <= 7) || record.status === "interview" || record.status === "waiting_result";
+    }).length
   };
 }
 
@@ -2641,6 +3395,44 @@ function formatEventDate(value: string): string {
     minute: "2-digit",
     hour12: false
   }).format(date);
+}
+
+function formatRelativeEventDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const days = getRemainingDays(value);
+  const prefix = days === 0 ? "今天" : days === 1 ? "明天" : days > 1 ? `${days} 天后` : "已发生";
+  return `${prefix} · ${formatEventDate(value)}`;
+}
+
+function dateTimeIsoToLocal(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const offset = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function dateTimeLocalToIso(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toISOString();
+}
+
+function cloneApplicationRecord(record: ApplicationRecord): ApplicationRecord {
+  return {
+    ...record,
+    areas: [...record.areas],
+    materials: record.materials.map((material) => ({ ...material })),
+    events: record.events.map((event) => ({ ...event }))
+  };
+}
+
+function serializeEditableRecord(record: ApplicationRecord): string {
+  const { updatedAt: _updatedAt, ...editable } = record;
+  return JSON.stringify(editable);
 }
 
 interface CalendarEventEntry {
@@ -2731,6 +3523,7 @@ function filterItems(
   range: RangeFilter,
   source: SourceFilter,
   relevance: RelevanceFilter,
+  activityType: ActivityTypeFilter,
   tiers: Set<TierFilter>,
   areas: Set<AreaFilter>,
   recent: RecentFilter
@@ -2739,6 +3532,9 @@ function filterItems(
   const rangeConfig = RANGE_OPTIONS.find((option) => option.value === range);
   return items.filter((item) => {
     if (!matchesRelevance(item, relevance)) {
+      return false;
+    }
+    if (activityType !== "all" && item.activityType !== activityType) {
       return false;
     }
     if (!tiers.has(item.tier)) {
@@ -2783,6 +3579,51 @@ function matchesRelevance(item: DdlItem, relevance: RelevanceFilter): boolean {
   return item.relevance === "strong";
 }
 
+function buildActivityTypeStats(items: DdlItem[]): Record<ActivityType, number> {
+  const stats: Record<ActivityType, number> = {
+    summer_camp: 0,
+    pre_recommendation: 0,
+    unknown: 0
+  };
+  for (const item of items) {
+    stats[item.activityType] += 1;
+  }
+  return stats;
+}
+
+function getAdvancedFilterCount(filters: {
+  activeAreas: Set<AreaFilter>;
+  activeTiers: Set<TierFilter>;
+  recent: RecentFilter;
+  source: SourceFilter;
+}): number {
+  let count = 0;
+  if (filters.activeAreas.size > 0) count += 1;
+  if (filters.activeTiers.size !== TIER_OPTIONS.length) count += 1;
+  if (filters.source !== "all") count += 1;
+  if (filters.recent !== "all") count += 1;
+  return count;
+}
+
+function getDdlActiveFilterCount(filters: {
+  activeAreas: Set<AreaFilter>;
+  activeTiers: Set<TierFilter>;
+  activityType: ActivityTypeFilter;
+  query: string;
+  range: RangeFilter;
+  recent: RecentFilter;
+  relevance: RelevanceFilter;
+  source: SourceFilter;
+}): number {
+  return (
+    Number(filters.query.trim() !== "") +
+    Number(filters.activityType !== "all") +
+    Number(filters.relevance !== "strong") +
+    Number(filters.range !== "future") +
+    getAdvancedFilterCount(filters)
+  );
+}
+
 function buildStats(items: DdlItem[]): {
   today: number;
   threeDays: number;
@@ -2792,9 +3633,9 @@ function buildStats(items: DdlItem[]): {
 } {
   return {
     today: items.filter((item) => item.remainingDays <= 0).length,
-    threeDays: items.filter((item) => item.remainingDays > 0 && item.remainingDays <= 3).length,
-    sevenDays: items.filter((item) => item.remainingDays > 3 && item.remainingDays <= 7).length,
-    fifteenDays: items.filter((item) => item.remainingDays > 7 && item.remainingDays <= 15).length,
+    threeDays: items.filter((item) => item.remainingDays >= 0 && item.remainingDays <= 3).length,
+    sevenDays: items.filter((item) => item.remainingDays >= 0 && item.remainingDays <= 7).length,
+    fifteenDays: items.filter((item) => item.remainingDays >= 0 && item.remainingDays <= 15).length,
     later: items.filter((item) => item.remainingDays > 15).length
   };
 }
@@ -2826,6 +3667,7 @@ function buildTimeline(items: DdlItem[]): TimelineStop[] {
           school: item.school,
           institute: item.institute,
           tier: item.tier,
+          activityType: item.activityType,
           website: item.website
         }));
       return {
@@ -2906,6 +3748,16 @@ function formatRelevance(value: Relevance): string {
   return "无关";
 }
 
+function formatActivityType(value: ActivityType): string {
+  if (value === "summer_camp") {
+    return "夏令营";
+  }
+  if (value === "pre_recommendation") {
+    return "预推免";
+  }
+  return "未标注";
+}
+
 function readInitialTheme(): ThemeMode {
   try {
     const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
@@ -2918,7 +3770,7 @@ function readInitialTheme(): ThemeMode {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function readInitialMainTab(): MainTab {
+function readStoredMainTab(): MainTab {
   try {
     const value = window.localStorage.getItem(MAIN_TAB_STORAGE_KEY);
     if (value === "ddl" || value === "applications" || value === "calendar") {
@@ -2931,17 +3783,21 @@ function readInitialMainTab(): MainTab {
 }
 
 function readFiltersFromUrl(): {
+  mainTab: MainTab;
   query: string;
   range: RangeFilter;
   source: SourceFilter;
   relevance: RelevanceFilter;
+  activityType: ActivityTypeFilter;
   recent: RecentFilter;
   viewMode: ViewMode;
   tiers: Set<TierFilter>;
   areas: Set<AreaFilter>;
 } {
   const params = new URLSearchParams(window.location.search);
+  const urlViewMode = params.get("view");
   return {
+    mainTab: readOption(params.get("tab"), ["ddl", "applications", "calendar"], readStoredMainTab()),
     query: params.get("q") ?? "",
     range: readOption(params.get("range"), RANGE_OPTIONS.map((option) => option.value), "future"),
     source: readOption(params.get("source"), SOURCE_OPTIONS.map((option) => option.value), "all"),
@@ -2950,8 +3806,17 @@ function readFiltersFromUrl(): {
       RELEVANCE_OPTIONS.map((option) => option.value),
       "strong"
     ),
+    activityType: readOption(
+      params.get("type"),
+      ACTIVITY_TYPE_OPTIONS.map((option) => option.value),
+      "all"
+    ),
     recent: readOption(params.get("recent"), RECENT_OPTIONS.map((option) => option.value), "all"),
-    viewMode: readOption(params.get("view"), ["cards", "table"], "cards"),
+    viewMode: readOption(
+      urlViewMode,
+      ["cards", "table"],
+      readStoredViewMode("ddl", matchesMobileViewport())
+    ),
     tiers: readTierSet(params.get("tiers")),
     areas: readAreaSet(params.get("areas"))
   };
@@ -2964,10 +3829,15 @@ function writeFiltersToUrl(filters: {
   range: RangeFilter;
   recent: RecentFilter;
   relevance: RelevanceFilter;
+  activityType: ActivityTypeFilter;
   source: SourceFilter;
   viewMode: ViewMode;
+  mainTab: MainTab;
 }): void {
   const params = new URLSearchParams();
+  if (filters.mainTab !== "ddl") {
+    params.set("tab", filters.mainTab);
+  }
   if (filters.query.trim() !== "") {
     params.set("q", filters.query.trim());
   }
@@ -2980,12 +3850,13 @@ function writeFiltersToUrl(filters: {
   if (filters.relevance !== "strong") {
     params.set("relevance", filters.relevance);
   }
+  if (filters.activityType !== "all") {
+    params.set("type", filters.activityType);
+  }
   if (filters.recent !== "all") {
     params.set("recent", filters.recent);
   }
-  if (filters.viewMode !== "cards") {
-    params.set("view", filters.viewMode);
-  }
+  params.set("view", filters.viewMode);
   if (filters.activeTiers.size !== TIER_OPTIONS.length) {
     params.set("tiers", TIER_OPTIONS.filter((tier) => filters.activeTiers.has(tier)).join(","));
   }
@@ -3024,6 +3895,51 @@ function readAreaSet(value: string | null): Set<AreaFilter> {
   );
 }
 
+function matchesMobileViewport(): boolean {
+  return window.matchMedia?.(MOBILE_VIEW_MEDIA_QUERY).matches ?? false;
+}
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia?.(query).matches ?? false);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia(query);
+    const update = (): void => setMatches(mediaQuery.matches);
+    update();
+    mediaQuery.addEventListener("change", update);
+    return () => mediaQuery.removeEventListener("change", update);
+  }, [query]);
+
+  return matches;
+}
+
+function getViewStorageKey(kind: "ddl" | "application", mobile: boolean): string {
+  if (kind === "application") {
+    return mobile ? APPLICATION_VIEW_MOBILE_STORAGE_KEY : APPLICATION_VIEW_DESKTOP_STORAGE_KEY;
+  }
+  return mobile ? DDL_VIEW_MOBILE_STORAGE_KEY : DDL_VIEW_DESKTOP_STORAGE_KEY;
+}
+
+function readStoredViewMode(kind: "ddl" | "application", mobile: boolean): ViewMode {
+  try {
+    const value = window.localStorage.getItem(getViewStorageKey(kind, mobile));
+    if (value === "cards" || value === "table") {
+      return value;
+    }
+  } catch {
+    // Use the responsive default when browser storage is unavailable.
+  }
+  return mobile ? "cards" : "table";
+}
+
+function persistViewMode(kind: "ddl" | "application", mobile: boolean, value: ViewMode): void {
+  try {
+    window.localStorage.setItem(getViewStorageKey(kind, mobile), value);
+  } catch {
+    // The in-memory view selection still works for this session.
+  }
+}
+
 function getItemAreas(item: DdlItem): AreaFilter[] {
   const areas = (Array.isArray(item.areas) ? item.areas : []).filter((area): area is AreaFilter =>
     AREA_OPTIONS.includes(area as AreaFilter)
@@ -3042,7 +3958,11 @@ function useStoredKeySet(key: string): [Set<string>, (value: string) => void] {
   });
 
   useEffect(() => {
-    window.localStorage.setItem(key, JSON.stringify([...values]));
+    try {
+      window.localStorage.setItem(key, JSON.stringify([...values]));
+    } catch {
+      // Keep the in-memory state when browser storage is unavailable.
+    }
   }, [key, values]);
 
   function toggle(value: string): void {
@@ -3062,26 +3982,74 @@ function useStoredKeySet(key: string): [Set<string>, (value: string) => void] {
 
 function useApplicationTracker(): [
   ApplicationTrackerData,
-  React.Dispatch<React.SetStateAction<ApplicationTrackerData>>
+  React.Dispatch<React.SetStateAction<ApplicationTrackerData>>,
+  ApplicationStorageIssue | null,
+  () => void
 ] {
-  const [data, setData] = useState<ApplicationTrackerData>(() => {
+  const [initialState] = useState((): {
+    data: ApplicationTrackerData;
+    issue: ApplicationStorageIssue | null;
+  } => {
+    let raw = "";
     try {
-      const raw = window.localStorage.getItem(APPLICATION_TRACKER_STORAGE_KEY);
-      return raw === null ? createEmptyTrackerData() : normalizeTrackerData(JSON.parse(raw));
-    } catch {
-      return createEmptyTrackerData();
+      raw = window.localStorage.getItem(APPLICATION_TRACKER_STORAGE_KEY) ?? "";
+      if (raw === "") {
+        return { data: createEmptyTrackerData(), issue: null };
+      }
+      const parsed = JSON.parse(raw) as unknown;
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        !("schema" in parsed) ||
+        parsed.schema !== APPLICATION_TRACKER_SCHEMA ||
+        !("records" in parsed) ||
+        !Array.isArray(parsed.records)
+      ) {
+        throw new Error("数据格式或版本不受支持");
+      }
+      return { data: normalizeTrackerData(parsed), issue: null };
+    } catch (error) {
+      return {
+        data: createEmptyTrackerData(),
+        issue: {
+          message: error instanceof Error ? error.message : "本地数据解析失败",
+          rawValue: raw
+        }
+      };
     }
   });
+  const [data, setData] = useState<ApplicationTrackerData>(initialState.data);
+  const [storageIssue, setStorageIssue] = useState<ApplicationStorageIssue | null>(initialState.issue);
 
   useEffect(() => {
+    if (storageIssue !== null) {
+      return;
+    }
     try {
       window.localStorage.setItem(APPLICATION_TRACKER_STORAGE_KEY, JSON.stringify(data));
-    } catch {
-      // Keep the in-memory copy even if the browser refuses storage.
+    } catch (error) {
+      setStorageIssue({
+        message: error instanceof Error ? error.message : "浏览器拒绝写入本地数据",
+        rawValue: JSON.stringify(data)
+      });
     }
-  }, [data]);
+  }, [data, storageIssue]);
 
-  return [data, setData];
+  function resetStorage(): void {
+    const empty = createEmptyTrackerData();
+    try {
+      window.localStorage.setItem(APPLICATION_TRACKER_STORAGE_KEY, JSON.stringify(empty));
+      setData(empty);
+      setStorageIssue(null);
+    } catch (error) {
+      setStorageIssue({
+        message: error instanceof Error ? error.message : "浏览器拒绝重置本地数据",
+        rawValue: storageIssue?.rawValue ?? ""
+      });
+    }
+  }
+
+  return [data, setData, storageIssue, resetStorage];
 }
 
 function readStoredApplicationData(): ApplicationTrackerData {

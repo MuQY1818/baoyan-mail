@@ -1,6 +1,7 @@
 export interface Env {
   DB: D1Database;
   BAOYANXINXI_SOURCE_URL?: string;
+  BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_URL?: string;
   APP_BASE_URL?: string;
   MAIL_PROVIDER?: string;
   SENDER_NAME?: string;
@@ -16,6 +17,31 @@ export interface Env {
 
 export type SubscriberStatus = "pending" | "active" | "unsubscribed";
 export type Relevance = "strong" | "possible" | "unrelated";
+export type ActivityType = "summer_camp" | "pre_recommendation" | "unknown";
+export type ActivityTypeSource =
+  | "source"
+  | "source_group"
+  | "text"
+  | "classification"
+  | "unknown";
+
+export interface ItemActivityTypeClassification {
+  normalizedUrl: string;
+  activityType: ActivityType;
+  reason: string;
+  classifier: string;
+  classifiedAt: string;
+}
+
+export interface ItemActivityTypeClassificationRow {
+  normalized_url: string;
+  activity_type: ActivityType;
+  reason: string;
+  classifier: string;
+  classified_at: string;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface ItemRelevanceClassification {
   normalizedUrl: string;
@@ -59,6 +85,11 @@ export interface NormalizedItem {
   deadline: string;
   website: string;
   tags: string[];
+  activityType?: ActivityType;
+  activityTypeSource?: ActivityTypeSource;
+  activityTypeReason?: string;
+  activityTypeClassifier?: string;
+  activityTypeClassifiedAt?: string;
   areas?: string[];
   relevance?: Relevance;
   relevanceReason?: string;
@@ -113,6 +144,7 @@ export interface SourceStats {
   reviewCandidateCount?: number;
   duplicateCount: number;
   supplementedDeadlineCount: number;
+  activityType?: ActivityType;
   error?: string;
 }
 
@@ -135,6 +167,7 @@ export interface RunCheckResult {
   staleHiddenCount: number;
   lastSyncedAt: string;
   sourceStats?: SourceStats[];
+  activityTypeCounts?: Record<ActivityType, number>;
 }
 
 export interface VisitDailyStatRow {

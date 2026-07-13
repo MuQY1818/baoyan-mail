@@ -8,6 +8,7 @@ import {
   createEmptyTrackerData,
   getApplicationRecord,
   hydrateApplicationRecordLinks,
+  normalizeTrackerData,
   parseApplicationPatch,
   previewApplicationPatch,
   updateApplicationRecord
@@ -27,7 +28,10 @@ const SOURCE_ITEM = {
 
 describe("application tracker", () => {
   it("creates a local application record from a DDL item", () => {
-    const record = createApplicationRecord(SOURCE_ITEM, "2026-06-27T00:00:00.000Z");
+    const record = createApplicationRecord(
+      { ...SOURCE_ITEM, activityType: "pre_recommendation" },
+      "2026-06-27T00:00:00.000Z"
+    );
 
     expect(record.sourceDdlKey).toBe("ddl-1");
     expect(record.school).toBe("测试大学");
@@ -36,6 +40,21 @@ describe("application tracker", () => {
     expect(record.result).toBe("pending");
     expect(record.materials.map((material) => material.label)).toContain("成绩单");
     expect(record.events[0]?.type).toBe("deadline");
+    expect(record.activityType).toBe("pre_recommendation");
+  });
+
+  it("backfills unknown project type for legacy local records", () => {
+    const data = normalizeTrackerData({
+      schema: "baoyan-application-tracker/v1",
+      records: [
+        {
+          ...createApplicationRecord(SOURCE_ITEM),
+          activityType: undefined
+        }
+      ]
+    });
+
+    expect(data.records[0]?.activityType).toBe("unknown");
   });
 
   it("deduplicates records by id and source DDL key", () => {

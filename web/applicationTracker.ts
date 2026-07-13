@@ -17,6 +17,7 @@ export type ApplicationPriority = "rush" | "target" | "safe";
 export type ApplicationResult = "pending" | "accepted" | "waitlisted" | "rejected" | "withdrawn";
 export type MaterialStatus = "todo" | "done" | "not_required";
 export type ApplicationEventType = "deadline" | "interview" | "camp" | "result" | "material" | "other";
+export type ActivityType = "summer_camp" | "pre_recommendation" | "unknown";
 
 export interface ApplicationMaterial {
   id: string;
@@ -42,6 +43,7 @@ export interface ApplicationRecord {
   deadlineText: string;
   tier: string;
   areas: string[];
+  activityType: ActivityType;
   relevance: string;
   status: ApplicationStatus;
   priority: ApplicationPriority;
@@ -68,6 +70,7 @@ export interface DdlApplicationSource {
   deadlineText: string;
   tier: string;
   areas?: string[];
+  activityType?: ActivityType;
   relevance: string;
 }
 
@@ -120,6 +123,7 @@ const STATUS_VALUES: ApplicationStatus[] = [
 const PRIORITY_VALUES: ApplicationPriority[] = ["rush", "target", "safe"];
 const RESULT_VALUES: ApplicationResult[] = ["pending", "accepted", "waitlisted", "rejected", "withdrawn"];
 const MATERIAL_STATUS_VALUES: MaterialStatus[] = ["todo", "done", "not_required"];
+const ACTIVITY_TYPE_VALUES: ActivityType[] = ["summer_camp", "pre_recommendation", "unknown"];
 const EVENT_TYPE_VALUES: ApplicationEventType[] = [
   "deadline",
   "interview",
@@ -165,6 +169,7 @@ export function createApplicationRecord(
     deadlineText: item.deadlineText,
     tier: item.tier,
     areas: Array.isArray(item.areas) ? item.areas.filter((area) => area.trim() !== "") : [],
+    activityType: readActivityType(item.activityType),
     relevance: item.relevance,
     status: "watching",
     priority: "target",
@@ -453,6 +458,7 @@ function normalizeApplicationRecord(value: unknown): ApplicationRecord {
     deadlineText: readString(record.deadlineText),
     tier: readString(record.tier) || "其他",
     areas: Array.isArray(record.areas) ? record.areas.map(readString).filter((entry) => entry !== "") : [],
+    activityType: readActivityType(record.activityType),
     relevance: readString(record.relevance) || "strong",
     status: readEnum(record.status, STATUS_VALUES, "status", "watching"),
     priority: readEnum(record.priority, PRIORITY_VALUES, "priority", "target"),
@@ -505,6 +511,9 @@ function sanitizeUpdateValues(values: Partial<ApplicationRecord>): Partial<Appli
   if (values.website !== undefined) next.website = readString(values.website);
   if (values.deadlineAt !== undefined) next.deadlineAt = readString(values.deadlineAt);
   if (values.deadlineText !== undefined) next.deadlineText = readString(values.deadlineText);
+  if (values.activityType !== undefined) {
+    next.activityType = readActivityType(values.activityType);
+  }
   if (values.status !== undefined) next.status = readEnum(values.status, STATUS_VALUES, "status");
   if (values.priority !== undefined) next.priority = readEnum(values.priority, PRIORITY_VALUES, "priority");
   if (values.result !== undefined) next.result = readEnum(values.result, RESULT_VALUES, "result");
@@ -512,6 +521,10 @@ function sanitizeUpdateValues(values: Partial<ApplicationRecord>): Partial<Appli
   if (values.materials !== undefined) next.materials = normalizeMaterials(values.materials);
   if (values.events !== undefined) next.events = normalizeEvents(values.events);
   return next;
+}
+
+function readActivityType(value: unknown): ActivityType {
+  return readEnum(value, ACTIVITY_TYPE_VALUES, "activityType", "unknown");
 }
 
 interface ApplicationLinkIndex {

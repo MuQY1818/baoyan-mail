@@ -46,8 +46,18 @@
 - 2026-06-29：公开 DDL API 增加 `includeExpired=1` 归档查询参数，前端用归档快照自动回填旧本地申请记录缺失的官方通知链接。
 - 2026-06-29：优化 DDL 网站本地申请补链逻辑，对旧记录中的夏令营、开放日、学术探索营等活动后缀做规范化匹配，补齐北大深研院、南科大、武汉大学、中山大学和机构类公告等历史申请的官方链接，并增加防误补回归测试。
 - 2026-06-30：强化 DDL 相关度规则兜底，`信息学院`、`信院`、`鹏城国家实验室` 等明确信息技术方向会从 AI 的 `possible` 提升为 `strong`；同步更新每日 `ddl-ai` 自动化分类提示，并修正人大信息学院、鹏城国家实验室两条生产存量分类。
+- 2026-07-01：收窄 DDL 相关度规则兜底，学校名中的电子类关键词和 `智能制造` 不再自动覆盖 AI 分类为 `strong`，避免电子科技大学基础与前沿研究院、港科广智能制造等条目被 `rule-guard` 误提升；保留电子工程、电子信息等明确院系强相关兜底。
+- 2026-07-05：关闭 DDL 邮件推送，`runCheck` 默认只同步源站和公开 DDL 数据，Cloudflare 09:00 Cron 与管理员 `run-check` 均不再写入或发送 DDL 邮件；订阅和确认入口返回停用提示，退订入口保留。
+- 2026-07-06：将 Cloudflare 源站同步 Cron 从每天北京时间 09:00 调整为每天 08:00-23:00 每小时整点运行，降低保研信息平台白天新增通知在网站上的延迟；邮件推送仍保持关闭。
+- 2026-07-13：按官方页面证据首次回填生产项目类型分类，公开 API 已区分夏令营、预推免和未标注；反爬、空页面或证据不足条目保留给每日自动化重试。
+- 2026-07-13：DDL 时间线增加顶部横向滚动条并与内容轨道双向同步，隐藏原底部滚动条；内容不溢出时自动收起顶部滚动区域。
+- 2026-07-13：将顶部横向滚动条版本部署到 Vercel 生产环境，`csddl.muqyy.top` 已指向 READY 部署，并验证首页和 `/api/ddl` 均返回 200。
+- 2026-07-13：DDL 网站新增夏令营、预推免、未标注项目类型模型，支持独立预推免源配置、项目类型筛选、统计和 URL 分享；旧快照与本地申请记录自动回退为未标注，不按截止月份猜测项目类型，同时重组前端筛选区以降低信息密度。
+- 2026-07-13：修正保研信息平台页面级“夏令营”标签导致预推免条目被整页误标的问题，将 `2026jsjby` 改为混合类型源；新增 D1 官方标题项目类型分类表和管理员批量写入接口，公开 API 优先使用持久化分类，无法核验的条目保持“未标注”。
+- 2026-07-13：DDL 网站完成工作台式体验重构，搜索和高频筛选前置，桌面默认表格、手机默认卡片并分别记忆；新增 sticky 顶栏、手机底部导航、筛选 URL 状态、紧凑时间线和按需展开访问地图。申请管理改为带草稿保存与未保存确认的桌面右抽屉/手机全屏层，保留本地存储和 Agent CRUD，并增加异常 localStorage 原始数据恢复入口。
 
 ## 部署经验
 
 - Vercel 部署若长时间显示 `Building`，但 `vercel inspect --format=json` 里 `readyState` 是 `BLOCKED`，先看 `readyStateReason`。本项目曾因 Git author 为 `muqy1818@users.noreply.github.com` 被 Vercel Team Access 拦截，提示该 author 没有团队部署权限；解决方法是把提交 author/committer 改为 Vercel 认可的 `2565324759@qq.com`，再重新 `vercel build --prod && vercel deploy --prebuilt --prod --yes`。
 - 使用 `/tmp` 临时 Wrangler 配置部署 Worker 时，`main` 和 `migrations_dir` 要写绝对路径；Wrangler 会按配置文件所在目录解析相对路径，`main = "src/index.ts"` 在 `/tmp/*.toml` 中会被解析成 `/tmp/src/index.ts`。
+- Vercel `deploy --prebuilt` 如果在上传单个较大静态文件后长时间无响应，`--debug` 显示 `POST /v2/files` 返回非 JSON 的 `Internal Server Error`，应分别测试 `api.vercel.com` 直连和代理。当前环境中鉴权请求可走代理，但 1.8 MB 文件上传会被代理中断；取消 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NODE_USE_ENV_PROXY` 后直连执行 `vercel deploy --prebuilt --prod --yes` 可以正常完成。

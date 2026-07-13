@@ -1,10 +1,14 @@
 import {
   canonicalizeNotificationUrl,
   classifyBaoyanXinxiRecord,
+  getActivityTypeDetails,
   getBaoyanXinxiAreas,
   getSchoolTierTags
 } from "./source";
 import type {
+  ActivityType,
+  ActivityTypeSource,
+  ItemActivityTypeClassification,
   ItemRelevanceClassification,
   ItemSnapshotRow,
   NormalizedItem,
@@ -41,6 +45,12 @@ export interface DdlApiItem {
   relevanceClassifiedAt: string | null;
   sourceGroup: string;
   sourceLabel: string;
+  activityType: ActivityType;
+  activityTypeLabel: string;
+  activityTypeSource: ActivityTypeSource;
+  activityTypeReason: string | null;
+  activityTypeClassifier: string;
+  activityTypeClassifiedAt: string | null;
   website: string;
   firstSeenAt: string | null;
   updatedAt: string | null;
@@ -72,6 +82,7 @@ export interface DdlApiResponse {
 
 export interface BuildDdlResponseOptions {
   includeExpired?: boolean;
+  activityTypeClassifications?: Map<string, ItemActivityTypeClassification>;
 }
 
 export function buildDdlResponse(
@@ -81,7 +92,10 @@ export function buildDdlResponse(
   classifications: Map<string, ItemRelevanceClassification> = new Map(),
   options: BuildDdlResponseOptions = {}
 ): DdlApiResponse {
-  const contexts = entries.map((entry) => toDdlContext(entry, classifications));
+  const activityTypeClassifications = options.activityTypeClassifications ?? new Map();
+  const contexts = entries.map((entry) =>
+    toDdlContext(entry, classifications, activityTypeClassifications)
+  );
   const serializedItems = contexts
     .map((context) => serializeDdlItem(context, now))
     .filter((item): item is DdlApiItem => item !== null)
@@ -201,6 +215,7 @@ export function serializeDdlItem(
   const status = getDeadlineStatus(deadline, remainingDays, now);
   const tier = getSchoolTierTags(item.name)[0] ?? "其他";
   const relevance = getItemRelevance(item);
+  const activityTypeDetails = getActivityTypeDetails(item);
 
   return {
     key: item.key,
@@ -220,6 +235,13 @@ export function serializeDdlItem(
     relevanceClassifiedAt: item.relevanceClassifiedAt ?? null,
     sourceGroup: item.sourceGroup,
     sourceLabel: formatSourceGroup(item.sourceGroup),
+    activityType: activityTypeDetails.activityType,
+    activityTypeLabel: formatActivityType(activityTypeDetails.activityType),
+    activityTypeSource: activityTypeDetails.activityTypeSource,
+    activityTypeReason: item.activityTypeReason ?? null,
+    activityTypeClassifier:
+      item.activityTypeClassifier ?? getActivityTypeFallbackClassifier(activityTypeDetails),
+    activityTypeClassifiedAt: item.activityTypeClassifiedAt ?? null,
     website: item.website,
     firstSeenAt: context.firstSeenAt,
     updatedAt: context.updatedAt,
@@ -227,6 +249,16 @@ export function serializeDdlItem(
     missingSince: context.missingSince,
     sourceVisibility: getSourceVisibility(context.missingSince, now)
   };
+}
+
+export function formatActivityType(activityType: ActivityType): string {
+  if (activityType === "summer_camp") {
+    return "夏令营";
+  }
+  if (activityType === "pre_recommendation") {
+    return "预推免";
+  }
+  return "未标注";
 }
 
 export function getDdlEntryNormalizedUrls(entries: Array<NormalizedItem | ItemSnapshotRow>): string[] {
@@ -276,6 +308,32 @@ export function applyRelevanceClassification(
     areas: normalizeDdlAreas(item.areas ?? getBaoyanXinxiAreas(item.name, item.institute)),
     relevance: getRuleFallbackRelevance(item),
     relevanceClassifier: "rule-fallback"
+  };
+}
+
+export function applyActivityTypeClassificationsToItems(
+  items: NormalizedItem[],
+  classifications: Map<string, ItemActivityTypeClassification>
+): NormalizedItem[] {
+  return items.map((item) => applyActivityTypeClassification(item, classifications));
+}
+
+export function applyActivityTypeClassification(
+  item: NormalizedItem,
+  classifications: Map<string, ItemActivityTypeClassification>
+): NormalizedItem {
+  const normalizedUrl = canonicalizeNotificationUrl(item.website);
+  const classification = classifications.get(normalizedUrl);
+  if (classification === undefined) {
+    return item;
+  }
+  return {
+    ...item,
+    activityType: classification.activityType,
+    activityTypeSource: "classification",
+    activityTypeReason: classification.reason,
+    activityTypeClassifier: classification.classifier,
+    activityTypeClassifiedAt: classification.classifiedAt
   };
 }
 
@@ -405,12 +463,16 @@ function toUtcDayNumber(parts: { year: number; month: number; day: number }): nu
 
 function toDdlContext(
   entry: NormalizedItem | ItemSnapshotRow,
-  classifications: Map<string, ItemRelevanceClassification> = new Map()
+  classifications: Map<string, ItemRelevanceClassification> = new Map(),
+  activityTypeClassifications: Map<string, ItemActivityTypeClassification> = new Map()
 ): DdlContext {
   if ("payload" in entry) {
     const item = JSON.parse(entry.payload) as NormalizedItem;
     return {
-      item: applyRelevanceClassification(item, classifications),
+      item: applyActivityTypeClassification(
+        applyRelevanceClassification(item, classifications),
+        activityTypeClassifications
+      ),
       firstSeenAt: entry.first_seen_at,
       updatedAt: entry.updated_at,
       lastSeenAt: entry.last_seen_at,
@@ -418,12 +480,24 @@ function toDdlContext(
     };
   }
   return {
-    item: applyRelevanceClassification(entry, classifications),
+    item: applyActivityTypeClassification(
+      applyRelevanceClassification(entry, classifications),
+      activityTypeClassifications
+    ),
     firstSeenAt: null,
     updatedAt: null,
     lastSeenAt: null,
     missingSince: null
   };
+}
+
+function getActivityTypeFallbackClassifier(details: {
+  activityTypeSource: ActivityTypeSource;
+}): string {
+  if (details.activityTypeSource === "unknown") {
+    return "unclassified";
+  }
+  return details.activityTypeSource;
 }
 
 function getItemRelevance(item: NormalizedItem): Relevance {

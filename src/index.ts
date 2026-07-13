@@ -12,6 +12,6 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<void> {
-    ctx.waitUntil(runCheck(env));
+    ctx.waitUntil(runCheck(env, undefined, { sendEmails: false }));
   }
 };

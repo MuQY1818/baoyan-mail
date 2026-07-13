@@ -1,5 +1,7 @@
 import type {
   Env,
+  ItemActivityTypeClassification,
+  ItemActivityTypeClassificationRow,
   ItemRelevanceClassification,
   ItemRelevanceClassificationRow,
   ItemSnapshotRow,
@@ -322,6 +324,69 @@ export async function upsertItemRelevanceClassifications(
       entry.normalizedUrl,
       entry.relevance,
       JSON.stringify(entry.areas),
+      entry.reason,
+      entry.classifier,
+      entry.classifiedAt,
+      now,
+      now
+    )
+  );
+  const results = await runBatchInChunks(env, statements);
+  return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
+}
+
+export async function getItemActivityTypeClassifications(
+  env: Env,
+  normalizedUrls: string[]
+): Promise<Map<string, ItemActivityTypeClassification>> {
+  const uniqueUrls = Array.from(new Set(normalizedUrls.filter((url) => url !== "")));
+  const rows: ItemActivityTypeClassificationRow[] = [];
+  for (let index = 0; index < uniqueUrls.length; index += SQL_BATCH_SIZE) {
+    const chunk = uniqueUrls.slice(index, index + SQL_BATCH_SIZE);
+    if (chunk.length === 0) {
+      continue;
+    }
+    const placeholders = chunk.map(() => "?").join(", ");
+    const result = await env.DB.prepare(
+      `SELECT * FROM item_activity_type_classifications WHERE normalized_url IN (${placeholders})`
+    )
+      .bind(...chunk)
+      .all<ItemActivityTypeClassificationRow>();
+    rows.push(...(result.results ?? []));
+  }
+  return new Map(
+    rows.map((row) => [row.normalized_url, hydrateItemActivityTypeClassification(row)])
+  );
+}
+
+export async function upsertItemActivityTypeClassifications(
+  env: Env,
+  entries: ItemActivityTypeClassification[],
+  now: string
+): Promise<number> {
+  const statements = entries.map((entry) =>
+    env.DB.prepare(
+      `
+        INSERT INTO item_activity_type_classifications (
+          normalized_url,
+          activity_type,
+          reason,
+          classifier,
+          classified_at,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(normalized_url) DO UPDATE SET
+          activity_type = excluded.activity_type,
+          reason = excluded.reason,
+          classifier = excluded.classifier,
+          classified_at = excluded.classified_at,
+          updated_at = excluded.updated_at
+      `
+    ).bind(
+      entry.normalizedUrl,
+      entry.activityType,
       entry.reason,
       entry.classifier,
       entry.classifiedAt,
@@ -666,6 +731,18 @@ function hydrateItemRelevanceClassification(
     normalizedUrl: row.normalized_url,
     relevance: row.relevance,
     areas: parseStringArray(row.areas),
+    reason: row.reason,
+    classifier: row.classifier,
+    classifiedAt: row.classified_at
+  };
+}
+
+function hydrateItemActivityTypeClassification(
+  row: ItemActivityTypeClassificationRow
+): ItemActivityTypeClassification {
+  return {
+    normalizedUrl: row.normalized_url,
+    activityType: row.activity_type,
     reason: row.reason,
     classifier: row.classifier,
     classifiedAt: row.classified_at

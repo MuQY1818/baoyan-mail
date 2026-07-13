@@ -1,8 +1,17 @@
 import { sha256Hex } from "./crypto";
-import type { Env, NormalizedItem, ReviewCandidatePayload, SourceStats } from "./types";
+import type {
+  ActivityType,
+  ActivityTypeSource,
+  Env,
+  NormalizedItem,
+  ReviewCandidatePayload,
+  SourceStats
+} from "./types";
 
 const DEFAULT_BAOYANXINXI_SOURCE_URL = "https://www.baoyanxinxi.cn/2026jsjby/";
 export const BAOYANXINXI_SOURCE_GROUP = "baoyanxinxi2026jsjby";
+export const BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_GROUP =
+  "baoyanxinxi2026yutuimian";
 export const MANUAL_SOURCE_GROUP = "manual";
 const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const SHANGHAI_YEAR_FORMATTER = new Intl.DateTimeFormat("en-CA", {
@@ -39,7 +48,7 @@ const HUAWU_SCHOOLS = ["复旦大学", "上海交通大学", "南京大学", "�
 const INCLUDE_PATTERNS = [
   /计算机/u,
   /软件/u,
-  /人工智能|智能科学|智能学部|智能工程|智能制造|智能产业/u,
+  /人工智能|智能科学|智能学部|智能工程|智能产业/u,
   /网络空间安全|网安|信息安全|密码/u,
   /信息学院|信院|信息工程|信息科学|信息与电子|电子与信息|电子与通信|电子信息|电子工程|电子学院|电子科学|信息光电子|交叉信息|数据与信息/u,
   /通信|信息与通信|信通/u,
@@ -53,10 +62,7 @@ const INCLUDE_PATTERNS = [
 ];
 
 const SCHOOL_INCLUDE_PATTERNS = [
-  /电子科技大学/u,
   /北京邮电大学/u,
-  /西安电子科技大学/u,
-  /杭州电子科技大学/u,
   /北京信息科技大学/u
 ];
 
@@ -75,6 +81,7 @@ const EXCLUDE_PATTERNS = [
 
 const REVIEW_PATTERNS = [
   /科学智能/u,
+  /智能制造/u,
   /智能创意/u,
   /交互/u,
   /信息/u,
@@ -303,6 +310,8 @@ interface BaoyanXinxiRecord {
   institute: string;
   deadline: string;
   website: string;
+  activityType: ActivityType;
+  activityTypeSource: ActivityTypeSource;
 }
 
 interface BaoyanXinxiParseResult {
@@ -315,20 +324,37 @@ export async function fetchSourceItems(env: Env): Promise<NormalizedItem[]> {
 }
 
 export async function fetchSourceItemsWithStats(env: Env): Promise<FetchSourceItemsResult> {
-  const baoyanXinxiUrl = env.BAOYANXINXI_SOURCE_URL ?? DEFAULT_BAOYANXINXI_SOURCE_URL;
-  const baoyanXinxiResult = await fetchBaoyanXinxiItems(baoyanXinxiUrl);
-  const dedupedItems = dedupeSourceItems(baoyanXinxiResult.items);
+  const sourceDefinitions: BaoyanXinxiSourceDefinition[] = [
+    {
+      activityType: "unknown",
+      sourceGroup: BAOYANXINXI_SOURCE_GROUP,
+      url: env.BAOYANXINXI_SOURCE_URL ?? DEFAULT_BAOYANXINXI_SOURCE_URL
+    }
+  ];
+  const preRecommendationUrl = env.BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_URL?.trim();
+  if (preRecommendationUrl !== undefined && preRecommendationUrl !== "") {
+    sourceDefinitions.push({
+      activityType: "pre_recommendation",
+      sourceGroup: BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_GROUP,
+      url: preRecommendationUrl
+    });
+  }
+
+  const sourceResults = await Promise.all(
+    sourceDefinitions.map((definition) => fetchBaoyanXinxiItems(definition))
+  );
+  const allItems = sourceResults.flatMap((result) => result.items);
+  const dedupedItems = dedupeSourceItems(allItems);
   const finalized = await finalizeSourceItems(dedupedItems.items);
 
   return {
     items: finalized.items,
-    stats: [
-      {
-        ...baoyanXinxiResult.stats,
-        duplicateCount: baoyanXinxiResult.stats.duplicateCount + dedupedItems.duplicateCount
-      }
-    ],
-    reviewCandidates: baoyanXinxiResult.reviewCandidates
+    stats: sourceResults.map((result, index) => ({
+      ...result.stats,
+      duplicateCount:
+        result.stats.duplicateCount + (index === 0 ? dedupedItems.duplicateCount : 0)
+    })),
+    reviewCandidates: sourceResults.flatMap((result) => result.reviewCandidates)
   };
 }
 
@@ -339,21 +365,26 @@ export async function normalizeSourceData(data: unknown): Promise<NormalizedItem
 
 export function normalizeBaoyanXinxiHtml(
   html: string,
-  sourceUrl = DEFAULT_BAOYANXINXI_SOURCE_URL
+  sourceUrl = DEFAULT_BAOYANXINXI_SOURCE_URL,
+  options: BaoyanXinxiSourceOptions = {}
 ): { items: SourceItemInput[]; stats: SourceStats; reviewCandidates: SourceReviewCandidateInput[] } {
-  const parsed = parseBaoyanXinxiHtml(html, sourceUrl);
+  const sourceGroup = options.sourceGroup ?? BAOYANXINXI_SOURCE_GROUP;
+  const defaultActivityType = options.activityType ?? "unknown";
+  const parsed = parseBaoyanXinxiHtml(html, sourceUrl, sourceGroup, defaultActivityType);
   const items: SourceItemInput[] = [];
 
   for (const record of parsed.records) {
     const deadline = normalizeBaoyanXinxiDeadline(record.deadline);
     items.push({
-      sourceGroup: BAOYANXINXI_SOURCE_GROUP,
+      sourceGroup,
       name: record.name,
       institute: record.institute,
       description: "保研信息平台补充源",
       deadline,
       website: record.website,
       tags: getSchoolTierTags(record.name),
+      activityType: record.activityType,
+      activityTypeSource: record.activityTypeSource,
       areas: getBaoyanXinxiAreas(record.name, record.institute)
     });
   }
@@ -361,14 +392,15 @@ export function normalizeBaoyanXinxiHtml(
   return {
     items,
     stats: {
-      sourceGroup: BAOYANXINXI_SOURCE_GROUP,
+      sourceGroup,
       url: sourceUrl,
       rawCount: parsed.rawCount,
       acceptedCount: items.length,
       filteredCount: parsed.rawCount - items.length,
       reviewCandidateCount: 0,
       duplicateCount: 0,
-      supplementedDeadlineCount: 0
+      supplementedDeadlineCount: 0,
+      activityType: defaultActivityType
     },
     reviewCandidates: []
   };
@@ -410,6 +442,71 @@ export function isBaoyanXinxiRelevant(name: string, institute: string): boolean 
   return classifyBaoyanXinxiRecord(name, institute) === "accepted";
 }
 
+export interface ActivityTypeDetails {
+  activityType: ActivityType;
+  activityTypeSource: ActivityTypeSource;
+}
+
+export interface BaoyanXinxiSourceOptions {
+  activityType?: ActivityType;
+  sourceGroup?: string;
+}
+
+interface BaoyanXinxiSourceDefinition {
+  activityType: ActivityType;
+  sourceGroup: string;
+  url: string;
+}
+
+export function getActivityTypeDetails(
+  item: Pick<NormalizedItem, "activityType" | "activityTypeSource" | "sourceGroup" | "description" | "institute">
+): ActivityTypeDetails {
+  if (item.activityType !== undefined) {
+    return {
+      activityType: item.activityType,
+      activityTypeSource: item.activityTypeSource ?? "unknown"
+    };
+  }
+
+  const sourceGroupDetails = getActivityTypeFromSourceGroup(item.sourceGroup);
+  if (sourceGroupDetails.activityType !== "unknown") {
+    return sourceGroupDetails;
+  }
+
+  return getActivityTypeFromText(`${item.institute} ${item.description}`);
+}
+
+export function getActivityTypeFromSourceGroup(sourceGroup: string): ActivityTypeDetails {
+  if (/^(camp|summer)[-_]?\d{4}$/u.test(sourceGroup)) {
+    return { activityType: "summer_camp", activityTypeSource: "source_group" };
+  }
+  if (/^(yutuimian|pre[-_]?recommendation)[-_]?\d{4}$/u.test(sourceGroup)) {
+    return { activityType: "pre_recommendation", activityTypeSource: "source_group" };
+  }
+  if (sourceGroup === BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_GROUP) {
+    return { activityType: "pre_recommendation", activityTypeSource: "source_group" };
+  }
+  return { activityType: "unknown", activityTypeSource: "unknown" };
+}
+
+export function getActivityTypeFromText(value: string): ActivityTypeDetails {
+  const hasPreRecommendation =
+    /预推免|预免推|九推|推荐免试|免试攻读研究生|推免生接收|推免研究生|推免面试/u.test(
+      value
+    );
+  const hasSummerCamp =
+    /夏令营|暑期学校|暑期开放营|夏季学校|暑期研学营|暑期创新训练班|学术交流营|校园开放日|科学营|研修班/u.test(
+      value
+    );
+  if (hasPreRecommendation) {
+    return { activityType: "pre_recommendation", activityTypeSource: "text" };
+  }
+  if (hasSummerCamp) {
+    return { activityType: "summer_camp", activityTypeSource: "text" };
+  }
+  return { activityType: "unknown", activityTypeSource: "unknown" };
+}
+
 export function classifyBaoyanXinxiRecord(
   name: string,
   institute: string
@@ -419,11 +516,14 @@ export function classifyBaoyanXinxiRecord(
     INCLUDE_PATTERNS.some((pattern) => pattern.test(text)) ||
     SCHOOL_INCLUDE_PATTERNS.some((pattern) => pattern.test(name));
   const hasExcludeMatch = EXCLUDE_PATTERNS.some((pattern) => pattern.test(text));
+  const reviewText = `${institute} ${
+    /中国电子科技集团|信息支援部队/u.test(name) ? name : ""
+  }`;
 
   if (hasIncludeMatch && !hasExcludeMatch) {
     return "accepted";
   }
-  if (REVIEW_PATTERNS.some((pattern) => pattern.test(text))) {
+  if (REVIEW_PATTERNS.some((pattern) => pattern.test(reviewText))) {
     return "review";
   }
   return "rejected";
@@ -520,6 +620,9 @@ export function stableStringify(value: unknown): string {
 export async function createManualItemFromReviewPayload(
   payload: ReviewCandidatePayload
 ): Promise<NormalizedItem> {
+  const activityTypeDetails = getActivityTypeFromText(
+    `${payload.institute} ${payload.description}`
+  );
   const itemInput: SourceItemInput = {
     sourceGroup: MANUAL_SOURCE_GROUP,
     name: payload.name.trim(),
@@ -527,7 +630,9 @@ export async function createManualItemFromReviewPayload(
     description: payload.description.trim(),
     deadline: payload.deadline.trim(),
     website: payload.website.trim(),
-    tags: getSchoolTierTags(payload.name)
+    tags: getSchoolTierTags(payload.name),
+    activityType: activityTypeDetails.activityType,
+    activityTypeSource: activityTypeDetails.activityTypeSource
   };
   const key = await sha256Hex(
     stableStringify({
@@ -545,14 +650,14 @@ export async function createManualItemFromReviewPayload(
 }
 
 async function fetchBaoyanXinxiItems(
-  sourceUrl: string
+  definition: BaoyanXinxiSourceDefinition
 ): Promise<{
   items: SourceItemInput[];
   stats: SourceStats;
   reviewCandidates: SourceReviewCandidateInput[];
 }> {
   try {
-    const response = await fetch(sourceUrl, {
+    const response = await fetch(definition.url, {
       headers: {
         "User-Agent": "baoyan-mail-worker"
       }
@@ -560,20 +665,24 @@ async function fetchBaoyanXinxiItems(
     if (!response.ok) {
       throw new Error(`${response.status} ${response.statusText}`);
     }
-    return normalizeBaoyanXinxiHtml(await response.text(), sourceUrl);
+    return normalizeBaoyanXinxiHtml(await response.text(), definition.url, {
+      activityType: definition.activityType,
+      sourceGroup: definition.sourceGroup
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
       items: [],
       stats: {
-        sourceGroup: BAOYANXINXI_SOURCE_GROUP,
-        url: sourceUrl,
+        sourceGroup: definition.sourceGroup,
+        url: definition.url,
         rawCount: 0,
         acceptedCount: 0,
         filteredCount: 0,
         reviewCandidateCount: 0,
         duplicateCount: 0,
         supplementedDeadlineCount: 0,
+        activityType: definition.activityType,
         error: `拉取补充源失败：${message}`
       },
       reviewCandidates: []
@@ -767,6 +876,13 @@ function normalizeRecord(sourceGroup: string, record: RawSchoolRecord): SourceIt
     return null;
   }
 
+  const textDetails = getActivityTypeFromText(
+    `${name} ${institute} ${toCleanString(record.description)}`
+  );
+  const sourceDetails = getActivityTypeFromSourceGroup(sourceGroup);
+  const activityTypeDetails =
+    textDetails.activityTypeSource === "text" ? textDetails : sourceDetails;
+
   return {
     sourceGroup,
     name,
@@ -774,13 +890,20 @@ function normalizeRecord(sourceGroup: string, record: RawSchoolRecord): SourceIt
     description: toCleanString(record.description),
     deadline: toCleanString(record.deadline),
     website: toCleanString(record.website),
+    activityType: activityTypeDetails.activityType,
+    activityTypeSource: activityTypeDetails.activityTypeSource,
     tags: Array.isArray(record.tags)
       ? sanitizeDisplayTags(record.tags.map(toCleanString).filter((tag) => tag !== ""))
       : []
   };
 }
 
-function parseBaoyanXinxiHtml(html: string, sourceUrl: string): BaoyanXinxiParseResult {
+function parseBaoyanXinxiHtml(
+  html: string,
+  sourceUrl: string,
+  sourceGroup: string,
+  defaultActivityType: ActivityType
+): BaoyanXinxiParseResult {
   const records: BaoyanXinxiRecord[] = [];
   let rawCount = 0;
   const sectionPattern = /<h2\b[^>]*>[\s\S]*?<\/h2>[\s\S]*?(?=<h2\b|$)/giu;
@@ -808,12 +931,36 @@ function parseBaoyanXinxiHtml(html: string, sourceUrl: string): BaoyanXinxiParse
         name,
         institute,
         deadline: extractDeadline(paragraph),
-        website: resolveRecordUrl(href, sourceUrl)
+        website: resolveRecordUrl(href, sourceUrl),
+        ...resolveBaoyanXinxiActivityType(
+          `${paragraph} ${institute}`,
+          sourceGroup,
+          defaultActivityType
+        )
       });
     }
   }
 
   return { rawCount, records };
+}
+
+function resolveBaoyanXinxiActivityType(
+  text: string,
+  sourceGroup: string,
+  defaultActivityType: ActivityType
+): Pick<BaoyanXinxiRecord, "activityType" | "activityTypeSource"> {
+  const textDetails = getActivityTypeFromText(text);
+  if (textDetails.activityTypeSource === "text") {
+    return textDetails;
+  }
+  const sourceGroupDetails = getActivityTypeFromSourceGroup(sourceGroup);
+  if (sourceGroupDetails.activityType !== "unknown") {
+    return sourceGroupDetails;
+  }
+  return {
+    activityType: defaultActivityType,
+    activityTypeSource: defaultActivityType === "unknown" ? "unknown" : "source"
+  };
 }
 
 function extractDeadline(html: string): string {

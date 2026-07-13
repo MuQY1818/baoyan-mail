@@ -1,8 +1,7 @@
 import {
   approveReviewCandidate,
-  confirmSubscriberByToken,
-  findSubscriberByEmail,
   getAppState,
+  getItemActivityTypeClassifications,
   getItemRelevanceClassifications,
   getPendingReviewCandidates,
   getReviewCandidateById,
@@ -12,14 +11,13 @@ import {
   insertReviewRule,
   rejectReviewCandidate,
   unsubscribeByToken,
+  upsertItemActivityTypeClassifications,
   upsertItemRelevanceClassifications,
-  upsertManualItem,
-  upsertPendingSubscriber
+  upsertManualItem
 } from "./db";
 import { buildDdlResponse, getDdlEntryNormalizedUrls } from "./ddl";
-import { sendConfirmationEmail } from "./email";
 import { runCheck } from "./checker";
-import { createToken, sha256Hex, tokenHash } from "./crypto";
+import { sha256Hex } from "./crypto";
 import {
   BAOYAN_AREA_OPTIONS,
   BAOYANXINXI_SOURCE_GROUP,
@@ -30,7 +28,9 @@ import {
 } from "./source";
 import { upsertReviewCandidates, upsertSnapshots } from "./db";
 import type {
+  ActivityType,
   Env,
+  ItemActivityTypeClassification,
   ItemRelevanceClassification,
   Relevance,
   ReviewCandidatePayload,
@@ -112,6 +112,9 @@ export async function handleRequest(
     if (request.method === "POST" && url.pathname === "/api/admin/relevance-classifications") {
       return await handleRelevanceClassifications(request, env);
     }
+    if (request.method === "POST" && url.pathname === "/api/admin/activity-type-classifications") {
+      return await handleActivityTypeClassifications(request, env);
+    }
     if (request.method === "GET" && url.pathname === "/api/admin/review") {
       return await handleReviewPage(request, env);
     }
@@ -138,51 +141,17 @@ export function isValidEmail(email: string): boolean {
   return EMAIL_PATTERN.test(email) && email.length <= 254;
 }
 
-async function handleSubscribe(request: Request, env: Env): Promise<Response> {
-  const email = await readEmailFromRequest(request);
-  if (!isValidEmail(email)) {
-    return htmlResponse(renderMessagePage("邮箱格式不正确", "请返回后填写有效邮箱地址。"), 400);
-  }
-
-  const existing = await findSubscriberByEmail(env, email);
-  if (existing?.status === "active") {
-    return htmlResponse(
-      renderMessagePage("订阅请求已收到", "如果该邮箱已经订阅，将继续收到后续 DDL 邮件。")
-    );
-  }
-
-  const confirmToken = createToken();
-  const unsubscribeToken = createToken();
-  const confirmTokenHash = await tokenHash(confirmToken);
-  const now = new Date().toISOString();
-  await upsertPendingSubscriber(env, email, confirmTokenHash, unsubscribeToken, now);
-
-  const baseUrl = getPublicBaseUrl(env, request);
-  const confirmUrl = `${baseUrl}/api/confirm?token=${encodeURIComponent(confirmToken)}`;
-  await sendConfirmationEmail(env, email, confirmUrl);
-
+async function handleSubscribe(_request: Request, _env: Env): Promise<Response> {
   return htmlResponse(
-    renderMessagePage("确认邮件已发送", "请查看邮箱并点击确认链接，确认后才会收到 DDL 邮件。")
+    renderMessagePage("邮件推送已关闭", "当前不再接受新的邮件订阅，请使用 DDL 网站查看最新信息。"),
+    410
   );
 }
 
-async function handleConfirm(url: URL, env: Env): Promise<Response> {
-  const token = url.searchParams.get("token");
-  if (token === null || token.trim() === "") {
-    return htmlResponse(renderMessagePage("确认链接无效", "链接缺少确认参数。"), 400);
-  }
-
-  const subscriber = await confirmSubscriberByToken(
-    env,
-    await tokenHash(token),
-    new Date().toISOString()
-  );
-  if (subscriber === null) {
-    return htmlResponse(renderMessagePage("确认链接无效", "链接可能已经使用或已经过期。"), 400);
-  }
-
+async function handleConfirm(_url: URL, _env: Env): Promise<Response> {
   return htmlResponse(
-    renderMessagePage("订阅成功", "之后会收到每日 DDL 汇总和新增 DDL 提醒。")
+    renderMessagePage("邮件推送已关闭", "确认订阅入口已经停用，请使用 DDL 网站查看最新信息。"),
+    410
   );
 }
 
@@ -209,7 +178,7 @@ async function handleManualRun(
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
 
-  const resultPromise = runCheck(env, getPublicBaseUrl(env, request));
+  const resultPromise = runCheck(env, getPublicBaseUrl(env, request), { sendEmails: false });
   ctx.waitUntil(resultPromise);
   const result = await resultPromise;
   return jsonResponse({ ok: true, result });
@@ -235,16 +204,20 @@ async function handleDdl(env: Env, url: URL): Promise<Response> {
     BAOYANXINXI_SOURCE_GROUP,
     MANUAL_SOURCE_GROUP
   ]);
-  const classifications = await getItemRelevanceClassifications(
-    env,
-    getDdlEntryNormalizedUrls(rows)
-  );
+  const normalizedUrls = getDdlEntryNormalizedUrls(rows);
+  const [classifications, activityTypeClassifications] = await Promise.all([
+    getItemRelevanceClassifications(env, normalizedUrls),
+    getItemActivityTypeClassifications(env, normalizedUrls)
+  ]);
   const response = buildDdlResponse(
     rows,
     new Date(),
     await getAppState(env, "last_synced_at"),
     classifications,
-    { includeExpired: isTruthyQueryParam(url.searchParams.get("includeExpired")) }
+    {
+      includeExpired: isTruthyQueryParam(url.searchParams.get("includeExpired")),
+      activityTypeClassifications
+    }
   );
   return jsonResponse(response, 200, {
     "cache-control": "public, max-age=300, s-maxage=900",
@@ -303,6 +276,35 @@ async function handleRelevanceClassifications(request: Request, env: Env): Promi
   const changed = await upsertItemRelevanceClassifications(
     env,
     entries as ItemRelevanceClassification[],
+    now
+  );
+  return jsonResponse({
+    ok: true,
+    accepted: entries.length,
+    changed
+  });
+}
+
+async function handleActivityTypeClassifications(request: Request, env: Env): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+
+  const body = (await request.json()) as Record<string, unknown>;
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  if (rawItems.length === 0 || rawItems.length > 500) {
+    return jsonResponse({ ok: false, error: "invalid_items" }, 400);
+  }
+
+  const now = new Date().toISOString();
+  const entries = rawItems.map((entry) => readActivityTypeClassification(entry, now));
+  if (entries.some((entry) => entry === null)) {
+    return jsonResponse({ ok: false, error: "invalid_classification" }, 400);
+  }
+
+  const changed = await upsertItemActivityTypeClassifications(
+    env,
+    entries as ItemActivityTypeClassification[],
     now
   );
   return jsonResponse({
@@ -463,18 +465,6 @@ async function readReviewPayloadFromRequest(request: Request): Promise<ReviewCan
     submittedBy: String(form.get("submittedBy") ?? ""),
     note: String(form.get("note") ?? "")
   };
-}
-
-async function readEmailFromRequest(request: Request): Promise<string> {
-  const contentType = request.headers.get("content-type") ?? "";
-  if (contentType.includes("application/json")) {
-    const body = (await request.json()) as { email?: unknown };
-    return typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
-  }
-
-  const form = await request.formData();
-  const email = form.get("email");
-  return typeof email === "string" ? email.trim().toLowerCase() : "";
 }
 
 function isAuthorizedAdmin(request: Request, env: Env): boolean {
@@ -787,17 +777,11 @@ function formatShanghaiDate(date: Date): string {
 
 function renderSubscribePage(): string {
   return renderPage(
-    "保研通知订阅",
+    "保研 DDL 数据服务",
     `
-      <p class="lead">订阅后，系统会发送未来 15 天 DDL 汇总和新增 DDL 提醒。</p>
-      <form action="/api/subscribe" method="post">
-        <label for="email">邮箱地址</label>
-        <div class="field">
-          <input id="email" name="email" type="email" autocomplete="email" required placeholder="name@example.com">
-          <button type="submit">订阅</button>
-        </div>
-      </form>
-      <p class="note">提交后需要点击确认邮件中的链接。每封通知邮件都带退订链接。</p>
+      <p class="lead">邮件推送已经关闭，当前系统只维护 DDL 查询网站和公开数据接口。</p>
+      <p><a href="https://csddl.muqyy.top/">打开 DDL 查询网站</a></p>
+      <p class="note">历史邮件的退订链接仍然有效；新的 DDL 数据会继续每天同步到网站。</p>
     `
   );
 }
@@ -807,7 +791,7 @@ function renderMessagePage(title: string, message: string): string {
     title,
     `
       <p class="lead">${escapeHtml(message)}</p>
-      <p><a href="/">返回订阅页</a></p>
+      <p><a href="/">返回首页</a></p>
     `
   );
 }
@@ -1134,8 +1118,48 @@ function readRelevanceClassification(
   };
 }
 
+function readActivityTypeClassification(
+  value: unknown,
+  now: string
+): ItemActivityTypeClassification | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const normalizedUrl = canonicalizeNotificationUrl(
+    readString(record.normalizedUrl) || readString(record.website)
+  );
+  const activityType = readString(record.activityType);
+  const reason = readString(record.reason).trim();
+  const classifier = readString(record.classifier).trim() || "codex-official-title";
+  const classifiedAt = readString(record.classifiedAt).trim() || now;
+
+  if (
+    normalizedUrl === "" ||
+    !isValidActivityType(activityType) ||
+    reason === "" ||
+    reason.length > 500 ||
+    classifier.length > 64 ||
+    Number.isNaN(new Date(classifiedAt).getTime())
+  ) {
+    return null;
+  }
+
+  return {
+    normalizedUrl,
+    activityType,
+    reason,
+    classifier,
+    classifiedAt
+  };
+}
+
 function isValidRelevance(value: string): value is Relevance {
   return value === "strong" || value === "possible" || value === "unrelated";
+}
+
+function isValidActivityType(value: string): value is ActivityType {
+  return value === "summer_camp" || value === "pre_recommendation" || value === "unknown";
 }
 
 function areValidAreas(areas: string[]): boolean {

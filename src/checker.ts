@@ -2,6 +2,7 @@ import {
   countActiveSubscribers,
   getActiveSubscribers,
   getAppState,
+  getItemActivityTypeClassifications,
   getItemRelevanceClassifications,
   getManualItems,
   getPendingNewDeadlineNotifications,
@@ -18,6 +19,7 @@ import {
   upsertSnapshots
 } from "./db";
 import {
+  applyActivityTypeClassificationsToItems,
   applyRelevanceClassificationsToItems,
   getDdlEntryNormalizedUrls
 } from "./ddl";
@@ -26,12 +28,12 @@ import {
   sendNewDeadlineNotificationEmails
 } from "./email";
 import {
-  BAOYANXINXI_SOURCE_GROUP,
   canonicalizeNotificationUrl,
   fetchSourceItemsWithStats,
   getBaoyanXinxiAreas
 } from "./source";
 import type {
+  ActivityType,
   Env,
   NewDeadlineNotificationWithItem,
   NormalizedItem,
@@ -70,18 +72,22 @@ export async function runCheck(
   baseUrl?: string,
   options: RunCheckOptions = {}
 ): Promise<RunCheckResult> {
-  const sendEmails = options.sendEmails ?? true;
+  const sendEmails = options.sendEmails ?? false;
   const now = new Date().toISOString();
   const nowDate = new Date(now);
   const today = formatShanghaiDate(nowDate);
   const sourceResult = await fetchSourceItemsWithStats(env);
   const manualItems = await getManualItems(env);
   const items = [...sourceResult.items, ...manualItems];
-  const classifications = await getItemRelevanceClassifications(
-    env,
-    getDdlEntryNormalizedUrls(items)
+  const normalizedUrls = getDdlEntryNormalizedUrls(items);
+  const [classifications, activityTypeClassifications] = await Promise.all([
+    getItemRelevanceClassifications(env, normalizedUrls),
+    getItemActivityTypeClassifications(env, normalizedUrls)
+  ]);
+  const classifiedItems = applyActivityTypeClassificationsToItems(
+    applyRelevanceClassificationsToItems(items, classifications),
+    activityTypeClassifications
   );
-  const classifiedItems = applyRelevanceClassificationsToItems(items, classifications);
   const sourceStats = sourceResult.stats.map((stats) => ({ ...stats }));
   await upsertReviewCandidates(env, sourceResult.reviewCandidates, now);
   const snapshotCount = await getSnapshotCount(env);
@@ -154,8 +160,22 @@ export async function runCheck(
     staleVisibleCount: staleCounts.visible,
     staleHiddenCount: staleCounts.hidden,
     lastSyncedAt: now,
-    sourceStats
+    sourceStats,
+    activityTypeCounts: countActivityTypes(classifiedItems)
   };
+}
+
+function countActivityTypes(items: NormalizedItem[]): Record<ActivityType, number> {
+  const counts: Record<ActivityType, number> = {
+    summer_camp: 0,
+    pre_recommendation: 0,
+    unknown: 0
+  };
+  for (const item of items) {
+    const activityType = item.activityType ?? "unknown";
+    counts[activityType] += 1;
+  }
+  return counts;
 }
 
 function getEmailRelevantItems(items: NormalizedItem[]): NormalizedItem[] {
@@ -175,27 +195,20 @@ async function markMissingForSuccessfulSources(
   now: string
 ): Promise<number> {
   const seenKeys = new Set(items.map((item) => item.key));
-  const baoyanXinxiStat = sourceStats.find(
-    (stats) => stats.sourceGroup === BAOYANXINXI_SOURCE_GROUP
+  const successfulSourceGroups = new Set(
+    sourceStats
+      .filter((stats) => stats.error === undefined && stats.rawCount > 0)
+      .map((stats) => stats.sourceGroup)
   );
-  const canMarkBaoyanXinxi =
-    baoyanXinxiStat?.error === undefined && (baoyanXinxiStat?.rawCount ?? 0) > 0;
   const refs = await getUnmissingSnapshotRefs(env);
   const missingKeys = refs
     .filter((ref) => !seenKeys.has(ref.item_key))
-    .filter((ref) => shouldMarkSourceGroupMissing(ref.source_group, canMarkBaoyanXinxi))
+    .filter(
+      (ref) =>
+        ref.source_group !== "manual" && successfulSourceGroups.has(ref.source_group)
+    )
     .map((ref) => ref.item_key);
   return markSnapshotsMissing(env, missingKeys, now);
-}
-
-function shouldMarkSourceGroupMissing(sourceGroup: string, canMarkBaoyanXinxi: boolean): boolean {
-  if (sourceGroup === "manual") {
-    return false;
-  }
-  if (sourceGroup === BAOYANXINXI_SOURCE_GROUP) {
-    return canMarkBaoyanXinxi;
-  }
-  return true;
 }
 
 function countStaleSnapshotRows(

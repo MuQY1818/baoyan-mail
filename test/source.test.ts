@@ -10,6 +10,8 @@ import {
   canonicalizeNotificationUrl,
   classifyBaoyanXinxiRecord,
   fetchSourceItemsWithStats,
+  getActivityTypeFromSourceGroup,
+  getActivityTypeFromText,
   getBaoyanXinxiAreas,
   getSchoolTierTags,
   isBaoyanXinxiRelevant,
@@ -62,6 +64,7 @@ class FakeD1Database {
   readonly itemSnapshots = new Map<string, FakeSnapshotRow>();
   readonly appState = new Map<string, string>();
   readonly relevanceClassifications = new Map<string, unknown[]>();
+  readonly activityTypeClassifications = new Map<string, unknown[]>();
   readonly newDeadlineNotifications: unknown[][] = [];
   readonly visitDailyStats = new Map<string, unknown[]>();
   readonly mailLogs: unknown[][] = [];
@@ -152,6 +155,20 @@ class FakeD1Database {
           updated_at: String(entry[7])
         })) as T[];
     }
+    if (sql.includes("FROM item_activity_type_classifications")) {
+      const urls = new Set(bindings.map(String));
+      return Array.from(this.activityTypeClassifications.entries())
+        .filter(([url]) => urls.has(url))
+        .map(([url, entry]) => ({
+          normalized_url: url,
+          activity_type: String(entry[1]),
+          reason: String(entry[2]),
+          classifier: String(entry[3]),
+          classified_at: String(entry[4]),
+          created_at: String(entry[5]),
+          updated_at: String(entry[6])
+        })) as T[];
+    }
     if (sql.includes("FROM visit_daily_stats")) {
       const sinceDate = String(bindings[0]);
       return Array.from(this.visitDailyStats.values())
@@ -214,6 +231,9 @@ class FakeD1Database {
     } else if (sql.includes("INSERT INTO item_relevance_classifications")) {
       this.relevanceClassifications.set(String(bindings[0]), bindings);
       changes = 1;
+    } else if (sql.includes("INSERT INTO item_activity_type_classifications")) {
+      this.activityTypeClassifications.set(String(bindings[0]), bindings);
+      changes = 1;
     } else if (sql.includes("INSERT INTO visit_daily_stats")) {
       const key = `${String(bindings[0])}:${String(bindings[1])}:${String(bindings[2])}`;
       const existing = this.visitDailyStats.get(key);
@@ -246,6 +266,60 @@ class FakeD1Database {
 }
 
 describe("source normalization", () => {
+  it("classifies project type only from explicit source or text evidence", () => {
+    expect(getActivityTypeFromSourceGroup("camp2026").activityType).toBe("summer_camp");
+    expect(getActivityTypeFromSourceGroup("yutuimian2026").activityType).toBe(
+      "pre_recommendation"
+    );
+    expect(getActivityTypeFromText("计算机学院预推免通知")).toMatchObject({
+      activityType: "pre_recommendation",
+      activityTypeSource: "text"
+    });
+    expect(getActivityTypeFromText("计算机学院暑期夏令营通知")).toMatchObject({
+      activityType: "summer_camp",
+      activityTypeSource: "text"
+    });
+    expect(getActivityTypeFromText("暑期开放日暨2027年预推免报名通知")).toMatchObject({
+      activityType: "pre_recommendation",
+      activityTypeSource: "text"
+    });
+    expect(getActivityTypeFromText("研究生招生预报名通知").activityType).toBe("unknown");
+    expect(getActivityTypeFromText("推免面试第一批通知").activityType).toBe(
+      "pre_recommendation"
+    );
+    expect(getActivityTypeFromSourceGroup("baoyanxinxi2026jsjby").activityType).toBe(
+      "unknown"
+    );
+    expect(getActivityTypeFromText("计算机学院 2026 招生通知").activityType).toBe("unknown");
+  });
+
+  it("uses item text instead of forcing a type for the mixed source page", () => {
+    const result = normalizeBaoyanXinxiHtml(
+      `
+        <h2 id="测试大学"><a href="#测试大学"></a>测试大学</h2>
+        <p>【报名截止：<span class="deadline" data-deadline="2026-09-01T23:59:59">Loading…</span>】<a href="https://example.com/pre">计算机学院预推免</a></p>
+      `,
+      "https://www.baoyanxinxi.cn/2026jsjby/"
+    );
+
+    expect(result.items[0]).toMatchObject({
+      activityType: "pre_recommendation",
+      activityTypeSource: "text"
+    });
+
+    const unknown = normalizeBaoyanXinxiHtml(
+      `
+        <h2 id="测试大学"><a href="#测试大学"></a>测试大学</h2>
+        <p>【报名截止：<span class="deadline" data-deadline="2026-09-01T23:59:59">Loading…</span>】<a href="https://example.com/unknown">计算机学院招生通知</a></p>
+      `,
+      "https://www.baoyanxinxi.cn/2026jsjby/"
+    );
+    expect(unknown.items[0]).toMatchObject({
+      activityType: "unknown",
+      activityTypeSource: "unknown"
+    });
+  });
+
   it("flattens grouped CS-BAOYAN records", async () => {
     const items = await normalizeSourceData({
       camp2026: [
@@ -353,13 +427,16 @@ describe("source normalization", () => {
     expect(isBaoyanXinxiRelevant("中国人民大学", "信息学院")).toBe(true);
     expect(isBaoyanXinxiRelevant("鹏城国家实验室", "鹏城国家实验室")).toBe(true);
     expect(isBaoyanXinxiRelevant("北京邮电大学", "未来学院")).toBe(true);
+    expect(isBaoyanXinxiRelevant("电子科技大学", "电子工程系")).toBe(true);
     expect(isBaoyanXinxiRelevant("复旦大学", "公共卫生学院")).toBe(false);
     expect(isBaoyanXinxiRelevant("浙江大学", "材料科学与工程学院")).toBe(false);
     expect(isBaoyanXinxiRelevant("北京大学", "光华管理学院")).toBe(false);
+    expect(isBaoyanXinxiRelevant("电子科技大学", "基础与前沿研究院")).toBe(false);
   });
 
   it("classifies borderline records but still publishes them for user-side filtering", () => {
     expect(classifyBaoyanXinxiRecord("北京大学深圳研究生院", "科学智能学院")).toBe("review");
+    expect(classifyBaoyanXinxiRecord("香港科技大学（广州）", "智能制造理学硕士项目")).toBe("review");
     const html = `
       <h2 id="北京大学深圳研究生院"><a href="#北京大学深圳研究生院"></a>北京大学深圳研究生院</h2>
       <p>【报名截止：<span class="deadline" data-deadline="2099-06-20T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/pku-smart">科学智能学院</a></p>
@@ -552,18 +629,54 @@ describe("source normalization", () => {
         DB: db as unknown as D1Database,
         BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
-      } as Env);
+      } as Env, undefined, { sendEmails: true });
       const second = await runCheck({
         DB: db as unknown as D1Database,
         BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
-      } as Env);
+      } as Env, undefined, { sendEmails: true });
 
       expect(first.dailyDeadlineDetected).toBe(1);
       expect(first.dailyDeadlineSent).toBe(1);
       expect(second.dailyDeadlineDetected).toBe(1);
       expect(second.dailyDeadlineSent).toBe(0);
       expect(db.appState.get("daily_deadline_digest_sent_date")).toBeDefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("syncs sources by default without queuing or sending DDL mail", async () => {
+    const db = new FakeD1Database();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-07T01:00:00.000Z"));
+    const html = `
+      <h2 id="南京大学"><a href="#南京大学"></a>南京大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/cs">计算机学院</a></p>
+    `;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(html, { status: 200, headers: { "content-type": "text/html" } });
+
+    try {
+      const result = await runCheck({
+        DB: db as unknown as D1Database,
+        BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
+        APP_BASE_URL: "https://example.com"
+      } as Env);
+
+      expect(result.scanned).toBe(1);
+      expect(result.dailyDeadlineDetected).toBe(1);
+      expect(result.dailyDeadlineSent).toBe(0);
+      expect(result.newDeadlineDetected).toBe(0);
+      expect(result.newDeadlineSent).toBe(0);
+      expect(result.subscriberCount).toBe(0);
+      expect(db.itemSnapshots.size).toBe(1);
+      expect(db.newDeadlineNotifications).toHaveLength(0);
+      expect(db.mailLogs).toHaveLength(0);
+      expect(db.appState.get("last_synced_at")).toBeDefined();
+      expect(db.appState.get("daily_deadline_digest_sent_date")).toBeUndefined();
     } finally {
       globalThis.fetch = originalFetch;
       vi.useRealTimers();
@@ -589,7 +702,7 @@ describe("source normalization", () => {
         DB: db as unknown as D1Database,
         BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
-      } as Env);
+      } as Env, undefined, { sendEmails: true });
 
       expect(result.scanned).toBe(2);
       expect(result.dailyDeadlineDetected).toBe(1);
@@ -650,12 +763,12 @@ describe("source normalization", () => {
         DB: db as unknown as D1Database,
         BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
-      } as Env);
+      } as Env, undefined, { sendEmails: true });
       const second = await runCheck({
         DB: db as unknown as D1Database,
         BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
-      } as Env);
+      } as Env, undefined, { sendEmails: true });
 
       expect(first.newDeadlineDetected).toBe(1);
       expect(first.newDeadlineSent).toBe(1);
@@ -687,7 +800,7 @@ describe("source normalization", () => {
         DB: db as unknown as D1Database,
         BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
-      } as Env);
+      } as Env, undefined, { sendEmails: true });
       const publicResponse = buildDdlResponse(Array.from(db.itemSnapshots.values()), new Date());
 
       expect(result.scanned).toBe(2);
@@ -733,7 +846,7 @@ describe("source normalization", () => {
         DB: db as unknown as D1Database,
         BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
         APP_BASE_URL: "https://example.com"
-      } as Env);
+      } as Env, undefined, { sendEmails: true });
       const publicResponse = buildDdlResponse(
         Array.from(db.itemSnapshots.values()),
         new Date(),
@@ -886,6 +999,77 @@ describe("source normalization", () => {
       relevance: "strong",
       areas: ["电子信息"],
       relevanceClassifier: "codex-ai+rule-guard"
+    });
+  });
+
+  it("does not promote broad electronic schools or intelligent manufacturing over AI classifications", () => {
+    const items: NormalizedItem[] = [
+      {
+        key: "uestc-frontier",
+        contentHash: "hash",
+        sourceGroup: "baoyanxinxi2026jsjby",
+        name: "电子科技大学",
+        institute: "基础与前沿研究院",
+        description: "保研信息平台补充源",
+        deadline: "2026-07-15T15:59:59.000Z",
+        website: "https://example.com/uestc-frontier",
+        tags: ["985"],
+        areas: ["其他"]
+      },
+      {
+        key: "hkust-gz-manufacturing",
+        contentHash: "hash",
+        sourceGroup: "baoyanxinxi2026jsjby",
+        name: "香港科技大学（广州）",
+        institute: "智能制造理学硕士项目",
+        description: "保研信息平台补充源",
+        deadline: "2026-07-15T15:59:59.000Z",
+        website: "https://example.com/hkust-gz-manufacturing",
+        tags: ["其他"],
+        areas: ["人工智能"]
+      }
+    ];
+    const response = buildDdlResponse(
+      items,
+      new Date("2026-07-01T04:00:00.000Z"),
+      null,
+      new Map([
+        [
+          "https://example.com/uestc-frontier",
+          {
+            normalizedUrl: "https://example.com/uestc-frontier",
+            relevance: "unrelated",
+            areas: ["其他"],
+            reason: "基础研究院未明确命中计算机类方向",
+            classifier: "codex-ai",
+            classifiedAt: "2026-07-01T00:00:00.000Z"
+          }
+        ],
+        [
+          "https://example.com/hkust-gz-manufacturing",
+          {
+            normalizedUrl: "https://example.com/hkust-gz-manufacturing",
+            relevance: "possible",
+            areas: ["人工智能"],
+            reason: "智能制造可能相关但不够明确",
+            classifier: "codex-ai",
+            classifiedAt: "2026-07-01T00:00:00.000Z"
+          }
+        ]
+      ])
+    );
+
+    expect(response.items[0]).toMatchObject({
+      school: "电子科技大学",
+      institute: "基础与前沿研究院",
+      relevance: "unrelated",
+      relevanceClassifier: "codex-ai"
+    });
+    expect(response.items[1]).toMatchObject({
+      school: "香港科技大学（广州）",
+      institute: "智能制造理学硕士项目",
+      relevance: "possible",
+      relevanceClassifier: "codex-ai"
     });
   });
 
@@ -1419,6 +1603,185 @@ describe("DDL API", () => {
     expect(db.relevanceClassifications.has("https://example.com/notice")).toBe(true);
   });
 
+  it("persists activity type classifications and exposes them through the public API", async () => {
+    const db = new FakeD1Database();
+    const context = {
+      waitUntil: () => undefined,
+      passThroughOnException: () => undefined
+    } as unknown as ExecutionContext;
+    const item: NormalizedItem = {
+      key: "mixed-source-item",
+      contentHash: "hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "测试大学",
+      institute: "计算机学院",
+      description: "保研信息平台补充源",
+      deadline: "2099-09-01T23:59:59+08:00",
+      website: "https://example.com/pre?scene=1",
+      tags: [],
+      activityType: "unknown",
+      activityTypeSource: "unknown"
+    };
+    db.itemSnapshots.set(item.key, {
+      item_key: item.key,
+      content_hash: item.contentHash,
+      payload: JSON.stringify(item),
+      source_group: item.sourceGroup,
+      first_seen_at: "2099-07-01T00:00:00.000Z",
+      updated_at: "2099-07-01T00:00:00.000Z",
+      last_seen_at: "2099-07-01T00:00:00.000Z",
+      missing_since: null
+    });
+
+    const unauthorized = await handleRequest(
+      new Request("https://example.com/api/admin/activity-type-classifications", {
+        method: "POST",
+        body: JSON.stringify({ items: [] })
+      }),
+      { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env,
+      context
+    );
+    const invalid = await handleRequest(
+      new Request("https://example.com/api/admin/activity-type-classifications", {
+        method: "POST",
+        headers: { authorization: "Bearer secret" },
+        body: JSON.stringify({
+          items: [{ website: item.website, activityType: "autumn_camp", reason: "非法类型" }]
+        })
+      }),
+      { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env,
+      context
+    );
+    const accepted = await handleRequest(
+      new Request("https://example.com/api/admin/activity-type-classifications", {
+        method: "POST",
+        headers: { authorization: "Bearer secret" },
+        body: JSON.stringify({
+          items: [
+            {
+              website: item.website,
+              activityType: "pre_recommendation",
+              reason: "官方标题明确写有推荐免试研究生预报名",
+              classifier: "codex-official-title"
+            }
+          ]
+        })
+      }),
+      { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env,
+      context
+    );
+    const publicResponse = await handleRequest(
+      new Request("https://example.com/api/ddl"),
+      { DB: db as unknown as D1Database } as Env,
+      context
+    );
+    const body = (await publicResponse.json()) as {
+      items: Array<{
+        activityType: string;
+        activityTypeSource: string;
+        activityTypeClassifier: string;
+      }>;
+    };
+
+    expect(unauthorized.status).toBe(401);
+    expect(invalid.status).toBe(400);
+    expect(accepted.status).toBe(200);
+    expect(db.activityTypeClassifications.has("https://example.com/pre")).toBe(true);
+    expect(body.items[0]).toMatchObject({
+      activityType: "pre_recommendation",
+      activityTypeSource: "classification",
+      activityTypeClassifier: "codex-official-title"
+    });
+  });
+
+  it("keeps admin run-check sync-only after DDL mail pushes are disabled", async () => {
+    const db = new FakeD1Database();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-07T01:00:00.000Z"));
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(
+        `
+          <h2 id="南京大学"><a href="#南京大学"></a>南京大学</h2>
+          <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/cs">计算机学院</a></p>
+        `,
+        { status: 200, headers: { "content-type": "text/html" } }
+      );
+    const context = {
+      waitUntil: () => undefined,
+      passThroughOnException: () => undefined
+    } as unknown as ExecutionContext;
+
+    try {
+      const response = await handleRequest(
+        new Request("https://example.com/api/admin/run-check", {
+          headers: {
+            authorization: "Bearer secret"
+          }
+        }),
+        {
+          DB: db as unknown as D1Database,
+          ADMIN_TOKEN: "secret",
+          BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
+          APP_BASE_URL: "https://example.com"
+        } as Env,
+        context
+      );
+      const body = (await response.json()) as {
+        ok: boolean;
+        result: {
+          dailyDeadlineDetected: number;
+          dailyDeadlineSent: number;
+          newDeadlineDetected: number;
+          newDeadlineSent: number;
+          lastSyncedAt: string;
+        };
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(body.result.dailyDeadlineDetected).toBe(1);
+      expect(body.result.dailyDeadlineSent).toBe(0);
+      expect(body.result.newDeadlineDetected).toBe(0);
+      expect(body.result.newDeadlineSent).toBe(0);
+      expect(body.result.lastSyncedAt).toBe("2026-06-07T01:00:00.000Z");
+      expect(db.itemSnapshots.size).toBe(1);
+      expect(db.newDeadlineNotifications).toHaveLength(0);
+      expect(db.mailLogs).toHaveLength(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns gone for disabled subscription confirmation flows", async () => {
+    const db = new FakeD1Database();
+    const context = {
+      waitUntil: () => undefined,
+      passThroughOnException: () => undefined
+    } as unknown as ExecutionContext;
+    const env = { DB: db as unknown as D1Database } as Env;
+
+    const subscribe = await handleRequest(
+      new Request("https://example.com/api/subscribe", {
+        method: "POST",
+        body: new FormData()
+      }),
+      env,
+      context
+    );
+    const confirm = await handleRequest(
+      new Request("https://example.com/api/confirm?token=test"),
+      env,
+      context
+    );
+
+    expect(subscribe.status).toBe(410);
+    expect(confirm.status).toBe(410);
+    expect(await subscribe.text()).toContain("邮件推送已关闭");
+    expect(await confirm.text()).toContain("邮件推送已关闭");
+  });
+
   it("aggregates anonymous visit stats from Vercel geo headers", async () => {
     const db = new FakeD1Database();
     const context = {
@@ -1479,5 +1842,27 @@ describe("DDL API", () => {
     });
     expect(body.countries[0]).toMatchObject({ countryCode: "CN", visitCount: 2 });
     expect(body.regions[0]).toMatchObject({ regionName: "中国大陆 / Jinan", visitCount: 2 });
+  });
+
+  it("serializes project type fields and keeps legacy source groups compatible", () => {
+    const item: NormalizedItem = {
+      key: "pre-1",
+      contentHash: "hash",
+      sourceGroup: "yutuimian2026",
+      name: "测试大学",
+      institute: "计算机学院",
+      description: "预推免通知",
+      deadline: "2099-09-01T23:59:59+08:00",
+      website: "https://example.com/pre",
+      tags: [],
+      areas: ["计算机"]
+    };
+    const response = buildDdlResponse([item], new Date("2099-07-01T00:00:00+08:00"));
+
+    expect(response.items[0]).toMatchObject({
+      activityType: "pre_recommendation",
+      activityTypeLabel: "预推免",
+      activityTypeSource: "source_group"
+    });
   });
 });
