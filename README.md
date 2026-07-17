@@ -1,6 +1,6 @@
 # 保研 DDL 查询网站数据服务
 
-![保研 DDL 查询网站数据服务 Hero 图](public/assets/hero.png)
+![保研 DDL 查询网站数据服务 Hero 图](docs/assets/hero.png)
 
 一个部署在 Cloudflare Workers 上的保研 DDL 数据服务。系统在北京时间白天每小时拉取保研信息平台
 `2026 计算机保研` 页面，公开网站默认展示 AI 判定的计算机类强相关条目，并保留可能相关和全部源站切换。
