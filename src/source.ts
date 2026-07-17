@@ -919,25 +919,34 @@ function parseBaoyanXinxiHtml(
       if (!/<span\b[^>]*\bdeadline\b[^>]*>/iu.test(paragraph)) {
         continue;
       }
-      rawCount += 1;
-      const linkMatch = /<a\b[^>]*>([\s\S]*?)<\/a>/iu.exec(paragraph);
-      const linkTag = linkMatch?.[0] ?? "";
-      const href = extractAttribute(linkTag, "href");
-      const institute = linkMatch?.[1] === undefined ? "" : stripTags(linkMatch[1]);
-      if (name === "" || institute === "" || href === "") {
-        continue;
+      const deadlineMatches = Array.from(
+        paragraph.matchAll(/<span\b[^>]*\bdeadline\b[^>]*>[\s\S]*?<\/span>/giu)
+      );
+      rawCount += Math.max(deadlineMatches.length, 1);
+
+      for (const [index, deadlineMatch] of deadlineMatches.entries()) {
+        const recordStart = deadlineMatch.index ?? 0;
+        const recordEnd = deadlineMatches[index + 1]?.index ?? paragraph.length;
+        const recordHtml = paragraph.slice(recordStart, recordEnd);
+        const linkMatch = /<a\b[^>]*>([\s\S]*?)<\/a>/iu.exec(recordHtml);
+        const linkTag = linkMatch?.[0] ?? "";
+        const href = extractAttribute(linkTag, "href");
+        const institute = linkMatch?.[1] === undefined ? "" : stripTags(linkMatch[1]);
+        if (name === "" || institute === "" || href === "") {
+          continue;
+        }
+        records.push({
+          name,
+          institute,
+          deadline: extractDeadline(deadlineMatch[0]),
+          website: resolveRecordUrl(href, sourceUrl),
+          ...resolveBaoyanXinxiActivityType(
+            `${recordHtml} ${institute}`,
+            sourceGroup,
+            defaultActivityType
+          )
+        });
       }
-      records.push({
-        name,
-        institute,
-        deadline: extractDeadline(paragraph),
-        website: resolveRecordUrl(href, sourceUrl),
-        ...resolveBaoyanXinxiActivityType(
-          `${paragraph} ${institute}`,
-          sourceGroup,
-          defaultActivityType
-        )
-      });
     }
   }
 

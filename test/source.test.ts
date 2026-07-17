@@ -405,6 +405,38 @@ describe("source normalization", () => {
     expect(result.items[2]?.website).toBe("https://www.baoyanxinxi.cn/notice");
   });
 
+  it("parses every deadline-link pair when one paragraph contains multiple records", () => {
+    const html = `
+      <h2 id="清华大学"><a href="#清华大学"></a>清华大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-07-28T15:00:00">Loading…</span>】<a href="https://example.com/tsinghua-all">全校类</a>|【报名截止：<span class="deadline" data-deadline="2026-07-28T15:00:00">Loading…</span>】<a href="https://example.com/tsinghua-sigs">深圳国际研究生院</a></p>
+      <h2 id="同济大学"><a href="#同济大学"></a>同济大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2026-09-19T24:00:00">Loading…</span>】<a href="https://example.com/tongji-all">全校类</a>|【报名截止：<span class="deadline" data-deadline="2026-10-07T24:00:00">Loading…</span>】<a href="https://example.com/tongji-plan">国优计划</a></p>
+    `;
+
+    const result = normalizeBaoyanXinxiHtml(html, "https://www.baoyanxinxi.cn/2026jsjby/");
+
+    expect(result.stats.rawCount).toBe(4);
+    expect(result.stats.acceptedCount).toBe(4);
+    expect(result.items.map((item) => item.institute)).toEqual([
+      "全校类",
+      "深圳国际研究生院",
+      "全校类",
+      "国优计划"
+    ]);
+    expect(result.items.map((item) => item.deadline)).toEqual([
+      "2026-07-28T07:00:00.000Z",
+      "2026-07-28T07:00:00.000Z",
+      "2026-09-19T16:00:00.000Z",
+      "2026-10-07T16:00:00.000Z"
+    ]);
+    expect(result.items.map((item) => item.website)).toEqual([
+      "https://example.com/tsinghua-all",
+      "https://example.com/tsinghua-sigs",
+      "https://example.com/tongji-all",
+      "https://example.com/tongji-plan"
+    ]);
+  });
+
   it("normalizes BaoyanXinxi deadlines", () => {
     expect(normalizeBaoyanXinxiDeadline("N/A")).toBe("");
     expect(normalizeBaoyanXinxiDeadline("暂无")).toBe("");
