@@ -48,6 +48,8 @@ export const RANGE_OPTIONS: Array<{ value: RangeFilter; label: string; maxDays: 
 export const SOURCE_OPTIONS: Array<{ value: SourceFilter; label: string }> = [
   { value: "all", label: "全部来源" },
   { value: "baoyanxinxi", label: "保研信息平台" },
+  { value: "xingke", label: "星刻保研" },
+  { value: "zscampus", label: "保研岛" },
   { value: "manual", label: "人工补充" }
 ];
 export const RECENT_OPTIONS: Array<{ value: RecentFilter; label: string }> = [

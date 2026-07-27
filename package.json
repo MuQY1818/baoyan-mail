@@ -9,6 +9,7 @@
     "dev:web": "vite --host 0.0.0.0",
     "deploy": "wrangler deploy",
     "build:web": "vite build",
+    "sync:sources:external": "tsx scripts/sync-sources.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "db:migrate:local": "wrangler d1 migrations apply baoyan-mail-db --local",
@@ -25,9 +26,11 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260510.0",
+    "@types/node": "^26.1.1",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@types/three": "0.185.0",
+    "tsx": "^4.23.1",
     "typescript": "^5.9.3",
     "vitest": "^4.0.13",
     "wrangler": "^4.50.0"

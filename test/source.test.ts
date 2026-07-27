@@ -15,13 +15,18 @@ import {
   getBaoyanXinxiAreas,
   getSchoolTierTags,
   isBaoyanXinxiRelevant,
+  mergeSourceItems,
   normalizeBaoyanXinxiDeadline,
   normalizeBaoyanXinxiHtml,
+  normalizeXingkeData,
+  normalizeZscampusData,
   normalizeSourceData
 } from "../src/source";
+import type { SourceItemInput } from "../src/source";
 import { buildDdlResponse } from "../src/ddl";
 import { handleRequest, isValidEmail } from "../src/routes";
-import type { Env, NormalizedItem } from "../src/types";
+import { assertNoUnexpectedMergedDrop, reuseExistingKeys } from "../scripts/sync-sources";
+import type { Env, NormalizedItem, OfficialItemVerification } from "../src/types";
 
 interface FakeSnapshotRow {
   item_key: string;
@@ -62,7 +67,19 @@ class FakeD1Statement {
 
 class FakeD1Database {
   readonly itemSnapshots = new Map<string, FakeSnapshotRow>();
+  readonly externalSourceSyncItems = new Map<
+    string,
+    {
+      runId: string;
+      itemKey: string;
+      contentHash: string;
+      payload: string;
+      sourceGroup: string;
+      createdAt: string;
+    }
+  >();
   readonly appState = new Map<string, string>();
+  readonly appStateUpdatedAt = new Map<string, string>();
   readonly relevanceClassifications = new Map<string, unknown[]>();
   readonly activityTypeClassifications = new Map<string, unknown[]>();
   readonly newDeadlineNotifications: unknown[][] = [];
@@ -79,6 +96,22 @@ class FakeD1Database {
   }
 
   first<T>(sql: string, bindings: unknown[]): T | null {
+    if (sql.includes("COUNT(*) AS count FROM external_source_sync_items")) {
+      const runId = String(bindings[0]);
+      return {
+        count: Array.from(this.externalSourceSyncItems.values()).filter(
+          (row) => row.runId === runId
+        ).length
+      } as T;
+    }
+    if (sql.includes("COUNT(*) AS count FROM item_snapshots WHERE last_seen_at")) {
+      const lastSeenAt = String(bindings[0]);
+      return {
+        count: Array.from(this.itemSnapshots.values()).filter(
+          (row) => row.last_seen_at === lastSeenAt
+        ).length
+      } as T;
+    }
     if (sql.includes("COUNT(*) AS count FROM item_snapshots")) {
       return { count: this.itemSnapshots.size } as T;
     }
@@ -93,11 +126,23 @@ class FakeD1Database {
   }
 
   all<T>(sql: string, bindings: unknown[]): T[] {
-    if (sql.includes("SELECT * FROM item_snapshots")) {
-      const rows = Array.from(this.itemSnapshots.values());
+    if (/SELECT\s+\*\s+FROM item_snapshots/u.test(sql)) {
+      let rows = Array.from(this.itemSnapshots.values());
       if (sql.includes("WHERE source_group IN")) {
-        const sourceGroups = new Set(bindings.map(String));
-        return rows.filter((row) => sourceGroups.has(row.source_group)) as T[];
+        if (sql.includes("item_key >")) {
+          const cursor = String(bindings.at(-2));
+          const limit = Number(bindings.at(-1));
+          const sourceGroups = new Set(bindings.slice(0, -2).map(String));
+          rows = rows
+            .filter(
+              (row) => sourceGroups.has(row.source_group) && row.item_key > cursor
+            )
+            .sort((left, right) => left.item_key.localeCompare(right.item_key))
+            .slice(0, limit);
+        } else {
+          const sourceGroups = new Set(bindings.map(String));
+          rows = rows.filter((row) => sourceGroups.has(row.source_group));
+        }
       }
       return rows as T[];
     }
@@ -189,7 +234,32 @@ class FakeD1Database {
 
   async run(sql: string, bindings: unknown[]): Promise<D1Result> {
     let changes = 0;
-    if (sql.includes("INSERT INTO item_snapshots")) {
+    if (
+      sql.includes("INSERT INTO item_snapshots") &&
+      sql.includes("FROM external_source_sync_items")
+    ) {
+      const runId = String(bindings[3]);
+      for (const staged of this.externalSourceSyncItems.values()) {
+        if (staged.runId !== runId) {
+          continue;
+        }
+        const existing = this.itemSnapshots.get(staged.itemKey);
+        this.itemSnapshots.set(staged.itemKey, {
+          item_key: staged.itemKey,
+          content_hash: staged.contentHash,
+          payload: staged.payload,
+          source_group: staged.sourceGroup,
+          first_seen_at: existing?.first_seen_at ?? String(bindings[0]),
+          updated_at:
+            existing !== undefined && existing.content_hash === staged.contentHash
+              ? existing.updated_at
+              : String(bindings[1]),
+          last_seen_at: String(bindings[2]),
+          missing_since: null
+        });
+        changes += 1;
+      }
+    } else if (sql.includes("INSERT INTO item_snapshots")) {
       const row = {
         item_key: String(bindings[0]),
         content_hash: String(bindings[1]),
@@ -202,14 +272,93 @@ class FakeD1Database {
       };
       this.itemSnapshots.set(row.item_key, row);
       changes = 1;
+    } else if (sql.includes("INSERT INTO external_source_sync_items")) {
+      const row = {
+        runId: String(bindings[0]),
+        itemKey: String(bindings[1]),
+        contentHash: String(bindings[2]),
+        payload: String(bindings[3]),
+        sourceGroup: String(bindings[4]),
+        createdAt: String(bindings[5])
+      };
+      this.externalSourceSyncItems.set(`${row.runId}\u0000${row.itemKey}`, row);
+      changes = 1;
+    } else if (
+      sql.includes("DELETE FROM external_source_sync_items") &&
+      sql.includes("created_at <")
+    ) {
+      const createdBefore = String(bindings[0]);
+      for (const [key, row] of this.externalSourceSyncItems.entries()) {
+        if (row.createdAt < createdBefore) {
+          this.externalSourceSyncItems.delete(key);
+          changes += 1;
+        }
+      }
+    } else if (sql.includes("DELETE FROM external_source_sync_items")) {
+      const runId = String(bindings[0]);
+      for (const [key, row] of this.externalSourceSyncItems.entries()) {
+        if (row.runId === runId) {
+          this.externalSourceSyncItems.delete(key);
+          changes += 1;
+        }
+      }
+    } else if (sql.includes("VALUES ('last_synced_at'")) {
+      this.appState.set("last_synced_at", String(bindings[0]));
+      this.appStateUpdatedAt.set("last_synced_at", String(bindings[1]));
+      changes = 1;
+    } else if (sql.includes("VALUES ('last_source_stats'")) {
+      this.appState.set("last_source_stats", String(bindings[0]));
+      this.appStateUpdatedAt.set("last_source_stats", String(bindings[1]));
+      changes = 1;
+    } else if (
+      sql.includes("INSERT INTO app_state") &&
+      sql.includes("WHERE app_state.value = ''")
+    ) {
+      const key = String(bindings[0]);
+      const existingValue = this.appState.get(key);
+      const existingUpdatedAt = this.appStateUpdatedAt.get(key) ?? "";
+      if (
+        existingValue === undefined ||
+        existingValue === "" ||
+        existingUpdatedAt < String(bindings[3])
+      ) {
+        this.appState.set(key, String(bindings[1]));
+        this.appStateUpdatedAt.set(key, String(bindings[2]));
+        changes = 1;
+      }
     } else if (sql.includes("INSERT INTO app_state")) {
       this.appState.set(String(bindings[0]), String(bindings[1]));
+      this.appStateUpdatedAt.set(String(bindings[0]), String(bindings[2]));
       changes = 1;
+    } else if (sql.includes("UPDATE app_state") && sql.includes("value = ''")) {
+      const key = String(bindings[1]);
+      if (this.appState.get(key) === String(bindings[2])) {
+        this.appState.set(key, "");
+        this.appStateUpdatedAt.set(key, String(bindings[0]));
+        changes = 1;
+      }
     } else if (sql.includes("INSERT OR IGNORE INTO new_deadline_notifications")) {
       const itemKey = String(bindings[0]);
       if (!this.newDeadlineNotifications.some((entry) => String(entry[0]) === itemKey)) {
         this.newDeadlineNotifications.push(bindings);
         changes = 1;
+      }
+    } else if (
+      sql.includes("UPDATE item_snapshots") &&
+      sql.includes("COALESCE(last_seen_at, '')")
+    ) {
+      const now = String(bindings[0]);
+      const lastSeenAt = String(bindings.at(-1));
+      const sourceGroups = new Set(bindings.slice(1, -1).map(String));
+      for (const row of this.itemSnapshots.values()) {
+        if (
+          sourceGroups.has(row.source_group) &&
+          row.last_seen_at !== lastSeenAt &&
+          row.missing_since === null
+        ) {
+          row.missing_since = now;
+          changes += 1;
+        }
       }
     } else if (sql.includes("UPDATE item_snapshots") && sql.includes("missing_since")) {
       const itemKey = String(bindings[1]);
@@ -528,6 +677,11 @@ describe("source normalization", () => {
         "https://mp.weixin.qq.com/s/example?scene=1&click_id=20&utm_source=test&a=1#wechat_redirect"
       )
     ).toBe("https://mp.weixin.qq.com/s/example?a=1");
+    expect(
+      canonicalizeNotificationUrl(
+        "https://yjszs.neu.edu.cn/entrance#/detail?a=100&b=200"
+      )
+    ).toBe("https://yjszs.neu.edu.cn/entrance#/detail?a=100&b=200");
   });
 
   it("dedupes BaoyanXinxi records by canonical source URL", async () => {
@@ -1160,6 +1314,836 @@ describe("source normalization", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("normalizes the Xingke JSON feed and keeps only upcoming records", () => {
+    const result = normalizeXingkeData(
+      {
+        items: [
+          {
+            id: 1,
+            school: "北京邮电大学",
+            department: "计算机学院",
+            title: "北京邮电大学计算机学院 2027 年推免预报名通知",
+            category: "预推免",
+            signup_end: "2026-09-10",
+            url: "https://scs.bupt.edu.cn/info/1050/4416.htm",
+            updated_at: "2026-07-27T08:00:00"
+          },
+          {
+            id: 2,
+            school: "北京邮电大学",
+            department: "计算机学院",
+            title: "已截止通知",
+            category: "夏令营",
+            signup_end: "2026-07-01",
+            url: "https://example.com/expired"
+          }
+        ]
+      },
+      "https://xingkebaoyan.com/data.json",
+      new Date("2026-07-27T00:00:00.000Z")
+    );
+
+    expect(result.stats).toMatchObject({ rawCount: 2, acceptedCount: 1, filteredCount: 1 });
+    expect(result.items[0]).toMatchObject({
+      sourceGroup: "xingkebaoyan",
+      activityType: "pre_recommendation",
+      deadlinePrecision: "date",
+      sourceGroups: ["xingkebaoyan"]
+    });
+    expect(result.items[0]?.sourceObservations?.[0]).toMatchObject({
+      sourceItemId: "1",
+      publishedAt: "2026-07-27T00:00:00.000Z"
+    });
+  });
+
+  it("removes invisible control characters from aggregate source text", () => {
+    const result = normalizeXingkeData(
+      {
+        items: [
+          {
+            id: 1,
+            school: "天津大学",
+            department: "材料科学与工程学院",
+            title: "2027年\u0007接收优秀应届本科毕业生免试攻读研究生预报名",
+            category: "预推免",
+            signup_end: "2026-09-10",
+            url: "https://mse.tju.edu.cn/info/1133/6136.htm"
+          }
+        ]
+      },
+      "https://xingkebaoyan.com/data.json",
+      new Date("2026-07-27T00:00:00.000Z")
+    );
+
+    expect(result.items[0]?.description).toBe(
+      "2027年 接收优秀应届本科毕业生免试攻读研究生预报名"
+    );
+  });
+
+  it("retains Xingke notices without a structured deadline for official verification", () => {
+    const result = normalizeXingkeData(
+      {
+        items: [
+          {
+            id: 2,
+            school: "西安电子科技大学",
+            department: "机电工程学院",
+            title: "机电工程学院2027年推免生预报名通知",
+            category: "预推免",
+            signup_end: "",
+            signup_end_text: "预报名系统预计开放至9月上旬，未公布具体日期",
+            url: "https://eme.xidian.edu.cn/info/1012/16196.htm",
+            updated_at: "2026-07-26T01:34:32"
+          }
+        ]
+      },
+      "https://xingkebaoyan.com/data.json",
+      new Date("2026-07-27T00:00:00.000Z")
+    );
+
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]).toMatchObject({
+      deadline: "",
+      deadlinePrecision: "unknown"
+    });
+    expect(result.items[0]?.sourceObservations?.[0]?.deadlineRaw).toContain(
+      "未公布具体日期"
+    );
+    expect(result.stats.unknownDeadlineCount).toBe(1);
+  });
+
+  it("normalizes the Baoyan Island API records without treating default end-of-day as exact", () => {
+    const result = normalizeZscampusData(
+      [
+        {
+          summerid: 100,
+          universityname: "北京邮电大学",
+          collegename: "计算机学院",
+          summername: "北京邮电大学计算机学院 2027 年推免预报名通知",
+          websiteUrl: "https://scs.bupt.edu.cn/info/1050/4416.htm",
+          recruitType: "预推免",
+          publishTime: "2026-07-27 08:00:00",
+          endtime: "2026-09-10 23:59:59"
+        }
+      ],
+      "https://api.zscampus.com/zs-baoyan-summer/summer/getListWithConditions",
+      1,
+      new Date("2026-07-27T00:00:00.000Z")
+    );
+
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]).toMatchObject({
+      sourceGroup: "zscampus",
+      activityType: "pre_recommendation",
+      deadlinePrecision: "date"
+    });
+  });
+
+  it("merges exact URLs, prefers an explicit time, and retains the conflict for review", () => {
+    const entries: SourceItemInput[] = [
+      {
+        sourceGroup: "xingkebaoyan",
+        name: "北京邮电大学",
+        institute: "计算机学院",
+        description: "北京邮电大学计算机学院 2027 年推免预报名通知",
+        deadline: "2026-09-10T15:59:59.000Z",
+        deadlinePrecision: "date",
+        website: "https://scs.bupt.edu.cn/info/1050/4416.htm?utm_source=xingke",
+        tags: ["211"],
+        activityType: "pre_recommendation",
+        activityTypeSource: "source"
+      },
+      {
+        sourceGroup: "zscampus",
+        name: "北京邮电大学",
+        institute: "计算机学院",
+        description: "北京邮电大学计算机学院 2027 年推免预报名通知",
+        deadline: "2026-09-10T09:00:00.000Z",
+        deadlinePrecision: "exact",
+        website: "https://scs.bupt.edu.cn/info/1050/4416.htm",
+        tags: ["211"],
+        activityType: "pre_recommendation",
+        activityTypeSource: "source"
+      }
+    ];
+
+    const merged = mergeSourceItems(entries).items;
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      deadline: "2026-09-10T09:00:00.000Z",
+      deadlinePrecision: "exact",
+      deadlineConflict: true,
+      mergeReason: "exact_url",
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+  });
+
+  it("merges cross-source exact notice URLs even when deadline dates conflict", () => {
+    const base = {
+      name: "北京邮电大学",
+      institute: "计算机学院",
+      description: "北京邮电大学计算机学院2027年推免预报名通知",
+      deadlinePrecision: "date" as const,
+      website: "https://scs.bupt.edu.cn/info/1050/4416.htm",
+      tags: ["211"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        deadline: "2026-09-10T15:59:59.000Z"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        deadline: "2026-09-11T15:59:59.000Z"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      deadlineConflict: true,
+      mergeReason: "exact_url",
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+  });
+
+  it("merges a specific official notice despite different aggregator titles", () => {
+    const merged = mergeSourceItems([
+      {
+        sourceGroup: "xingkebaoyan",
+        name: "北京邮电大学",
+        institute: "计算机学院",
+        description: "2027 年推免预报名通知",
+        deadline: "2026-09-10T15:59:59.000Z",
+        deadlinePrecision: "date",
+        website: "https://scs.bupt.edu.cn/info/1050/4416.htm",
+        tags: ["211"]
+      },
+      {
+        sourceGroup: "zscampus",
+        name: "北京邮电大学",
+        institute: "计算机学院",
+        description: "接收优秀应届本科毕业生免试攻读研究生办法",
+        deadline: "2026-09-11T15:59:59.000Z",
+        deadlinePrecision: "date",
+        website: "https://scs.bupt.edu.cn/info/1050/4416.htm?scene=1",
+        tags: ["211"]
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      deadlineConflict: true,
+      mergeReason: "exact_url",
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+  });
+
+  it("merges cross-source institute aliases on the same specific notice and day", () => {
+    const base = {
+      name: "南京理工大学",
+      description: "智能科学与技术学院优秀大学生校园开放日活动公告",
+      deadline: "2026-07-30T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      website: "https://mp.weixin.qq.com/s/specific-notice",
+      tags: ["211"]
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        institute: "智能制造学院"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        institute: "智能科学与技术学院"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      mergeReason: "exact_url",
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+  });
+
+  it("merges institute aliases on a specific notice when one source has no deadline", () => {
+    const base = {
+      name: "哈尔滨工业大学",
+      deadlinePrecision: "unknown" as const,
+      website: "https://ise.hit.edu.cn/2026/0722/c16271a398085/page.htm",
+      tags: ["C9"]
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "baoyanxinxi2026jsjby",
+        institute: "仪器科学与工程学院-7月22日发布，分批审核",
+        description: "保研信息平台补充源",
+        deadline: ""
+      },
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        institute: "仪器科学与工程学院",
+        description: "哈尔滨工业大学仪器科学与工程学院2027年接收推免生报名通知",
+        deadline: ""
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      mergeReason: "exact_url",
+      institute: "仪器科学与工程学院",
+      sourceGroups: ["baoyanxinxi2026jsjby", "xingkebaoyan"]
+    });
+  });
+
+  it("merges exact notice duplicates when one source supplies the missing deadline", () => {
+    const merged = mergeSourceItems([
+      {
+        sourceGroup: "baoyanxinxi2026jsjby",
+        name: "哈尔滨工业大学",
+        institute: "（威海）汽车工程学院-7月23日发布，分两批审核",
+        description: "保研信息平台补充源",
+        deadline: "",
+        deadlinePrecision: "unknown",
+        website: "https://auto.hitwh.edu.cn/2026/0723/c189a216251/page.htm",
+        tags: ["C9"]
+      },
+      {
+        sourceGroup: "xingkebaoyan",
+        name: "哈尔滨工业大学（威海）",
+        institute: "汽车工程学院",
+        description: "哈尔滨工业大学（威海）汽车工程学院2027年接收推免生报名通知",
+        deadline: "2026-09-13T15:59:59.000Z",
+        deadlinePrecision: "date",
+        website: "https://auto.hitwh.edu.cn/2026/0723/c189a216251/page.htm",
+        tags: ["C9"]
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      deadline: "2026-09-13T15:59:59.000Z",
+      deadlinePrecision: "date",
+      sourceGroups: ["baoyanxinxi2026jsjby", "xingkebaoyan"]
+    });
+  });
+
+  it("merges same-source duplicate variants only when their exact notice titles agree", () => {
+    const merged = mergeSourceItems([
+      {
+        sourceGroup: "xingkebaoyan",
+        name: "上海财经大学",
+        institute: "",
+        description: "上海财经大学法学院2027年接收推荐免试研究生预报名的通知",
+        deadline: "2026-08-20T15:59:59.000Z",
+        deadlinePrecision: "date",
+        website: "https://law.sufe.edu.cn/14/93/c7989a267411/page.htm",
+        tags: ["211"]
+      },
+      {
+        sourceGroup: "xingkebaoyan",
+        name: "上海财经大学",
+        institute: "法学院",
+        description: "2026年上海财经大学法学院2027年接收推荐免试研究生预报名的通知",
+        deadline: "2026-08-20T15:59:59.000Z",
+        deadlinePrecision: "date",
+        website: "https://law.sufe.edu.cn/14/93/c7989a267411/page.htm",
+        tags: ["211"]
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+  });
+
+  it("keeps similar school-wide and institute-specific notices separate", () => {
+    const base = {
+      sourceGroup: "xingkebaoyan",
+      name: "北京工业大学",
+      deadlinePrecision: "unknown" as const,
+      website: "https://yanzhao.bjut.edu.cn/info/1019/18119.htm",
+      tags: ["211"]
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        institute: "",
+        description: "北京工业大学2027年研究生招生宣传研学活动通知",
+        deadline: ""
+      },
+      {
+        ...base,
+        institute: "建筑与城市规划学院",
+        description: "北京工业大学建筑与城市规划学院2027年研究生招生宣传研学活动方案",
+        deadline: ""
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("treats adjacent midnight representations as the same deadline", () => {
+    const base = {
+      name: "同济大学",
+      description: "同济大学2027年国优计划研究生招生报名通知",
+      website: "https://cdibb.tongji.edu.cn/ca/ce/c37918a379598/page.htm",
+      tags: ["985"]
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "baoyanxinxi2026jsjby",
+        institute: "国优计划",
+        deadline: "2026-10-07T16:00:00.000Z",
+        deadlinePrecision: "exact"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        institute: "全校类",
+        deadline: "2026-10-07T15:59:59.000Z",
+        deadlinePrecision: "date"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.deadlineConflict).toBe(true);
+  });
+
+  it("keeps institute aliases separate when a specific notice has different deadline days", () => {
+    const base = {
+      name: "东南大学",
+      description: "接收推荐免试研究生报名通知",
+      deadlinePrecision: "date" as const,
+      website: "https://example.edu.cn/2026/notice.html",
+      tags: ["985"]
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        institute: "计算机科学与工程学院",
+        deadline: "2026-08-10T15:59:59.000Z"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        institute: "软件学院",
+        deadline: "2026-08-11T15:59:59.000Z"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("keeps same-source projects separate despite sharing a specific notice and day", () => {
+    const base = {
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "东南大学",
+      description: "保研信息平台补充源",
+      deadline: "2026-08-10T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      website: "https://example.edu.cn/2026/notice.html",
+      tags: ["985"]
+    };
+    const merged = mergeSourceItems([
+      { ...base, institute: "计算机科学与工程学院" },
+      { ...base, institute: "软件学院" }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("keeps a generic application portal separate across deadline days", () => {
+    const base = {
+      name: "中国科学院大学",
+      institute: "计算机学院",
+      description: "2027 年接收推荐免试研究生报名通知",
+      deadlinePrecision: "date" as const,
+      website: "https://zhaosheng.ucas.ac.cn/sign_up/TMS/views/index.aspx",
+      tags: []
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        deadline: "2026-09-10T15:59:59.000Z"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        deadline: "2026-09-11T15:59:59.000Z"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("keeps a generic application portal separate on the same day", () => {
+    const base = {
+      name: "中国科学院大学",
+      description: "2027 年接收推荐免试研究生报名通知",
+      deadline: "2026-09-10T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      website: "https://zhaosheng.ucas.ac.cn/sign_up/TMS/views/index.aspx",
+      tags: []
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        institute: "计算机学院"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        institute: "人工智能学院"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("does not merge generic application portals across conflicting notices", () => {
+    const base = {
+      name: "中国科学院大学",
+      institute: "计算机学院",
+      description: "",
+      deadlinePrecision: "date" as const,
+      website: "https://zhaosheng.ucas.ac.cn/sign_up/TMS/views/index.aspx",
+      tags: [],
+      activityType: "unknown" as const,
+      activityTypeSource: "unknown" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        deadline: "2026-09-10T15:59:59.000Z"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        deadline: "2026-09-11T15:59:59.000Z"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("only merges different URLs when school, institute, deadline, and title all agree", () => {
+    const base: Omit<SourceItemInput, "sourceGroup" | "website"> = {
+      name: "北京邮电大学",
+      institute: "计算机学院",
+      description: "北京邮电大学计算机学院 2027 年推免预报名通知",
+      deadline: "2026-09-10T15:59:59.000Z",
+      deadlinePrecision: "date",
+      tags: ["211"],
+      activityType: "pre_recommendation",
+      activityTypeSource: "text"
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        website: "https://mp.weixin.qq.com/s/example"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        website: "https://scs.bupt.edu.cn/info/1050/4416.htm"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      mergeReason: "title_match",
+      website: "https://scs.bupt.edu.cn/info/1050/4416.htm"
+    });
+    expect(merged[0]?.alternateWebsites).toEqual(["https://mp.weixin.qq.com/s/example"]);
+  });
+
+  it("does not let a school-wide notice bridge separate institute notices", () => {
+    const base = {
+      name: "东南大学",
+      deadline: "2026-07-31T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: ["985"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        institute: "自动化学院",
+        description: "东南大学自动化学院2027年接收推荐免试研究生报名通知",
+        website: "https://automation.seu.edu.cn/notice"
+      },
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        institute: "电气工程学院",
+        description: "东南大学电气工程学院2027年接收推荐免试研究生报名通知",
+        website: "https://ee.seu.edu.cn/notice"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        institute: "",
+        description: "2026年东南大学2027年接收推荐免试研究生报名通知",
+        website: "https://yzb.seu.edu.cn/notice"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(3);
+    expect(merged.every((item) => item.mergeReason === "single")).toBe(true);
+  });
+
+  it("does not merge a parent institute notice with a sub-program notice", () => {
+    const base = {
+      name: "同济大学",
+      deadline: "2026-08-01T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: ["985"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        institute: "交通学院",
+        description: "交通学院2027年接收推荐免试研究生预报名通知",
+        website: "https://tjjt.tongji.edu.cn/notice/college"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        institute: "交通学院低空技术与工程",
+        description: "低空技术与工程2027年接收推荐免试研究生预报名通知",
+        website: "https://tjjt.tongji.edu.cn/notice/low-altitude"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("keeps title matching one-to-one for records from the same source", () => {
+    const base = {
+      name: "北京邮电大学",
+      institute: "计算机学院",
+      description: "北京邮电大学计算机学院2027年推免预报名通知",
+      deadline: "2026-09-10T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: ["211"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        website: "https://example.com/xingke-one"
+      },
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        website: "https://example.com/xingke-two"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        description: "2026年北京邮电大学计算机学院2027年推免预报名通知",
+        website: "https://example.com/zscampus"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+    expect(
+      merged.every(
+        (item) => new Set(item.sourceGroups ?? [item.sourceGroup]).size ===
+          (item.sourceGroups ?? [item.sourceGroup]).length
+      )
+    ).toBe(true);
+  });
+
+  it("keeps notices separate when a school reuses one application URL", () => {
+    const base = {
+      sourceGroup: "xingkebaoyan",
+      name: "东南大学",
+      deadline: "2026-07-31T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      website: "https://yzb.seu.edu.cn/application",
+      tags: ["985"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        institute: "自动化学院",
+        description: "东南大学自动化学院2027年接收推荐免试研究生报名通知"
+      },
+      {
+        ...base,
+        institute: "电气工程学院",
+        description: "东南大学电气工程学院2027年接收推荐免试研究生报名通知"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("keeps distinct SPA hash routes as distinct notification URLs", () => {
+    const base = {
+      sourceGroup: "xingkebaoyan",
+      name: "东北大学",
+      institute: "计算机科学与工程学院",
+      description: "东北大学2027年推免预报名通知",
+      deadline: "2026-09-14T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: ["985"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        website: "https://yjszs.neu.edu.cn/entrance#/detail?a=100&b=200"
+      },
+      {
+        ...base,
+        institute: "机器人科学与工程学院",
+        deadline: "2026-09-09T15:59:59.000Z",
+        website: "https://yjszs.neu.edu.cn/entrance#/detail?a=101&b=200"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("does not mark a multi-source snapshot missing while one of its observed sources failed", async () => {
+    const db = new FakeD1Database();
+    const previous: NormalizedItem = {
+      key: "stable-key",
+      contentHash: "previous-hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      sourceGroups: ["baoyanxinxi2026jsjby", "xingkebaoyan"],
+      name: "北京邮电大学",
+      institute: "计算机学院",
+      description: "通知",
+      deadline: "2099-09-10T15:59:59.000Z",
+      website: "https://example.com/previous",
+      tags: ["211"]
+    };
+    db.itemSnapshots.set(previous.key, {
+      item_key: previous.key,
+      content_hash: previous.contentHash,
+      payload: JSON.stringify(previous),
+      source_group: previous.sourceGroup,
+      first_seen_at: "2026-07-27T00:00:00.000Z",
+      updated_at: "2026-07-27T00:00:00.000Z",
+      last_seen_at: "2026-07-27T00:00:00.000Z",
+      missing_since: null
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("baoyanxinxi")) {
+        return new Response(
+          `
+            <h2 id="复旦大学"><a href="#复旦大学"></a>复旦大学</h2>
+            <p>【报名截止：<span class="deadline" data-deadline="2099-10-10T23:59:59">Loading…</span>】<a href="https://example.com/current">生命科学学院</a></p>
+          `,
+          { status: 200 }
+        );
+      }
+      if (url.includes("xingkebaoyan")) {
+        throw new Error("temporary source failure");
+      }
+      return new Response(JSON.stringify({ code: 10000, data: { total: 0, list: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    };
+
+    try {
+      const result = await runCheck({ DB: db as unknown as D1Database } as Env);
+      expect(result.missingCount).toBe(0);
+      expect(db.itemSnapshots.get(previous.key)?.missing_since).toBeNull();
+      expect(result.sourceStats?.find((stats) => stats.sourceGroup === "xingkebaoyan")?.error).toContain(
+        "temporary source failure"
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("reuses an old merged snapshot key only once when notices split apart", async () => {
+    const db = new FakeD1Database();
+    const previous: NormalizedItem = {
+      key: "old-merged-key",
+      contentHash: "old-hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "东南大学",
+      institute: "自动化学院",
+      description: "保研信息平台补充源",
+      deadline: "2099-07-31T15:59:59.000Z",
+      website: "https://yzb.seu.edu.cn/application",
+      tags: ["985"]
+    };
+    db.itemSnapshots.set(previous.key, {
+      item_key: previous.key,
+      content_hash: previous.contentHash,
+      payload: JSON.stringify(previous),
+      source_group: previous.sourceGroup,
+      first_seen_at: "2099-07-01T00:00:00.000Z",
+      updated_at: "2099-07-01T00:00:00.000Z",
+      last_seen_at: "2099-07-01T00:00:00.000Z",
+      missing_since: null
+    });
+    const html = `
+      <h2 id="东南大学"><a href="#东南大学"></a>东南大学</h2>
+      <p>【报名截止：<span class="deadline" data-deadline="2099-07-31T23:59:59">Loading…</span>】<a target="_blank" href="https://yzb.seu.edu.cn/application">自动化学院</a></p>
+      <p>【报名截止：<span class="deadline" data-deadline="2099-07-31T23:59:59">Loading…</span>】<a target="_blank" href="https://yzb.seu.edu.cn/application">电气工程学院</a></p>
+    `;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("baoyanxinxi")) {
+        return new Response(html, { status: 200, headers: { "content-type": "text/html" } });
+      }
+      if (url.includes("xingkebaoyan")) {
+        return Response.json({ items: [] });
+      }
+      return Response.json({ code: 10000, data: { list: [], total: 0 } });
+    };
+
+    try {
+      const result = await runCheck({ DB: db as unknown as D1Database } as Env);
+      const activeItems = Array.from(db.itemSnapshots.values())
+        .filter((row) => row.missing_since === null)
+        .map((row) => JSON.parse(row.payload) as NormalizedItem);
+
+      expect(result.scanned).toBe(2);
+      expect(activeItems).toHaveLength(2);
+      expect(new Set(activeItems.map((item) => item.key)).size).toBe(2);
+      expect(activeItems.map((item) => item.institute).sort()).toEqual([
+        "电气工程学院",
+        "自动化学院"
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 describe("email validation", () => {
@@ -1321,6 +2305,86 @@ describe("DDL API", () => {
     expect(response.items[0]).not.toHaveProperty("payload");
   });
 
+  it("uses verified official deadlines over conflicting aggregate values", () => {
+    const item: NormalizedItem = {
+      key: "multi-source",
+      contentHash: "hash",
+      sourceGroup: "xingkebaoyan",
+      sourceGroups: ["xingkebaoyan", "zscampus"],
+      name: "北京邮电大学",
+      institute: "计算机学院",
+      description: "聚合站标题",
+      deadline: "2026-09-10T15:59:59.000Z",
+      deadlinePrecision: "date",
+      deadlineConflict: true,
+      website: "https://scs.bupt.edu.cn/info/1050/4416.htm",
+      tags: ["211"]
+    };
+    const verification: OfficialItemVerification = {
+      normalizedUrl: "https://scs.bupt.edu.cn/info/1050/4416.htm",
+      title: "官方预报名通知",
+      deadline: "2026-09-10T09:00:00.000Z",
+      deadlinePrecision: "exact",
+      reason: "官方页面写明 17:00 截止",
+      verifier: "luna-high",
+      verifiedAt: "2026-07-27T08:00:00.000Z"
+    };
+
+    const response = buildDdlResponse(
+      [item],
+      now,
+      null,
+      new Map(),
+      { officialVerifications: new Map([[verification.normalizedUrl, verification]]) }
+    );
+
+    expect(response.items[0]).toMatchObject({
+      description: "官方预报名通知",
+      deadlineAt: "2026-09-10T09:00:00.000Z",
+      deadlinePrecision: "exact",
+      deadlineConflict: false,
+      deadlineSource: "official-verification",
+      officialVerifiedAt: "2026-07-27T08:00:00.000Z",
+      sourceCount: 2,
+      sourceLabels: ["星刻保研", "保研岛"]
+    });
+  });
+
+  it("keeps an officially verified unknown deadline out of the public timeline", () => {
+    const item: NormalizedItem = {
+      key: "no-fixed-deadline",
+      contentHash: "hash",
+      sourceGroup: "xingkebaoyan",
+      sourceGroups: ["xingkebaoyan"],
+      name: "哈尔滨工业大学（威海）",
+      institute: "信息科学与工程学院",
+      description: "接收推免生报名通知",
+      deadline: "2026-09-20T15:59:59.000Z",
+      deadlinePrecision: "date",
+      website: "https://siee.hitwh.edu.cn/2026/0723/c1677a216258/page.htm",
+      tags: ["C9"]
+    };
+    const verification: OfficialItemVerification = {
+      normalizedUrl: item.website,
+      title: item.description,
+      deadline: "",
+      deadlinePrecision: "unknown",
+      reason: "官方通知仅说明分批审核，没有固定报名截止时间",
+      verifier: "luna-high",
+      verifiedAt: "2026-07-28T00:00:00.000Z"
+    };
+
+    const response = buildDdlResponse(
+      [item],
+      now,
+      null,
+      new Map(),
+      { officialVerifications: new Map([[verification.normalizedUrl, verification]]) }
+    );
+
+    expect(response.items).toHaveLength(0);
+  });
+
   it("can include expired items for local application link hydration", () => {
     const expiredItem = {
       key: "expired",
@@ -1424,6 +2488,120 @@ describe("DDL API", () => {
       sourceGroup: "camp2026",
       sourceLabel: "2026 夏令营"
     });
+  });
+
+  it("keeps different institutes that share an application URL", () => {
+    const response = buildDdlResponse(
+      [
+        {
+          key: "automation",
+          contentHash: "hash-a",
+          sourceGroup: "xingkebaoyan",
+          name: "东南大学",
+          institute: "自动化学院",
+          description: "自动化学院推免通知",
+          deadline: "2026-07-31T23:59:59+08:00",
+          website: "https://yzb.seu.edu.cn/application",
+          tags: []
+        },
+        {
+          key: "electrical",
+          contentHash: "hash-b",
+          sourceGroup: "xingkebaoyan",
+          name: "东南大学",
+          institute: "电气工程学院",
+          description: "电气工程学院推免通知",
+          deadline: "2026-07-31T23:59:59+08:00",
+          website: "https://yzb.seu.edu.cn/application",
+          tags: []
+        }
+      ],
+      new Date("2026-07-27T00:00:00.000Z")
+    );
+
+    expect(response.total).toBe(2);
+  });
+
+  it("hides grace aliases covered by a current exact-url multi-source merge", () => {
+    const response = buildDdlResponse(
+      [
+        {
+          item_key: "active-merged",
+          content_hash: "a".repeat(64),
+          payload: JSON.stringify({
+            key: "active-merged",
+            contentHash: "a".repeat(64),
+            sourceGroup: "baoyanxinxi2026jsjby",
+            sourceGroups: ["baoyanxinxi2026jsjby", "xingkebaoyan"],
+            mergeReason: "exact_url",
+            name: "哈尔滨工业大学",
+            institute: "仪器科学与工程学院",
+            description: "2027年接收推免生报名通知",
+            deadline: "2026-09-10T15:59:59.000Z",
+            website: "https://ise.hit.edu.cn/2026/0722/c16271a398085/page.htm",
+            tags: []
+          }),
+          source_group: "baoyanxinxi2026jsjby",
+          first_seen_at: "2026-07-27T00:00:00.000Z",
+          updated_at: "2026-07-27T00:00:00.000Z",
+          last_seen_at: "2026-07-27T00:00:00.000Z",
+          missing_since: null
+        },
+        {
+          item_key: "grace-alias",
+          content_hash: "b".repeat(64),
+          payload: JSON.stringify({
+            key: "grace-alias",
+            contentHash: "b".repeat(64),
+            sourceGroup: "baoyanxinxi2026jsjby",
+            sourceGroups: ["baoyanxinxi2026jsjby"],
+            name: "哈尔滨工业大学",
+            institute: "仪器科学与工程学院-7月22日发布",
+            description: "保研信息平台补充源",
+            deadline: "2026-09-10T15:59:59.000Z",
+            website: "https://ise.hit.edu.cn/2026/0722/c16271a398085/page.htm",
+            tags: []
+          }),
+          source_group: "baoyanxinxi2026jsjby",
+          first_seen_at: "2026-07-26T00:00:00.000Z",
+          updated_at: "2026-07-26T00:00:00.000Z",
+          last_seen_at: "2026-07-26T00:00:00.000Z",
+          missing_since: "2026-07-27T00:00:00.000Z"
+        }
+      ],
+      new Date("2026-07-27T01:00:00.000Z")
+    );
+
+    expect(response.total).toBe(1);
+    expect(response.items[0]?.key).toBe("active-merged");
+  });
+
+  it("reports source statistics for every source represented by a merged item", () => {
+    const response = buildDdlResponse(
+      [
+        {
+          key: "merged-source-stats",
+          contentHash: "hash",
+          sourceGroup: "baoyanxinxi2026jsjby",
+          sourceGroups: ["baoyanxinxi2026jsjby", "xingkebaoyan", "zscampus"],
+          name: "北京邮电大学",
+          institute: "计算机学院",
+          description: "推免预报名通知",
+          deadline: "2099-09-10T15:59:59.000Z",
+          website: "https://example.com/merged-source-stats",
+          tags: []
+        }
+      ],
+      new Date("2099-07-01T00:00:00.000Z")
+    );
+
+    expect(response.sourceStats).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sourceGroup: "baoyanxinxi2026jsjby", total: 1 }),
+        expect.objectContaining({ sourceGroup: "xingkebaoyan", total: 1 }),
+        expect.objectContaining({ sourceGroup: "zscampus", total: 1 })
+      ])
+    );
   });
 
   it("hides stale future DDL after the visibility grace period", () => {
@@ -1726,64 +2904,357 @@ describe("DDL API", () => {
     });
   });
 
-  it("keeps admin run-check sync-only after DDL mail pushes are disabled", async () => {
+  it("preserves matching public keys during external synchronization", () => {
+    const item: NormalizedItem = {
+      key: "generated-key",
+      contentHash: "a".repeat(64),
+      sourceGroup: "xingkebaoyan",
+      sourceGroups: ["xingkebaoyan"],
+      name: "北京邮电大学",
+      institute: "计算机学院",
+      description: "推免通知",
+      deadline: "2099-09-10T15:59:59.000Z",
+      deadlinePrecision: "date",
+      deadlineConflict: false,
+      deadlineSource: "xingkebaoyan",
+      website: "https://example.com/notice?utm_source=test",
+      sourceObservations: [],
+      alternateWebsites: [],
+      mergeReason: "single",
+      tags: []
+    };
+    const result = reuseExistingKeys([item], [
+      {
+        key: "stable-public-key",
+        school: item.name,
+        institute: item.institute,
+        deadlineAt: item.deadline,
+        website: "https://example.com/notice"
+      }
+    ]);
+
+    expect(result[0]?.key).toBe("stable-public-key");
+  });
+
+  it("stops an external sync when a healthy merge unexpectedly loses most active items", () => {
+    expect(() =>
+      assertNoUnexpectedMergedDrop(
+        64,
+        Array.from({ length: 100 }, (_, index) => ({
+          key: `previous-${index}`,
+          school: "测试大学",
+          institute: "计算机学院",
+          deadlineAt: "2099-09-10T15:59:59.000Z",
+          website: `https://example.com/${index}`,
+          active: true
+        }))
+      )
+    ).toThrow("合并后条目数量异常骤降");
+    expect(() =>
+      assertNoUnexpectedMergedDrop(
+        65,
+        Array.from({ length: 100 }, (_, index) => ({
+          key: `previous-${index}`,
+          school: "测试大学",
+          institute: "计算机学院",
+          deadlineAt: "2099-09-10T15:59:59.000Z",
+          website: `https://example.com/${index}`,
+          active: true
+        }))
+      )
+    ).not.toThrow();
+  });
+
+  it("accepts a complete external source sync and only then marks old rows missing", async () => {
     const db = new FakeD1Database();
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-06-07T01:00:00.000Z"));
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () =>
-      new Response(
-        `
-          <h2 id="南京大学"><a href="#南京大学"></a>南京大学</h2>
-          <p>【报名截止：<span class="deadline" data-deadline="2026-06-10T23:59:59">Loading…</span>】<a target="_blank" href="https://example.com/cs">计算机学院</a></p>
-        `,
-        { status: 200, headers: { "content-type": "text/html" } }
-      );
     const context = {
       waitUntil: () => undefined,
       passThroughOnException: () => undefined
     } as unknown as ExecutionContext;
+    const env = { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env;
+    db.externalSourceSyncItems.set("abandoned\u0000stale-item", {
+      runId: "abandoned",
+      itemKey: "stale-item",
+      contentHash: "0".repeat(64),
+      payload: "{}",
+      sourceGroup: "xingkebaoyan",
+      createdAt: "2000-01-01T00:00:00.000Z"
+    });
+    db.itemSnapshots.set("old-item", {
+      item_key: "old-item",
+      content_hash: "b".repeat(64),
+      payload: JSON.stringify({
+        key: "old-item",
+        contentHash: "b".repeat(64),
+        sourceGroup: "xingkebaoyan",
+        name: "旧大学",
+        institute: "计算机学院",
+        description: "旧通知",
+        deadline: "2099-08-01T15:59:59.000Z",
+        website: "https://example.com/old",
+        tags: []
+      }),
+      source_group: "xingkebaoyan",
+      first_seen_at: "2099-01-01T00:00:00.000Z",
+      updated_at: "2099-01-01T00:00:00.000Z",
+      last_seen_at: "2099-01-01T00:00:00.000Z",
+      missing_since: null
+    });
+    const runId = new Date().toISOString();
+    const sourceStats = [
+      "baoyanxinxi2026jsjby",
+      "xingkebaoyan",
+      "zscampus"
+    ].map((sourceGroup) => ({
+      sourceGroup,
+      url: `https://example.com/${sourceGroup}`,
+      rawCount: 2,
+      acceptedCount: 2,
+      filteredCount: 0,
+      duplicateCount: 0,
+      supplementedDeadlineCount: 0
+    }));
+    const items: NormalizedItem[] = ["one", "two"].map((suffix, index) => ({
+      key: `external-${suffix}`,
+      contentHash: String(index + 1).repeat(64),
+      sourceGroup: index === 0 ? "xingkebaoyan" : "zscampus",
+      sourceGroups: [index === 0 ? "xingkebaoyan" : "zscampus"],
+      name: `测试大学${index + 1}`,
+      institute: "计算机学院",
+      description: "推免通知",
+      deadline: `2099-09-${10 + index}T15:59:59.000Z`,
+      deadlinePrecision: "date",
+      deadlineConflict: false,
+      deadlineSource: index === 0 ? "xingkebaoyan" : "zscampus",
+      website: `https://example.com/${suffix}`,
+      sourceObservations: [],
+      alternateWebsites: [],
+      mergeReason: "single",
+      tags: []
+    }));
+    const authorizedHeaders = {
+      authorization: "Bearer secret",
+      "content-type": "application/json"
+    };
 
-    try {
-      const response = await handleRequest(
-        new Request("https://example.com/api/admin/run-check", {
-          headers: {
-            authorization: "Bearer secret"
-          }
-        }),
+    const start = await handleRequest(
+      new Request("https://example.com/api/admin/source-sync/start", {
+        method: "POST",
+        headers: authorizedHeaders,
+        body: JSON.stringify({
+          runId,
+          expectedCount: 2,
+          reviewCandidateCount: 0,
+          sourceStats,
+          activityTypeCounts: { summer_camp: 0, pre_recommendation: 0, unknown: 2 }
+        })
+      }),
+      env,
+      context
+    );
+    const secondRunId = new Date(new Date(runId).getTime() + 1_000).toISOString();
+    const concurrentStart = await handleRequest(
+      new Request("https://example.com/api/admin/source-sync/start", {
+        method: "POST",
+        headers: authorizedHeaders,
+        body: JSON.stringify({
+          runId: secondRunId,
+          expectedCount: 2,
+          reviewCandidateCount: 0,
+          sourceStats,
+          activityTypeCounts: { summer_camp: 0, pre_recommendation: 0, unknown: 2 }
+        })
+      }),
+      env,
+      context
+    );
+    const indexResponse = await handleRequest(
+      new Request("https://example.com/api/admin/source-sync/index", {
+        method: "POST",
+        headers: authorizedHeaders,
+        body: JSON.stringify({ runId, cursor: "", limit: 100 })
+      }),
+      env,
+      context
+    );
+    const indexBody = (await indexResponse.json()) as {
+      items: Array<{ key: string; active: boolean }>;
+      nextCursor: string | null;
+    };
+    const upload = await handleRequest(
+      new Request("https://example.com/api/admin/source-sync/items", {
+        method: "POST",
+        headers: authorizedHeaders,
+        body: JSON.stringify({ runId, items })
+      }),
+      env,
+      context
+    );
+    expect(db.itemSnapshots.get("old-item")?.missing_since).toBeNull();
+    expect(db.itemSnapshots.has("external-one")).toBe(false);
+    expect(db.externalSourceSyncItems.size).toBe(2);
+    const finalize = await handleRequest(
+      new Request("https://example.com/api/admin/source-sync/finalize", {
+        method: "POST",
+        headers: authorizedHeaders,
+        body: JSON.stringify({ runId })
+      }),
+      env,
+      context
+    );
+
+    expect(start.status).toBe(200);
+    expect(
+      Array.from(db.externalSourceSyncItems.values()).some(
+        (row) => row.runId === "abandoned"
+      )
+    ).toBe(false);
+    expect(concurrentStart.status).toBe(409);
+    expect(indexResponse.status).toBe(200);
+    expect(indexBody).toMatchObject({
+      items: [{ key: "old-item", active: true }],
+      nextCursor: null
+    });
+    expect(upload.status).toBe(200);
+    expect(finalize.status).toBe(200);
+    expect(db.externalSourceSyncItems.size).toBe(0);
+    expect(db.itemSnapshots.has("external-one")).toBe(true);
+    expect(db.itemSnapshots.get("old-item")?.missing_since).not.toBeNull();
+    expect(db.itemSnapshots.get("external-one")?.first_seen_at).toBe(
+      db.appState.get("last_synced_at")
+    );
+    expect(db.itemSnapshots.get("external-one")?.last_seen_at).toBe(
+      db.appState.get("last_synced_at")
+    );
+    expect(db.appState.get("last_source_stats")).toBe(JSON.stringify(sourceStats));
+    expect(db.appState.get("external_source_sync_active_run")).toBe("");
+  });
+
+  it("returns paginated verification candidates with explicit reasons", async () => {
+    const db = new FakeD1Database();
+    const context = {
+      waitUntil: () => undefined,
+      passThroughOnException: () => undefined
+    } as unknown as ExecutionContext;
+    const env = { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env;
+    for (const [index, key] of ["candidate-a", "candidate-b"].entries()) {
+      const item: NormalizedItem = {
+        key,
+        contentHash: String(index + 1).repeat(64),
+        sourceGroup: "xingkebaoyan",
+        sourceGroups: ["xingkebaoyan"],
+        name: `测试大学${index + 1}`,
+        institute: "计算机学院",
+        description: "推免通知",
+        deadline: `2099-09-${10 + index}T15:59:59.000Z`,
+        deadlinePrecision: "date",
+        deadlineConflict: index === 0,
+        deadlineSource: "xingkebaoyan",
+        website: `https://example.com/${key}`,
+        sourceObservations: [],
+        alternateWebsites: [],
+        mergeReason: "single",
+        tags: []
+      };
+      db.itemSnapshots.set(key, {
+        item_key: key,
+        content_hash: item.contentHash,
+        payload: JSON.stringify(item),
+        source_group: item.sourceGroup,
+        first_seen_at: "2099-07-01T00:00:00.000Z",
+        updated_at: "2099-07-01T00:00:00.000Z",
+        last_seen_at: "2099-07-01T00:00:00.000Z",
+        missing_since: null
+      });
+    }
+    const headers = {
+      authorization: "Bearer secret",
+      "content-type": "application/json"
+    };
+
+    const unauthorized = await handleRequest(
+      new Request("https://example.com/api/admin/verification-candidates", {
+        method: "POST",
+        body: "{}"
+      }),
+      env,
+      context
+    );
+    const first = await handleRequest(
+      new Request("https://example.com/api/admin/verification-candidates", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ cursor: "", limit: 1 })
+      }),
+      env,
+      context
+    );
+    const firstBody = (await first.json()) as {
+      candidates: Array<{ key: string; reasons: string[] }>;
+      nextCursor: string | null;
+    };
+    const second = await handleRequest(
+      new Request("https://example.com/api/admin/verification-candidates", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ cursor: firstBody.nextCursor, limit: 1 })
+      }),
+      env,
+      context
+    );
+    const secondBody = (await second.json()) as {
+      candidates: Array<{ key: string; reasons: string[] }>;
+      nextCursor: string | null;
+    };
+
+    expect(unauthorized.status).toBe(401);
+    expect(first.status).toBe(200);
+    expect(firstBody).toMatchObject({
+      candidates: [
         {
-          DB: db as unknown as D1Database,
-          ADMIN_TOKEN: "secret",
-          BAOYANXINXI_SOURCE_URL: "https://example.com/baoyanxinxi.html",
-          APP_BASE_URL: "https://example.com"
-        } as Env,
+          key: "candidate-a",
+          reasons: [
+            "date-level-deadline",
+            "deadline-conflict",
+            "unclassified-relevance",
+            "unclassified-activity-type"
+          ]
+        }
+      ],
+      nextCursor: "candidate-a"
+    });
+    expect(second.status).toBe(200);
+    expect(secondBody).toMatchObject({
+      candidates: [{ key: "candidate-b" }],
+      nextCursor: null
+    });
+  });
+
+  it("rejects legacy Worker-side source sync", async () => {
+    const db = new FakeD1Database();
+    const context = {
+      waitUntil: () => undefined,
+      passThroughOnException: () => undefined
+    } as unknown as ExecutionContext;
+    const env = {
+      DB: db as unknown as D1Database,
+      ADMIN_TOKEN: "secret"
+    } as Env;
+
+    for (const path of ["run-check", "sync-sources"]) {
+      const response = await handleRequest(
+        new Request(`https://example.com/api/admin/${path}`, {
+          headers: { authorization: "Bearer secret" }
+        }),
+        env,
         context
       );
-      const body = (await response.json()) as {
-        ok: boolean;
-        result: {
-          dailyDeadlineDetected: number;
-          dailyDeadlineSent: number;
-          newDeadlineDetected: number;
-          newDeadlineSent: number;
-          lastSyncedAt: string;
-        };
-      };
+      const body = (await response.json()) as { ok: boolean; error: string };
 
-      expect(response.status).toBe(200);
-      expect(body.ok).toBe(true);
-      expect(body.result.dailyDeadlineDetected).toBe(1);
-      expect(body.result.dailyDeadlineSent).toBe(0);
-      expect(body.result.newDeadlineDetected).toBe(0);
-      expect(body.result.newDeadlineSent).toBe(0);
-      expect(body.result.lastSyncedAt).toBe("2026-06-07T01:00:00.000Z");
-      expect(db.itemSnapshots.size).toBe(1);
-      expect(db.newDeadlineNotifications).toHaveLength(0);
-      expect(db.mailLogs).toHaveLength(0);
-    } finally {
-      globalThis.fetch = originalFetch;
-      vi.useRealTimers();
+      expect(response.status).toBe(409);
+      expect(body).toMatchObject({ ok: false, error: "external_sync_required" });
     }
+    expect(db.itemSnapshots.size).toBe(0);
   });
 
   it("returns gone for disabled subscription confirmation flows", async () => {

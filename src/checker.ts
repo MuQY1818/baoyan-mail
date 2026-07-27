@@ -5,11 +5,11 @@ import {
   getItemActivityTypeClassifications,
   getItemRelevanceClassifications,
   getManualItems,
+  getOfficialItemVerifications,
   getPendingNewDeadlineNotifications,
-  getSnapshotCount,
+  getSnapshotLastSeenCount,
   getSnapshotRows,
-  getSnapshots,
-  getUnmissingSnapshotRefs,
+  getSnapshotRowsBySourceGroups,
   insertNewDeadlineNotifications,
   logMailSend,
   markSnapshotsMissing,
@@ -20,6 +20,7 @@ import {
 } from "./db";
 import {
   applyActivityTypeClassificationsToItems,
+  applyOfficialItemVerificationsToItems,
   applyRelevanceClassificationsToItems,
   getDdlEntryNormalizedUrls
 } from "./ddl";
@@ -29,8 +30,12 @@ import {
 } from "./email";
 import {
   canonicalizeNotificationUrl,
+  AUTOMATIC_SOURCE_GROUPS,
   fetchSourceItemsWithStats,
-  getBaoyanXinxiAreas
+  getBaoyanXinxiAreas,
+  MANUAL_SOURCE_GROUP,
+  mergeNormalizedItems,
+  rehashNormalizedItem
 } from "./source";
 import type {
   ActivityType,
@@ -48,6 +53,7 @@ const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const UNKNOWN_DEADLINE_VALUES = new Set(["", "暂无", "待定", "无明确说明"]);
 const DAILY_DEADLINE_DIGEST_STATE_KEY = "daily_deadline_digest_sent_date";
 const LAST_SYNC_STATE_KEY = "last_synced_at";
+export const LAST_SOURCE_STATS_STATE_KEY = "last_source_stats";
 const STALE_GRACE_HOURS = 48;
 const STALE_GRACE_MS = STALE_GRACE_HOURS * 60 * 60 * 1000;
 const SHANGHAI_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
@@ -76,22 +82,38 @@ export async function runCheck(
   const now = new Date().toISOString();
   const nowDate = new Date(now);
   const today = formatShanghaiDate(nowDate);
-  const sourceResult = await fetchSourceItemsWithStats(env);
-  const manualItems = await getManualItems(env);
-  const items = [...sourceResult.items, ...manualItems];
-  const normalizedUrls = getDdlEntryNormalizedUrls(items);
-  const [classifications, activityTypeClassifications] = await Promise.all([
-    getItemRelevanceClassifications(env, normalizedUrls),
-    getItemActivityTypeClassifications(env, normalizedUrls)
+  const [sourceResult, manualItems, currentSnapshotRows] = await Promise.all([
+    fetchSourceItemsWithStats(env),
+    getManualItems(env),
+    getSnapshotRowsBySourceGroups(env, [...AUTOMATIC_SOURCE_GROUPS, MANUAL_SOURCE_GROUP])
   ]);
+  const snapshotRows =
+    currentSnapshotRows.length > 0 ? currentSnapshotRows : await getSnapshotRows(env);
+  const snapshotCount = snapshotRows.length;
+  const snapshots = new Map(snapshotRows.map((row) => [row.item_key, row]));
+  const mergedItems =
+    manualItems.length === 0
+      ? sourceResult.items
+      : await mergeNormalizedItems([...sourceResult.items, ...manualItems]);
+  const items = await reconcileSourceItemsWithSnapshots(
+    mergedItems,
+    snapshots,
+    sourceResult.stats
+  );
+  const normalizedUrls = getDdlEntryNormalizedUrls(items);
+  const [classifications, activityTypeClassifications, officialVerifications] = await Promise.all([
+    getItemRelevanceClassifications(env, normalizedUrls),
+    getItemActivityTypeClassifications(env, normalizedUrls),
+    getOfficialItemVerifications(env, normalizedUrls)
+  ]);
+  const verifiedItems = applyOfficialItemVerificationsToItems(items, officialVerifications);
+  assertUniqueItemKeys(verifiedItems);
   const classifiedItems = applyActivityTypeClassificationsToItems(
-    applyRelevanceClassificationsToItems(items, classifications),
+    applyRelevanceClassificationsToItems(verifiedItems, classifications),
     activityTypeClassifications
   );
   const sourceStats = sourceResult.stats.map((stats) => ({ ...stats }));
   await upsertReviewCandidates(env, sourceResult.reviewCandidates, now);
-  const snapshotCount = await getSnapshotCount(env);
-  const snapshots = snapshotCount === 0 ? new Map() : await getSnapshots(env);
   let initialized = false;
   let newDeadlineItems: NormalizedItem[] = [];
   let addedCount = 0;
@@ -99,11 +121,12 @@ export async function runCheck(
   let missingCount = 0;
 
   if (snapshotCount === 0) {
-    await upsertSnapshots(env, items, now);
+    await upsertSnapshots(env, verifiedItems, now);
+    await assertSnapshotWriteCount(env, now, verifiedItems.length);
     initialized = true;
-    addedCount = items.length;
+    addedCount = verifiedItems.length;
   } else {
-    const detected = detectChanges(items, snapshots);
+    const detected = detectChanges(verifiedItems, snapshots);
     addedCount = detected.filter((change) => change.kind === "added").length;
     changedCount = detected.filter((change) => change.kind === "changed").length;
     if (sendEmails) {
@@ -115,11 +138,19 @@ export async function runCheck(
         classifications
       );
     }
-    await upsertSnapshots(env, items, now);
-    missingCount = await markMissingForSuccessfulSources(env, items, sourceStats, now);
+    await upsertSnapshots(env, verifiedItems, now);
+    await assertSnapshotWriteCount(env, now, verifiedItems.length);
+    missingCount = await markMissingForSuccessfulSources(
+      env,
+      verifiedItems,
+      snapshots,
+      sourceStats,
+      now
+    );
   }
 
   await setAppState(env, LAST_SYNC_STATE_KEY, now, now);
+  await setAppState(env, LAST_SOURCE_STATS_STATE_KEY, JSON.stringify(sourceStats), now);
   const dailyDeadlineDigest = collectDailyDeadlineDigestItems(
     getEmailRelevantItems(classifiedItems),
     DAILY_DEADLINE_DIGEST_DAYS,
@@ -138,10 +169,13 @@ export async function runCheck(
   const newDeadlineSendResult = sendEmails
     ? await sendPendingNewDeadlineNotifications(env, baseUrl, now, nowDate)
     : { sent: 0, subscriberCount: 0 };
-  const staleCounts = countStaleSnapshotRows(await getSnapshotRows(env), nowDate);
+  const staleCounts = countStaleSnapshotRows(
+    await getSnapshotRowsBySourceGroups(env, [...AUTOMATIC_SOURCE_GROUPS, MANUAL_SOURCE_GROUP]),
+    nowDate
+  );
   return {
     initialized,
-    scanned: items.length,
+    scanned: verifiedItems.length,
     detected: 0,
     pendingSent: 0,
     deadlineDetected: 0,
@@ -163,6 +197,32 @@ export async function runCheck(
     sourceStats,
     activityTypeCounts: countActivityTypes(classifiedItems)
   };
+}
+
+function assertUniqueItemKeys(items: NormalizedItem[]): void {
+  const keys = new Set<string>();
+  const duplicates: string[] = [];
+  for (const item of items) {
+    if (keys.has(item.key)) {
+      duplicates.push(`${item.key}:${item.name}:${item.institute}`);
+      continue;
+    }
+    keys.add(item.key);
+  }
+  if (duplicates.length > 0) {
+    throw new Error(`同步结果存在重复 item_key：${duplicates.slice(0, 5).join("；")}`);
+  }
+}
+
+async function assertSnapshotWriteCount(
+  env: Env,
+  lastSeenAt: string,
+  expected: number
+): Promise<void> {
+  const actual = await getSnapshotLastSeenCount(env, lastSeenAt);
+  if (actual !== expected) {
+    throw new Error(`快照写入数量不一致：expected=${expected}, actual=${actual}`);
+  }
 }
 
 function countActivityTypes(items: NormalizedItem[]): Record<ActivityType, number> {
@@ -191,6 +251,7 @@ function getEmailRelevantItems(items: NormalizedItem[]): NormalizedItem[] {
 async function markMissingForSuccessfulSources(
   env: Env,
   items: NormalizedItem[],
+  snapshots: Map<string, { payload: string; source_group: string; missing_since?: string | null }>,
   sourceStats: SourceStats[],
   now: string
 ): Promise<number> {
@@ -200,15 +261,149 @@ async function markMissingForSuccessfulSources(
       .filter((stats) => stats.error === undefined && stats.rawCount > 0)
       .map((stats) => stats.sourceGroup)
   );
-  const refs = await getUnmissingSnapshotRefs(env);
-  const missingKeys = refs
-    .filter((ref) => !seenKeys.has(ref.item_key))
-    .filter(
-      (ref) =>
-        ref.source_group !== "manual" && successfulSourceGroups.has(ref.source_group)
-    )
-    .map((ref) => ref.item_key);
+  const missingKeys: string[] = [];
+  for (const [itemKey, snapshot] of snapshots.entries()) {
+    if (snapshot.missing_since !== null && snapshot.missing_since !== undefined) {
+      continue;
+    }
+    if (seenKeys.has(itemKey)) {
+      continue;
+    }
+    const sourceGroups = getSnapshotSourceGroups(snapshot.payload, snapshot.source_group);
+    const automaticSourceGroups = sourceGroups.filter((sourceGroup) => sourceGroup !== "manual");
+    if (
+      automaticSourceGroups.length > 0 &&
+      automaticSourceGroups.every((sourceGroup) => successfulSourceGroups.has(sourceGroup))
+    ) {
+      missingKeys.push(itemKey);
+    }
+  }
   return markSnapshotsMissing(env, missingKeys, now);
+}
+
+async function reconcileSourceItemsWithSnapshots(
+  items: NormalizedItem[],
+  snapshots: Map<string, { payload: string; source_group: string; missing_since?: string | null }>,
+  sourceStats: SourceStats[]
+): Promise<NormalizedItem[]> {
+  if (snapshots.size === 0) {
+    return items;
+  }
+  const snapshotsByUrl = new Map<string, Array<{ key: string; item: NormalizedItem }>>();
+  for (const [key, snapshot] of snapshots.entries()) {
+    try {
+      const item = JSON.parse(snapshot.payload) as NormalizedItem;
+      for (const url of getItemCanonicalUrls(item)) {
+        const matches = snapshotsByUrl.get(url) ?? [];
+        matches.push({ key, item });
+        snapshotsByUrl.set(url, matches);
+      }
+    } catch {
+      continue;
+    }
+  }
+  const failedSourceGroups = new Set(
+    sourceStats.filter((stats) => stats.error !== undefined).map((stats) => stats.sourceGroup)
+  );
+  const usedSnapshotKeys = new Set<string>();
+  const assignments = items.map((item) => {
+    const matches = getItemCanonicalUrls(item)
+      .flatMap((url) => snapshotsByUrl.get(url) ?? [])
+      .filter((match, index, all) => all.findIndex((entry) => entry.key === match.key) === index)
+      .sort((left, right) => left.key.localeCompare(right.key));
+    const stableMatch = matches.find((match) => !usedSnapshotKeys.has(match.key));
+    if (stableMatch !== undefined) {
+      usedSnapshotKeys.add(stableMatch.key);
+    }
+    return { item, stableMatch };
+  });
+  const unavailableKeys = new Set(snapshots.keys());
+  const assignedKeys = new Set(usedSnapshotKeys);
+  const reconciled: NormalizedItem[] = [];
+  for (const { item, stableMatch } of assignments) {
+    const key =
+      stableMatch?.key ?? createAvailableSnapshotKey(item.key, unavailableKeys, assignedKeys);
+    assignedKeys.add(key);
+    unavailableKeys.add(key);
+    const withStableKey = key === item.key ? item : { ...item, key };
+    const retainedItem = retainFailedSourceObservations(
+      withStableKey,
+      stableMatch?.item,
+      failedSourceGroups
+    );
+    reconciled.push(
+      retainedItem === withStableKey ? withStableKey : await rehashNormalizedItem(retainedItem)
+    );
+  }
+  return reconciled;
+}
+
+function createAvailableSnapshotKey(
+  baseKey: string,
+  unavailableKeys: Set<string>,
+  assignedKeys: Set<string>
+): string {
+  if (!unavailableKeys.has(baseKey) && !assignedKeys.has(baseKey)) {
+    return baseKey;
+  }
+  let suffix = 2;
+  while (
+    unavailableKeys.has(`${baseKey}-split-${suffix}`) ||
+    assignedKeys.has(`${baseKey}-split-${suffix}`)
+  ) {
+    suffix += 1;
+  }
+  return `${baseKey}-split-${suffix}`;
+}
+
+function retainFailedSourceObservations(
+  item: NormalizedItem,
+  previous: NormalizedItem | undefined,
+  failedSourceGroups: Set<string>
+): NormalizedItem {
+  if (previous === undefined || failedSourceGroups.size === 0) {
+    return item;
+  }
+  const retained = (previous.sourceObservations ?? []).filter((observation) =>
+    failedSourceGroups.has(observation.sourceGroup)
+  );
+  if (retained.length === 0) {
+    return item;
+  }
+  const current = item.sourceObservations ?? [];
+  const observations = [...current, ...retained].filter(
+    (observation, index, all) =>
+      all.findIndex(
+        (candidate) =>
+          candidate.sourceGroup === observation.sourceGroup &&
+          candidate.sourceItemId === observation.sourceItemId &&
+          canonicalizeNotificationUrl(candidate.website) === canonicalizeNotificationUrl(observation.website)
+      ) === index
+  );
+  const sourceGroups = Array.from(
+    new Set([...(item.sourceGroups ?? [item.sourceGroup]), ...retained.map((entry) => entry.sourceGroup)])
+  );
+  return { ...item, sourceGroups, sourceObservations: observations };
+}
+
+function getSnapshotSourceGroups(payload: string, fallbackSourceGroup: string): string[] {
+  try {
+    const item = JSON.parse(payload) as NormalizedItem;
+    const sourceGroups = item.sourceGroups?.filter((sourceGroup) => sourceGroup !== "") ?? [];
+    return sourceGroups.length > 0 ? sourceGroups : [fallbackSourceGroup];
+  } catch {
+    return [fallbackSourceGroup];
+  }
+}
+
+function getItemCanonicalUrls(item: NormalizedItem): string[] {
+  return Array.from(
+    new Set(
+      [item.website, ...(item.alternateWebsites ?? [])]
+        .map((website) => canonicalizeNotificationUrl(website))
+        .filter((website) => website !== "")
+    )
+  );
 }
 
 function countStaleSnapshotRows(

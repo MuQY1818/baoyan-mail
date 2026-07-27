@@ -3,7 +3,8 @@ import {
   classifyBaoyanXinxiRecord,
   getActivityTypeDetails,
   getBaoyanXinxiAreas,
-  getSchoolTierTags
+  getSchoolTierTags,
+  isSpecificNoticeUrl
 } from "./source";
 import type {
   ActivityType,
@@ -12,6 +13,7 @@ import type {
   ItemRelevanceClassification,
   ItemSnapshotRow,
   NormalizedItem,
+  OfficialItemVerification,
   Relevance
 } from "./types";
 
@@ -45,6 +47,14 @@ export interface DdlApiItem {
   relevanceClassifiedAt: string | null;
   sourceGroup: string;
   sourceLabel: string;
+  sourceGroups: string[];
+  sourceLabels: string[];
+  sourceCount: number;
+  mergeReason: "single" | "exact_url" | "title_match";
+  deadlinePrecision: "exact" | "date" | "unknown";
+  deadlineConflict: boolean;
+  deadlineSource: string | null;
+  officialVerifiedAt: string | null;
   activityType: ActivityType;
   activityTypeLabel: string;
   activityTypeSource: ActivityTypeSource;
@@ -83,6 +93,7 @@ export interface DdlApiResponse {
 export interface BuildDdlResponseOptions {
   includeExpired?: boolean;
   activityTypeClassifications?: Map<string, ItemActivityTypeClassification>;
+  officialVerifications?: Map<string, OfficialItemVerification>;
 }
 
 export function buildDdlResponse(
@@ -93,14 +104,17 @@ export function buildDdlResponse(
   options: BuildDdlResponseOptions = {}
 ): DdlApiResponse {
   const activityTypeClassifications = options.activityTypeClassifications ?? new Map();
+  const officialVerifications = options.officialVerifications ?? new Map();
   const contexts = entries.map((entry) =>
-    toDdlContext(entry, classifications, activityTypeClassifications)
+    toDdlContext(entry, classifications, activityTypeClassifications, officialVerifications)
   );
-  const serializedItems = contexts
-    .map((context) => serializeDdlItem(context, now))
-    .filter((item): item is DdlApiItem => item !== null)
-    .reduce(dedupeDdlItems(), [])
-    .sort(compareDdlItems);
+  const serializedItems = hideSupersededGraceAliases(
+    contexts
+      .map((context) => serializeDdlItem(context, now))
+      .filter((item): item is DdlApiItem => item !== null)
+      .reduce(dedupeDdlItems(), [])
+      .sort(compareDdlItems)
+  );
   const ddlItems = serializedItems.filter(
     (item) =>
       (options.includeExpired === true && item.status === "expired") ||
@@ -121,6 +135,32 @@ export function buildDdlResponse(
     sourceStats: buildSourceStats(serializedItems),
     items: ddlItems
   };
+}
+
+function hideSupersededGraceAliases(items: DdlApiItem[]): DdlApiItem[] {
+  const activeMergedItems = items.filter(
+    (item) =>
+      item.sourceVisibility === "current" &&
+      item.mergeReason === "exact_url" &&
+      item.sourceCount > 1 &&
+      isSpecificNoticeUrl(item.website)
+  );
+  if (activeMergedItems.length === 0) {
+    return items;
+  }
+  return items.filter((item) => {
+    if (item.sourceVisibility !== "grace") {
+      return true;
+    }
+    const canonicalUrl = canonicalizeNotificationUrl(item.website);
+    const school = normalizeDuplicateText(item.school);
+    return !activeMergedItems.some(
+      (activeItem) =>
+        canonicalizeNotificationUrl(activeItem.website) === canonicalUrl &&
+        normalizeDuplicateText(activeItem.school) === school &&
+        item.sourceGroups.every((sourceGroup) => activeItem.sourceGroups.includes(sourceGroup))
+    );
+  });
 }
 
 interface DdlContext {
@@ -163,11 +203,26 @@ function getDdlDuplicateKey(item: DdlApiItem): string {
     canonicalUrl,
     normalizeDuplicateText(item.school),
     normalizeDuplicateText(item.institute),
-    item.deadlineAt
+    formatShanghaiDate(new Date(item.deadlineAt))
   ].join("\u0000");
 }
 
 function shouldPreferDdlItem(candidate: DdlApiItem, current: DdlApiItem): boolean {
+  const candidateManual = candidate.sourceGroups.includes("manual") ? 1 : 0;
+  const currentManual = current.sourceGroups.includes("manual") ? 1 : 0;
+  if (candidateManual !== currentManual) {
+    return candidateManual > currentManual;
+  }
+  const precisionCompare =
+    getDeadlinePrecisionRank(candidate.deadlinePrecision) -
+    getDeadlinePrecisionRank(current.deadlinePrecision);
+  if (precisionCompare !== 0) {
+    return precisionCompare > 0;
+  }
+  const sourceCountCompare = candidate.sourceCount - current.sourceCount;
+  if (sourceCountCompare !== 0) {
+    return sourceCountCompare > 0;
+  }
   const candidateYearDistance = getSourceDeadlineYearDistance(candidate);
   const currentYearDistance = getSourceDeadlineYearDistance(current);
   if (candidateYearDistance !== currentYearDistance) {
@@ -216,6 +271,8 @@ export function serializeDdlItem(
   const tier = getSchoolTierTags(item.name)[0] ?? "其他";
   const relevance = getItemRelevance(item);
   const activityTypeDetails = getActivityTypeDetails(item);
+  const sourceGroups = getItemSourceGroups(item);
+  const sourceLabels = sourceGroups.map(formatSourceGroup);
 
   return {
     key: item.key,
@@ -234,7 +291,18 @@ export function serializeDdlItem(
     relevanceClassifier: item.relevanceClassifier ?? "rule-fallback",
     relevanceClassifiedAt: item.relevanceClassifiedAt ?? null,
     sourceGroup: item.sourceGroup,
-    sourceLabel: formatSourceGroup(item.sourceGroup),
+    sourceLabel:
+      sourceLabels.length <= 1
+        ? sourceLabels[0] ?? formatSourceGroup(item.sourceGroup)
+        : `${sourceLabels[0]} 等 ${sourceLabels.length} 个来源`,
+    sourceGroups,
+    sourceLabels,
+    sourceCount: sourceGroups.length,
+    mergeReason: item.mergeReason ?? "single",
+    deadlinePrecision: item.deadlinePrecision ?? "unknown",
+    deadlineConflict: item.deadlineConflict ?? false,
+    deadlineSource: item.deadlineSource ?? null,
+    officialVerifiedAt: item.officialVerifiedAt ?? null,
     activityType: activityTypeDetails.activityType,
     activityTypeLabel: formatActivityType(activityTypeDetails.activityType),
     activityTypeSource: activityTypeDetails.activityTypeSource,
@@ -262,9 +330,11 @@ export function formatActivityType(activityType: ActivityType): string {
 }
 
 export function getDdlEntryNormalizedUrls(entries: Array<NormalizedItem | ItemSnapshotRow>): string[] {
-  return entries
-    .map((entry) => canonicalizeNotificationUrl(toDdlContext(entry).item.website))
-    .filter((url) => url !== "");
+  return Array.from(
+    new Set(
+      entries.flatMap((entry) => getItemNormalizedUrls(toDdlContext(entry).item))
+    )
+  );
 }
 
 export function applyRelevanceClassificationsToItems(
@@ -278,8 +348,9 @@ export function applyRelevanceClassification(
   item: NormalizedItem,
   classifications: Map<string, ItemRelevanceClassification>
 ): NormalizedItem {
-  const normalizedUrl = canonicalizeNotificationUrl(item.website);
-  const classification = classifications.get(normalizedUrl);
+  const classification = getItemNormalizedUrls(item)
+    .map((url) => classifications.get(url))
+    .find((entry): entry is ItemRelevanceClassification => entry !== undefined);
   if (classification !== undefined) {
     const fallbackRelevance = getRuleFallbackRelevance(item);
     if (shouldUseRuleGuard(classification.relevance, fallbackRelevance)) {
@@ -322,8 +393,9 @@ export function applyActivityTypeClassification(
   item: NormalizedItem,
   classifications: Map<string, ItemActivityTypeClassification>
 ): NormalizedItem {
-  const normalizedUrl = canonicalizeNotificationUrl(item.website);
-  const classification = classifications.get(normalizedUrl);
+  const classification = getItemNormalizedUrls(item)
+    .map((url) => classifications.get(url))
+    .find((entry): entry is ItemActivityTypeClassification => entry !== undefined);
   if (classification === undefined) {
     return item;
   }
@@ -334,6 +406,35 @@ export function applyActivityTypeClassification(
     activityTypeReason: classification.reason,
     activityTypeClassifier: classification.classifier,
     activityTypeClassifiedAt: classification.classifiedAt
+  };
+}
+
+export function applyOfficialItemVerificationsToItems(
+  items: NormalizedItem[],
+  verifications: Map<string, OfficialItemVerification>
+): NormalizedItem[] {
+  return items.map((item) => applyOfficialItemVerification(item, verifications));
+}
+
+export function applyOfficialItemVerification(
+  item: NormalizedItem,
+  verifications: Map<string, OfficialItemVerification>
+): NormalizedItem {
+  const verification = getItemNormalizedUrls(item)
+    .map((url) => verifications.get(url))
+    .find((entry): entry is OfficialItemVerification => entry !== undefined);
+  if (verification === undefined) {
+    return item;
+  }
+  return {
+    ...item,
+    description: verification.title === "" ? item.description : verification.title,
+    deadline: verification.deadline,
+    deadlinePrecision: verification.deadlinePrecision,
+    deadlineConflict: false,
+    deadlineSource: "official-verification",
+    officialTitle: verification.title,
+    officialVerifiedAt: verification.verifiedAt
   };
 }
 
@@ -416,6 +517,15 @@ function formatSourceGroup(sourceGroup: string): string {
   if (sourceGroup === "baoyanxinxi2026jsjby") {
     return "保研信息平台";
   }
+  if (sourceGroup === "baoyanxinxi2026yutuimian") {
+    return "保研信息平台预推免";
+  }
+  if (sourceGroup === "xingkebaoyan") {
+    return "星刻保研";
+  }
+  if (sourceGroup === "zscampus") {
+    return "保研岛";
+  }
   const match = /^(camp|yutuimian)(\d{4})$/u.exec(sourceGroup);
   if (match === null) {
     return sourceGroup;
@@ -464,13 +574,17 @@ function toUtcDayNumber(parts: { year: number; month: number; day: number }): nu
 function toDdlContext(
   entry: NormalizedItem | ItemSnapshotRow,
   classifications: Map<string, ItemRelevanceClassification> = new Map(),
-  activityTypeClassifications: Map<string, ItemActivityTypeClassification> = new Map()
+  activityTypeClassifications: Map<string, ItemActivityTypeClassification> = new Map(),
+  officialVerifications: Map<string, OfficialItemVerification> = new Map()
 ): DdlContext {
   if ("payload" in entry) {
     const item = JSON.parse(entry.payload) as NormalizedItem;
     return {
       item: applyActivityTypeClassification(
-        applyRelevanceClassification(item, classifications),
+        applyRelevanceClassification(
+          applyOfficialItemVerification(item, officialVerifications),
+          classifications
+        ),
         activityTypeClassifications
       ),
       firstSeenAt: entry.first_seen_at,
@@ -481,7 +595,10 @@ function toDdlContext(
   }
   return {
     item: applyActivityTypeClassification(
-      applyRelevanceClassification(entry, classifications),
+      applyRelevanceClassification(
+        applyOfficialItemVerification(entry, officialVerifications),
+        classifications
+      ),
       activityTypeClassifications
     ),
     firstSeenAt: null,
@@ -512,7 +629,10 @@ function shouldUseRuleGuard(classificationRelevance: Relevance, fallbackRelevanc
 }
 
 function getRuleFallbackRelevance(item: NormalizedItem): Relevance {
-  const classification = classifyBaoyanXinxiRecord(item.name, item.institute);
+  const classification = classifyBaoyanXinxiRecord(
+    `${item.name} ${item.description}`,
+    item.institute
+  );
   if (classification === "accepted") {
     return "strong";
   }
@@ -520,6 +640,31 @@ function getRuleFallbackRelevance(item: NormalizedItem): Relevance {
     return "possible";
   }
   return "unrelated";
+}
+
+function getItemNormalizedUrls(item: NormalizedItem): string[] {
+  return Array.from(
+    new Set(
+      [item.website, ...(item.alternateWebsites ?? [])]
+        .map((website) => canonicalizeNotificationUrl(website))
+        .filter((website) => website !== "")
+    )
+  );
+}
+
+function getItemSourceGroups(item: NormalizedItem): string[] {
+  const sourceGroups = item.sourceGroups?.filter((sourceGroup) => sourceGroup !== "") ?? [];
+  return sourceGroups.length > 0 ? sourceGroups : [item.sourceGroup];
+}
+
+function getDeadlinePrecisionRank(precision: DdlApiItem["deadlinePrecision"]): number {
+  if (precision === "exact") {
+    return 2;
+  }
+  if (precision === "date") {
+    return 1;
+  }
+  return 0;
 }
 
 function normalizeDdlAreas(areas: string[]): string[] {
@@ -555,24 +700,26 @@ function getLatestLastSeenAt(contexts: DdlContext[]): string | null {
 function buildSourceStats(items: DdlApiItem[]): DdlApiSourceStat[] {
   const stats = new Map<string, DdlApiSourceStat>();
   for (const item of items.filter((entry) => entry.status !== "expired")) {
-    const current = stats.get(item.sourceGroup) ?? {
-      sourceGroup: item.sourceGroup,
-      sourceLabel: item.sourceLabel,
-      total: 0,
-      current: 0,
-      grace: 0,
-      staleHidden: 0
-    };
-    if (item.sourceVisibility === "current") {
-      current.current += 1;
-      current.total += 1;
-    } else if (item.sourceVisibility === "grace") {
-      current.grace += 1;
-      current.total += 1;
-    } else {
-      current.staleHidden += 1;
+    for (const sourceGroup of item.sourceGroups) {
+      const current = stats.get(sourceGroup) ?? {
+        sourceGroup,
+        sourceLabel: formatSourceGroup(sourceGroup),
+        total: 0,
+        current: 0,
+        grace: 0,
+        staleHidden: 0
+      };
+      if (item.sourceVisibility === "current") {
+        current.current += 1;
+        current.total += 1;
+      } else if (item.sourceVisibility === "grace") {
+        current.grace += 1;
+        current.total += 1;
+      } else {
+        current.staleHidden += 1;
+      }
+      stats.set(sourceGroup, current);
     }
-    stats.set(item.sourceGroup, current);
   }
   return Array.from(stats.values()).sort((left, right) =>
     left.sourceLabel.localeCompare(right.sourceLabel, "zh-CN")

@@ -4,13 +4,7 @@ compatibility_date = "2026-05-01"
 workers_dev = true
 
 [vars]
-SOURCE_URL = "https://raw.githubusercontent.com/CS-BAOYAN/CS-BAOYAN-DDL/main/src/data/schools.json"
-BAOYANXINXI_SOURCE_URL = "https://www.baoyanxinxi.cn/2026jsjby/"
 APP_BASE_URL = "https://baoyan.example.com"
-
-[triggers]
-# Cloudflare Cron 使用 UTC 时间。这里是每天北京时间 08:00-23:00 每小时整点。
-crons = ["0 0-15 * * *"]
 
 [[d1_databases]]
 binding = "DB"

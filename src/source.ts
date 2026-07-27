@@ -2,21 +2,44 @@ import { sha256Hex } from "./crypto";
 import type {
   ActivityType,
   ActivityTypeSource,
+  DeadlinePrecision,
   Env,
   NormalizedItem,
   ReviewCandidatePayload,
+  SourceMergeReason,
+  SourceObservation,
   SourceStats
 } from "./types";
 
 const DEFAULT_BAOYANXINXI_SOURCE_URL = "https://www.baoyanxinxi.cn/2026jsjby/";
+const DEFAULT_XINGKE_SOURCE_URL = "https://xingkebaoyan.com/data.json";
+const DEFAULT_ZSCAMPUS_SOURCE_URL =
+  "https://api.zscampus.com/zs-baoyan-summer/summer/getListWithConditions";
+const SOURCE_PAGE_SIZE = 100;
+const MAX_ZSCAMPUS_PAGES = 30;
+const SOURCE_FETCH_TIMEOUT_MS = 20_000;
 export const BAOYANXINXI_SOURCE_GROUP = "baoyanxinxi2026jsjby";
 export const BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_GROUP =
   "baoyanxinxi2026yutuimian";
+export const XINGKE_SOURCE_GROUP = "xingkebaoyan";
+export const ZSCAMPUS_SOURCE_GROUP = "zscampus";
 export const MANUAL_SOURCE_GROUP = "manual";
+export const AUTOMATIC_SOURCE_GROUPS = [
+  BAOYANXINXI_SOURCE_GROUP,
+  BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_GROUP,
+  XINGKE_SOURCE_GROUP,
+  ZSCAMPUS_SOURCE_GROUP
+] as const;
 const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const SHANGHAI_YEAR_FORMATTER = new Intl.DateTimeFormat("en-CA", {
   timeZone: SHANGHAI_TIME_ZONE,
   year: "numeric"
+});
+const SHANGHAI_DATE_FORMATTER = new Intl.DateTimeFormat("en-CA", {
+  timeZone: SHANGHAI_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit"
 });
 
 const UNKNOWN_DEADLINE_VALUES = new Set([
@@ -290,7 +313,7 @@ interface RawSchoolRecord {
   tags?: unknown;
 }
 
-type SourceItemInput = Omit<NormalizedItem, "key" | "contentHash">;
+export type SourceItemInput = Omit<NormalizedItem, "key" | "contentHash">;
 
 export interface FetchSourceItemsResult {
   items: NormalizedItem[];
@@ -319,16 +342,80 @@ interface BaoyanXinxiParseResult {
   records: BaoyanXinxiRecord[];
 }
 
+interface SourceFetchResult {
+  items: SourceItemInput[];
+  stats: SourceStats;
+  reviewCandidates: SourceReviewCandidateInput[];
+}
+
+interface SourceDefinition {
+  sourceGroup: string;
+  url: string;
+  activityType?: ActivityType;
+  fetchItems: () => Promise<SourceFetchResult>;
+}
+
+interface MergeSourceItemsResult {
+  items: SourceItemInput[];
+  duplicateCountsBySource: Map<string, number>;
+}
+
+interface XingkeRecord {
+  id?: unknown;
+  school?: unknown;
+  department?: unknown;
+  title?: unknown;
+  category?: unknown;
+  signup_end?: unknown;
+  signup_end_text?: unknown;
+  url?: unknown;
+  created_at?: unknown;
+  updated_at?: unknown;
+}
+
+interface ZscampusRecord {
+  summerid?: unknown;
+  summername?: unknown;
+  universityname?: unknown;
+  collegename?: unknown;
+  websiteUrl?: unknown;
+  recruitType?: unknown;
+  publishTime?: unknown;
+  createTime?: unknown;
+  endtime?: unknown;
+}
+
 export async function fetchSourceItems(env: Env): Promise<NormalizedItem[]> {
   return (await fetchSourceItemsWithStats(env)).items;
 }
 
 export async function fetchSourceItemsWithStats(env: Env): Promise<FetchSourceItemsResult> {
-  const sourceDefinitions: BaoyanXinxiSourceDefinition[] = [
+  const baoyanSourceUrl = env.BAOYANXINXI_SOURCE_URL ?? DEFAULT_BAOYANXINXI_SOURCE_URL;
+  const sourceDefinitions: SourceDefinition[] = [
     {
       activityType: "unknown",
       sourceGroup: BAOYANXINXI_SOURCE_GROUP,
-      url: env.BAOYANXINXI_SOURCE_URL ?? DEFAULT_BAOYANXINXI_SOURCE_URL
+      url: baoyanSourceUrl,
+      fetchItems: () =>
+        fetchBaoyanXinxiItems({
+          activityType: "unknown",
+          sourceGroup: BAOYANXINXI_SOURCE_GROUP,
+          url: baoyanSourceUrl
+        })
+    },
+    {
+      sourceGroup: XINGKE_SOURCE_GROUP,
+      url: env.XINGKE_SOURCE_URL ?? DEFAULT_XINGKE_SOURCE_URL,
+      fetchItems: () => fetchXingkeItems(env.XINGKE_SOURCE_URL ?? DEFAULT_XINGKE_SOURCE_URL)
+    },
+    {
+      sourceGroup: ZSCAMPUS_SOURCE_GROUP,
+      url: env.ZSCAMPUS_SOURCE_URL ?? DEFAULT_ZSCAMPUS_SOURCE_URL,
+      fetchItems: () =>
+        fetchZscampusItems(
+          env.ZSCAMPUS_SOURCE_URL ?? DEFAULT_ZSCAMPUS_SOURCE_URL,
+          getSourceYear(env)
+        )
     }
   ];
   const preRecommendationUrl = env.BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_URL?.trim();
@@ -336,30 +423,39 @@ export async function fetchSourceItemsWithStats(env: Env): Promise<FetchSourceIt
     sourceDefinitions.push({
       activityType: "pre_recommendation",
       sourceGroup: BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_GROUP,
-      url: preRecommendationUrl
+      url: preRecommendationUrl,
+      fetchItems: () =>
+        fetchBaoyanXinxiItems({
+          activityType: "pre_recommendation",
+          sourceGroup: BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_GROUP,
+          url: preRecommendationUrl
+        })
     });
   }
 
-  const sourceResults = await Promise.all(
-    sourceDefinitions.map((definition) => fetchBaoyanXinxiItems(definition))
+  const settledResults = await Promise.allSettled(
+    sourceDefinitions.map((definition) => definition.fetchItems())
   );
-  const allItems = sourceResults.flatMap((result) => result.items);
-  const dedupedItems = dedupeSourceItems(allItems);
-  const finalized = await finalizeSourceItems(dedupedItems.items);
+  const sourceResults = settledResults.map((result, index) =>
+    result.status === "fulfilled"
+      ? result.value
+      : createSourceErrorResult(sourceDefinitions[index]!, result.reason)
+  );
+  const mergedItems = mergeSourceItems(sourceResults.flatMap((result) => result.items));
+  const finalized = await finalizeSourceItems(mergedItems.items);
 
   return {
     items: finalized.items,
-    stats: sourceResults.map((result, index) => ({
-      ...result.stats,
-      duplicateCount:
-        result.stats.duplicateCount + (index === 0 ? dedupedItems.duplicateCount : 0)
-    })),
-    reviewCandidates: sourceResults.flatMap((result) => result.reviewCandidates)
+    stats: enrichSourceStats(sourceResults.map((result) => result.stats), mergedItems),
+    reviewCandidates: [
+      ...sourceResults.flatMap((result) => result.reviewCandidates),
+      ...buildMergeReviewCandidates(mergedItems.items)
+    ]
   };
 }
 
 export async function normalizeSourceData(data: unknown): Promise<NormalizedItem[]> {
-  return (await finalizeSourceItems(dedupeSourceItems(normalizeCsRecords(extractRecords(data))).items))
+  return (await finalizeSourceItems(mergeSourceItems(normalizeCsRecords(extractRecords(data))).items))
     .items;
 }
 
@@ -375,13 +471,32 @@ export function normalizeBaoyanXinxiHtml(
 
   for (const record of parsed.records) {
     const deadline = normalizeBaoyanXinxiDeadline(record.deadline);
+    const deadlinePrecision = inferDeadlinePrecision(record.deadline, deadline);
     items.push({
       sourceGroup,
+      sourceGroups: [sourceGroup],
       name: record.name,
       institute: record.institute,
       description: "保研信息平台补充源",
       deadline,
+      deadlinePrecision,
+      deadlineConflict: false,
+      deadlineSource: sourceGroup,
       website: record.website,
+      sourceObservations: [
+        createSourceObservation({
+          sourceGroup,
+          sourceItemId: canonicalizeNotificationUrl(record.website),
+          title: "",
+          website: record.website,
+          deadlineRaw: record.deadline,
+          deadline,
+          deadlinePrecision,
+          publishedAt: ""
+        })
+      ],
+      alternateWebsites: [],
+      mergeReason: "single",
       tags: getSchoolTierTags(record.name),
       activityType: record.activityType,
       activityTypeSource: record.activityTypeSource,
@@ -572,6 +687,7 @@ export function canonicalizeNotificationUrl(value: string): string {
 
   try {
     const url = new URL(trimmed);
+    const applicationHash = /^#(?:!\/|\/)/u.test(url.hash) ? url.hash : "";
     url.hash = "";
     url.hostname = url.hostname.toLowerCase();
 
@@ -596,6 +712,7 @@ export function canonicalizeNotificationUrl(value: string): string {
     if (url.pathname !== "/") {
       url.pathname = url.pathname.replace(/\/+$/u, "");
     }
+    url.hash = applicationHash;
     return url.toString();
   } catch {
     return trimmed.replace(/#.*$/u, "");
@@ -623,13 +740,34 @@ export async function createManualItemFromReviewPayload(
   const activityTypeDetails = getActivityTypeFromText(
     `${payload.institute} ${payload.description}`
   );
+  const deadline = normalizeBaoyanXinxiDeadline(payload.deadline.trim());
+  const deadlinePrecision = inferManualDeadlinePrecision(deadline);
+  const website = payload.website.trim();
   const itemInput: SourceItemInput = {
     sourceGroup: MANUAL_SOURCE_GROUP,
+    sourceGroups: [MANUAL_SOURCE_GROUP],
     name: payload.name.trim(),
     institute: payload.institute.trim(),
     description: payload.description.trim(),
-    deadline: payload.deadline.trim(),
-    website: payload.website.trim(),
+    deadline,
+    deadlinePrecision,
+    deadlineConflict: false,
+    deadlineSource: MANUAL_SOURCE_GROUP,
+    website,
+    sourceObservations: [
+      createSourceObservation({
+        sourceGroup: MANUAL_SOURCE_GROUP,
+        sourceItemId: canonicalizeNotificationUrl(website),
+        title: payload.description.trim(),
+        website,
+        deadlineRaw: payload.deadline.trim(),
+        deadline,
+        deadlinePrecision,
+        publishedAt: ""
+      })
+    ],
+    alternateWebsites: [],
+    mergeReason: "single",
     tags: getSchoolTierTags(payload.name),
     activityType: activityTypeDetails.activityType,
     activityTypeSource: activityTypeDetails.activityTypeSource
@@ -651,87 +789,1228 @@ export async function createManualItemFromReviewPayload(
 
 async function fetchBaoyanXinxiItems(
   definition: BaoyanXinxiSourceDefinition
-): Promise<{
-  items: SourceItemInput[];
-  stats: SourceStats;
-  reviewCandidates: SourceReviewCandidateInput[];
-}> {
-  try {
-    const response = await fetch(definition.url, {
-      headers: {
-        "User-Agent": "baoyan-mail-worker"
+): Promise<SourceFetchResult> {
+  const response = await fetchSourceResponse(definition.url, "text/html");
+  return normalizeBaoyanXinxiHtml(await response.text(), definition.url, {
+    activityType: definition.activityType,
+    sourceGroup: definition.sourceGroup
+  });
+}
+
+async function fetchXingkeItems(sourceUrl: string): Promise<SourceFetchResult> {
+  const response = await fetchSourceResponse(sourceUrl, "application/json");
+  return normalizeXingkeData(await response.json(), sourceUrl);
+}
+
+export function normalizeXingkeData(
+  data: unknown,
+  sourceUrl = DEFAULT_XINGKE_SOURCE_URL,
+  now = new Date()
+): SourceFetchResult {
+  const records = readObjectArray(data, "items") as XingkeRecord[];
+  const items: SourceItemInput[] = [];
+  let latestPublishedAt = "";
+
+  for (const record of records) {
+    const name = toCleanString(record.school);
+    const institute = toCleanString(record.department);
+    const title = toCleanString(record.title);
+    const website = toCleanString(record.url);
+    const structuredDeadline = toCleanString(record.signup_end);
+    const deadlineNote = toCleanString(record.signup_end_text);
+    const deadlineRaw = structuredDeadline || deadlineNote;
+    const deadline = normalizeBaoyanXinxiDeadline(structuredDeadline);
+    const deadlineAt = parseComparableDeadline(deadline);
+    if (
+      name === "" ||
+      title === "" ||
+      canonicalizeNotificationUrl(website) === "" ||
+      (deadlineAt !== null && deadlineAt.getTime() <= now.getTime())
+    ) {
+      continue;
+    }
+
+    const category = toCleanString(record.category);
+    const activityTypeDetails = getAggregateActivityType(category, title);
+    const publishedAt = normalizePublishedAt(
+      toCleanString(record.updated_at) || toCleanString(record.created_at)
+    );
+    latestPublishedAt = getLatestTimestamp(latestPublishedAt, publishedAt);
+    const deadlinePrecision = inferDeadlinePrecision(deadlineRaw, deadline);
+    items.push({
+      sourceGroup: XINGKE_SOURCE_GROUP,
+      sourceGroups: [XINGKE_SOURCE_GROUP],
+      name,
+      institute,
+      description: title,
+      deadline,
+      deadlinePrecision,
+      deadlineConflict: false,
+      deadlineSource: XINGKE_SOURCE_GROUP,
+      website,
+      sourceObservations: [
+        createSourceObservation({
+          sourceGroup: XINGKE_SOURCE_GROUP,
+          sourceItemId: toSourceItemId(record.id),
+          title,
+          website,
+          deadlineRaw,
+          deadline,
+          deadlinePrecision,
+          publishedAt
+        })
+      ],
+      alternateWebsites: [],
+      mergeReason: "single",
+      tags: getSchoolTierTags(name),
+      activityType: activityTypeDetails.activityType,
+      activityTypeSource: activityTypeDetails.activityTypeSource,
+      areas: getBaoyanXinxiAreas(`${name} ${title}`, institute)
+    });
+  }
+
+  return {
+    items,
+    stats: {
+      sourceGroup: XINGKE_SOURCE_GROUP,
+      url: sourceUrl,
+      rawCount: records.length,
+      acceptedCount: items.length,
+      filteredCount: records.length - items.length,
+      reviewCandidateCount: 0,
+      duplicateCount: 0,
+      supplementedDeadlineCount: 0,
+      unknownDeadlineCount: items.filter((item) => item.deadline === "").length,
+      pageCount: 1,
+      latestPublishedAt
+    },
+    reviewCandidates: []
+  };
+}
+
+async function fetchZscampusItems(
+  sourceUrl: string,
+  sourceYear: number
+): Promise<SourceFetchResult> {
+  const firstPage = await fetchZscampusPage(sourceUrl, sourceYear, 1);
+  const pageCount = Math.max(1, Math.ceil(firstPage.total / SOURCE_PAGE_SIZE));
+  if (pageCount > MAX_ZSCAMPUS_PAGES) {
+    throw new Error(`分页数量 ${pageCount} 超过安全上限 ${MAX_ZSCAMPUS_PAGES}`);
+  }
+
+  const remainingPages = await Promise.all(
+    Array.from({ length: pageCount - 1 }, (_value, index) =>
+      fetchZscampusPage(sourceUrl, sourceYear, index + 2)
+    )
+  );
+  const records = [firstPage, ...remainingPages].flatMap((page) => page.records);
+  return normalizeZscampusData(records, sourceUrl, pageCount);
+}
+
+export function normalizeZscampusData(
+  data: unknown,
+  sourceUrl = DEFAULT_ZSCAMPUS_SOURCE_URL,
+  pageCount = 1,
+  now = new Date()
+): SourceFetchResult {
+  const records = Array.isArray(data) ? (data as ZscampusRecord[]) : [];
+  const items: SourceItemInput[] = [];
+  let latestPublishedAt = "";
+
+  for (const record of records) {
+    const name = toCleanString(record.universityname);
+    const institute = toCleanString(record.collegename);
+    const title = toCleanString(record.summername);
+    const website = toCleanString(record.websiteUrl);
+    const deadlineRaw = toCleanString(record.endtime);
+    const deadline = normalizeBaoyanXinxiDeadline(deadlineRaw);
+    const deadlineAt = parseComparableDeadline(deadline);
+    if (
+      name === "" ||
+      title === "" ||
+      canonicalizeNotificationUrl(website) === "" ||
+      deadlineAt === null ||
+      deadlineAt.getTime() <= now.getTime()
+    ) {
+      continue;
+    }
+
+    const activityTypeDetails = getAggregateActivityType(
+      toCleanString(record.recruitType),
+      title
+    );
+    const publishedAt = normalizePublishedAt(
+      toCleanString(record.publishTime) || toCleanString(record.createTime)
+    );
+    latestPublishedAt = getLatestTimestamp(latestPublishedAt, publishedAt);
+    const deadlinePrecision = inferDeadlinePrecision(deadlineRaw, deadline);
+    items.push({
+      sourceGroup: ZSCAMPUS_SOURCE_GROUP,
+      sourceGroups: [ZSCAMPUS_SOURCE_GROUP],
+      name,
+      institute,
+      description: title,
+      deadline,
+      deadlinePrecision,
+      deadlineConflict: false,
+      deadlineSource: ZSCAMPUS_SOURCE_GROUP,
+      website,
+      sourceObservations: [
+        createSourceObservation({
+          sourceGroup: ZSCAMPUS_SOURCE_GROUP,
+          sourceItemId: toSourceItemId(record.summerid),
+          title,
+          website,
+          deadlineRaw,
+          deadline,
+          deadlinePrecision,
+          publishedAt
+        })
+      ],
+      alternateWebsites: [],
+      mergeReason: "single",
+      tags: getSchoolTierTags(name),
+      activityType: activityTypeDetails.activityType,
+      activityTypeSource: activityTypeDetails.activityTypeSource,
+      areas: getBaoyanXinxiAreas(`${name} ${title}`, institute)
+    });
+  }
+
+  return {
+    items,
+    stats: {
+      sourceGroup: ZSCAMPUS_SOURCE_GROUP,
+      url: sourceUrl,
+      rawCount: records.length,
+      acceptedCount: items.length,
+      filteredCount: records.length - items.length,
+      reviewCandidateCount: 0,
+      duplicateCount: 0,
+      supplementedDeadlineCount: 0,
+      pageCount,
+      latestPublishedAt
+    },
+    reviewCandidates: []
+  };
+}
+
+async function fetchZscampusPage(
+  sourceUrl: string,
+  sourceYear: number,
+  page: number
+): Promise<{ total: number; records: ZscampusRecord[] }> {
+  const url = new URL(
+    `${sourceUrl.replace(/\/+$/u, "")}/${page}/${SOURCE_PAGE_SIZE}/`
+  );
+  const query: Record<string, string> = {
+    key: "all",
+    recruitType: "all",
+    year: String(sourceYear),
+    universityLevel: "all",
+    location: "all",
+    majorType: "all",
+    overDeadline: "1",
+    probabilityStr: "all",
+    tipType: "all",
+    tipContent: "all",
+    fields:
+      "college,createTime,delFlag,id,majorType,msgType,officialSubject,publishTime,recruitType,tipType,title,universityId,universityName,website"
+  };
+  for (const [key, value] of Object.entries(query)) {
+    url.searchParams.set(key, value);
+  }
+  const response = await fetchSourceResponse(url.toString(), "application/json");
+  const payload = (await response.json()) as Record<string, unknown>;
+  if (Number(payload.code) !== 10000 || !isRecord(payload.data)) {
+    throw new Error(`第 ${page} 页返回格式异常`);
+  }
+  const pageData = payload.data;
+  const records = Array.isArray(pageData.list) ? (pageData.list as ZscampusRecord[]) : [];
+  const total = Number(pageData.total);
+  if (!Number.isFinite(total) || total < 0) {
+    throw new Error(`第 ${page} 页缺少有效 total`);
+  }
+  return { total, records };
+}
+
+async function fetchSourceResponse(url: string, accept: string): Promise<Response> {
+  const response = await fetch(url, {
+    headers: {
+      Accept: accept,
+      "User-Agent": "baoyan-mail-worker"
+    },
+    signal: AbortSignal.timeout(SOURCE_FETCH_TIMEOUT_MS)
+  });
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+  return response;
+}
+
+function createSourceErrorResult(
+  definition: SourceDefinition,
+  error: unknown
+): SourceFetchResult {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    items: [],
+    stats: {
+      sourceGroup: definition.sourceGroup,
+      url: definition.url,
+      rawCount: 0,
+      acceptedCount: 0,
+      filteredCount: 0,
+      reviewCandidateCount: 0,
+      duplicateCount: 0,
+      supplementedDeadlineCount: 0,
+      ...(definition.activityType === undefined
+        ? {}
+        : { activityType: definition.activityType }),
+      error: `拉取来源失败：${message}`
+    },
+    reviewCandidates: []
+  };
+}
+
+export function mergeSourceItems(entries: SourceItemInput[]): MergeSourceItemsResult {
+  const duplicateCountsBySource = new Map<string, number>();
+  const byNoticeIdentity = new Map<string, SourceItemInput[]>();
+
+  for (const [index, entry] of entries.entries()) {
+    const canonicalUrl = canonicalizeNotificationUrl(entry.website);
+    const key =
+      canonicalUrl === ""
+        ? `empty:${index}`
+        : [
+            canonicalUrl,
+            normalizeDuplicateText(entry.name),
+            normalizeDuplicateText(entry.institute),
+            getDeadlineDay(entry.deadline)
+          ].join("\u0000");
+    const group = byNoticeIdentity.get(key);
+    if (group === undefined) {
+      byNoticeIdentity.set(key, [entry]);
+      continue;
+    }
+    if (group.some((existing) => existing.sourceGroup === entry.sourceGroup)) {
+      duplicateCountsBySource.set(
+        entry.sourceGroup,
+        (duplicateCountsBySource.get(entry.sourceGroup) ?? 0) + 1
+      );
+    }
+    group.push(entry);
+  }
+
+  const clusters = Array.from(byNoticeIdentity.values());
+  const parent = clusters.map((_cluster, index) => index);
+  const clusterSourceGroups = clusters.map(
+    (cluster) =>
+      new Set(
+        cluster.flatMap((entry) => entry.sourceGroups ?? [entry.sourceGroup])
+      )
+  );
+  const titleMatchedIndices = new Set<number>();
+  const exactUrlBuckets = new Map<string, number[]>();
+  for (const [index, cluster] of clusters.entries()) {
+    const profile = getExactUrlMatchProfile(cluster);
+    if (profile === null) {
+      continue;
+    }
+    const bucket = exactUrlBuckets.get(profile.bucketKey) ?? [];
+    for (const otherIndex of bucket) {
+      const otherProfile = getExactUrlMatchProfile(clusters[otherIndex]!);
+      const allowSourceOverlap =
+        otherProfile !== null &&
+        areStrongSameSourceExactUrlDuplicates(profile, otherProfile);
+      if (
+        otherProfile !== null &&
+        areCrossSourceExactUrlMatches(profile, otherProfile) &&
+        (allowSourceOverlap
+          ? unionClusters(parent, clusterSourceGroups, index, otherIndex)
+          : unionClustersIfSourceDisjoint(
+              parent,
+              clusterSourceGroups,
+              index,
+              otherIndex
+            ))
+      ) {
+        break;
       }
-    });
-    if (!response.ok) {
-      throw new Error(`${response.status} ${response.statusText}`);
     }
-    return normalizeBaoyanXinxiHtml(await response.text(), definition.url, {
-      activityType: definition.activityType,
-      sourceGroup: definition.sourceGroup
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      items: [],
-      stats: {
-        sourceGroup: definition.sourceGroup,
-        url: definition.url,
-        rawCount: 0,
-        acceptedCount: 0,
-        filteredCount: 0,
-        reviewCandidateCount: 0,
-        duplicateCount: 0,
-        supplementedDeadlineCount: 0,
-        activityType: definition.activityType,
-        error: `拉取补充源失败：${message}`
-      },
-      reviewCandidates: []
-    };
+    bucket.push(index);
+    exactUrlBuckets.set(profile.bucketKey, bucket);
+  }
+  const matchBuckets = new Map<string, number[]>();
+  for (const [index, cluster] of clusters.entries()) {
+    const profile = getClusterMatchProfile(cluster);
+    if (profile === null) {
+      continue;
+    }
+    const bucket = matchBuckets.get(profile.bucketKey) ?? [];
+    for (const otherIndex of bucket) {
+      const otherProfile = getClusterMatchProfile(clusters[otherIndex]!);
+      if (
+        otherProfile !== null &&
+        areConservativeTitleMatches(profile, otherProfile) &&
+        unionClustersIfSourceDisjoint(parent, clusterSourceGroups, index, otherIndex)
+      ) {
+        titleMatchedIndices.add(index);
+        titleMatchedIndices.add(otherIndex);
+      }
+    }
+    bucket.push(index);
+    matchBuckets.set(profile.bucketKey, bucket);
+  }
+
+  const groupedClusters = new Map<number, { entries: SourceItemInput[]; titleMatched: boolean }>();
+  for (const [index, cluster] of clusters.entries()) {
+    const root = findClusterRoot(parent, index);
+    const current = groupedClusters.get(root);
+    if (current === undefined) {
+      groupedClusters.set(root, {
+        entries: [...cluster],
+        titleMatched: titleMatchedIndices.has(index)
+      });
+      continue;
+    }
+    current.entries.push(...cluster);
+    current.titleMatched ||= titleMatchedIndices.has(index);
+  }
+
+  return {
+    items: Array.from(groupedClusters.values()).map((cluster) =>
+      mergeSourceCluster(cluster.entries, cluster.titleMatched)
+    ),
+    duplicateCountsBySource
+  };
+}
+
+function mergeSourceCluster(
+  entries: SourceItemInput[],
+  titleMatched: boolean
+): SourceItemInput {
+  const primary = entries.reduce((current, entry) =>
+    shouldPreferMergedSourceItem(entry, current) ? entry : current
+  );
+  const observations = dedupeObservations(entries.flatMap(getSourceObservations));
+  const sourceGroups = Array.from(
+    new Set([
+      ...entries.map((entry) => entry.sourceGroup),
+      ...observations.map((observation) => observation.sourceGroup)
+    ])
+  ).sort(compareSourceGroups);
+  const website = choosePreferredWebsite(entries, primary);
+  const alternateWebsites = getAlternateWebsites(entries, website);
+  const deadline = selectMergedDeadline(observations);
+  const title = chooseMergedDescription(entries, observations, primary);
+  const name = chooseMergedField(entries, primary, "name");
+  const institute = chooseMergedField(entries, primary, "institute");
+  const activityTypeDetails = selectMergedActivityType(entries, title, institute);
+  const distinctSourceUrls = new Set(
+    observations.map((observation) => canonicalizeNotificationUrl(observation.website)).filter(Boolean)
+  );
+  const mergeReason: SourceMergeReason = titleMatched
+    ? "title_match"
+    : observations.length > 1 || distinctSourceUrls.size > 1
+      ? "exact_url"
+      : "single";
+
+  return {
+    ...primary,
+    sourceGroup: primary.sourceGroup,
+    sourceGroups,
+    sourceObservations: observations,
+    alternateWebsites,
+    mergeReason,
+    name,
+    institute,
+    description: title,
+    deadline: deadline.value,
+    deadlinePrecision: deadline.precision,
+    deadlineConflict: deadline.conflict,
+    deadlineSource: deadline.source,
+    website,
+    tags: mergeTags([], entries.flatMap((entry) => entry.tags)),
+    activityType: activityTypeDetails.activityType,
+    activityTypeSource: activityTypeDetails.activityTypeSource,
+    areas: getBaoyanXinxiAreas(`${name} ${title}`, institute)
+  };
+}
+
+function getExactUrlMatchProfile(entries: SourceItemInput[]): {
+  bucketKey: string;
+  canonicalUrl: string;
+  school: string;
+  institute: string;
+  title: string;
+  placeholderTitle: boolean;
+  deadlineDay: string;
+  deadlineTimestamp: number | null;
+} | null {
+  const primary = entries.reduce((current, entry) =>
+    shouldPreferMergedSourceItem(entry, current) ? entry : current
+  );
+  const canonicalUrl = canonicalizeNotificationUrl(primary.website);
+  const school = normalizeDuplicateText(primary.name);
+  const institute = normalizeDuplicateText(primary.institute);
+  const mergedTitle = chooseMergedDescription(
+    entries,
+    entries.flatMap(getSourceObservations),
+    primary
+  );
+  const deadline = parseComparableDeadline(primary.deadline);
+  if (canonicalUrl === "" || school === "") {
+    return null;
+  }
+  return {
+    bucketKey: `${canonicalUrl}\u0000${school}`,
+    canonicalUrl,
+    school,
+    institute,
+    title: normalizeComparableTitle(mergedTitle, primary.name, ""),
+    placeholderTitle: isAggregatePlaceholderTitle(mergedTitle),
+    deadlineDay: getDeadlineDay(primary.deadline),
+    deadlineTimestamp: deadline?.getTime() ?? null
+  };
+}
+
+function areCrossSourceExactUrlMatches(
+  left: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>,
+  right: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
+): boolean {
+  if (
+    left.canonicalUrl !== right.canonicalUrl ||
+    left.school !== right.school
+  ) {
+    return false;
+  }
+  if (isSpecificNoticeUrl(left.canonicalUrl)) {
+    const institutesCompatible = areInstituteAliasesOrEmpty(
+      left.institute,
+      right.institute
+    );
+    return (
+      left.institute === right.institute ||
+      haveEquivalentDeadline(left, right) ||
+      (institutesCompatible &&
+        (left.placeholderTitle ||
+          right.placeholderTitle ||
+          haveEquivalentExactUrlTitles(left, right)))
+    );
+  }
+  if (
+    left.institute !== right.institute ||
+    left.deadlineDay === "" ||
+    left.deadlineDay !== right.deadlineDay ||
+    left.title === "" ||
+    right.title === ""
+  ) {
+    return false;
+  }
+  const shorterLength = Math.min(left.title.length, right.title.length);
+  return (
+    left.title === right.title ||
+    (shorterLength >= 12 &&
+      (left.title.includes(right.title) || right.title.includes(left.title)))
+  );
+}
+
+function areStrongSameSourceExactUrlDuplicates(
+  left: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>,
+  right: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
+): boolean {
+  return (
+    left.canonicalUrl === right.canonicalUrl &&
+    left.school === right.school &&
+    isSpecificNoticeUrl(left.canonicalUrl) &&
+    !left.placeholderTitle &&
+    !right.placeholderTitle &&
+    areInstituteAliasesOrEmpty(left.institute, right.institute) &&
+    haveEquivalentExactUrlTitles(left, right)
+  );
+}
+
+function haveEquivalentDeadline(
+  left: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>,
+  right: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
+): boolean {
+  if (
+    left.deadlineDay !== "" &&
+    left.deadlineDay === right.deadlineDay
+  ) {
+    return true;
+  }
+  return (
+    left.deadlineTimestamp !== null &&
+    right.deadlineTimestamp !== null &&
+    Math.abs(left.deadlineTimestamp - right.deadlineTimestamp) <= 1_000
+  );
+}
+
+function haveEquivalentExactUrlTitles(
+  left: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>,
+  right: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
+): boolean {
+  const institutes = [left.institute, right.institute].filter(Boolean);
+  const normalize = (value: string): string => {
+    let normalized = value;
+    for (const institute of institutes) {
+      normalized = normalized.replaceAll(normalizeComparableEntity(institute), "");
+    }
+    return normalized.replace(/20\d{2}年/gu, "");
+  };
+  const leftTitle = normalize(left.title);
+  const rightTitle = normalize(right.title);
+  return leftTitle.length >= 10 && leftTitle === rightTitle;
+}
+
+function areInstituteAliasesOrEmpty(left: string, right: string): boolean {
+  const normalizedLeft = normalizeComparableEntity(left);
+  const normalizedRight = normalizeComparableEntity(right);
+  if (normalizedLeft === "" || normalizedRight === "") {
+    return true;
+  }
+  if (normalizedLeft === normalizedRight) {
+    return true;
+  }
+  const shorterLength = Math.min(normalizedLeft.length, normalizedRight.length);
+  return (
+    shorterLength >= 4 &&
+    (normalizedLeft.includes(normalizedRight) ||
+      normalizedRight.includes(normalizedLeft))
+  );
+}
+
+function normalizeComparableEntity(value: string): string {
+  return normalizeDuplicateText(value).replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function isAggregatePlaceholderTitle(value: string): boolean {
+  const normalized = normalizeComparableEntity(value);
+  return (
+    normalized === "" ||
+    normalized === "保研信息平台补充源" ||
+    normalized === "noresponse"
+  );
+}
+
+export function isSpecificNoticeUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const path = url.pathname.toLowerCase();
+    if (url.hostname === "mp.weixin.qq.com" && path.startsWith("/s/")) {
+      return true;
+    }
+    if (
+      /(?:^|\/)(?:index|default|login|logon|signin|signup|sign_up|apply|application)(?:\.[a-z0-9]+)?$/iu.test(
+        path
+      ) ||
+      /\/(?:sign_up|signup|application|apply)\//u.test(path)
+    ) {
+      return false;
+    }
+    if (
+      /(?:\/info\/|\/notice(?:\/|$)|\/news(?:\/|$)|\/(?:home\/)?detail(?:\/|$)|\/node\/\d+(?:\/|$)|\/20\d{2}\/|\.(?:html?|shtml)$)/iu.test(
+        path
+      ) ||
+      /\/pages?_\d+_\d+\.aspx$/iu.test(path)
+    ) {
+      return true;
+    }
+    return path === "/" && /^\d+$/u.test(url.searchParams.get("p") ?? "");
+  } catch {
+    return false;
   }
 }
 
-function dedupeSourceItems<T extends SourceItemInput>(
-  entries: T[]
-): { items: T[]; duplicateCount: number } {
-  const items: T[] = [];
-  const keyToIndex = new Map<string, number>();
-  let duplicateCount = 0;
+function getClusterMatchProfile(entries: SourceItemInput[]): {
+  bucketKey: string;
+  school: string;
+  institute: string;
+  title: string;
+  activityType: ActivityType;
+  sourceGroups: Set<string>;
+} | null {
+  const primary = entries.reduce((current, entry) =>
+    shouldPreferMergedSourceItem(entry, current) ? entry : current
+  );
+  const title = normalizeComparableTitle(
+    chooseMergedDescription(entries, entries.flatMap(getSourceObservations), primary),
+    primary.name,
+    primary.institute
+  );
+  const deadlineDay = getDeadlineDay(primary.deadline);
+  const school = normalizeDuplicateText(primary.name);
+  if (title.length < 10 || deadlineDay === "" || school === "") {
+    return null;
+  }
+  const activityType = getActivityTypeDetails(primary).activityType;
+  return {
+    bucketKey: `${school}\u0000${deadlineDay}`,
+    school,
+    institute: normalizeDuplicateText(primary.institute),
+    title,
+    activityType,
+    sourceGroups: new Set(entries.flatMap((entry) => entry.sourceGroups ?? [entry.sourceGroup]))
+  };
+}
 
+function areConservativeTitleMatches(
+  left: NonNullable<ReturnType<typeof getClusterMatchProfile>>,
+  right: NonNullable<ReturnType<typeof getClusterMatchProfile>>
+): boolean {
+  if (left.school !== right.school) {
+    return false;
+  }
+  if (
+    left.institute === "" ||
+    right.institute === "" ||
+    left.institute !== right.institute
+  ) {
+    return false;
+  }
+  if (
+    left.activityType !== "unknown" &&
+    right.activityType !== "unknown" &&
+    left.activityType !== right.activityType
+  ) {
+    return false;
+  }
+  const shorterLength = Math.min(left.title.length, right.title.length);
+  if (left.title === right.title) {
+    return true;
+  }
+  if (shorterLength >= 12 && (left.title.includes(right.title) || right.title.includes(left.title))) {
+    return true;
+  }
+  return false;
+}
+
+function findClusterRoot(parent: number[], index: number): number {
+  const value = parent[index]!;
+  if (value === index) {
+    return value;
+  }
+  const root = findClusterRoot(parent, value);
+  parent[index] = root;
+  return root;
+}
+
+function unionClustersIfSourceDisjoint(
+  parent: number[],
+  sourceGroups: Set<string>[],
+  left: number,
+  right: number
+): boolean {
+  const leftRoot = findClusterRoot(parent, left);
+  const rightRoot = findClusterRoot(parent, right);
+  if (leftRoot === rightRoot) {
+    return false;
+  }
+  const leftSources = sourceGroups[leftRoot]!;
+  const rightSources = sourceGroups[rightRoot]!;
+  if (Array.from(leftSources).some((sourceGroup) => rightSources.has(sourceGroup))) {
+    return false;
+  }
+  return unionClusterRoots(parent, sourceGroups, leftRoot, rightRoot);
+}
+
+function unionClusters(
+  parent: number[],
+  sourceGroups: Set<string>[],
+  left: number,
+  right: number
+): boolean {
+  const leftRoot = findClusterRoot(parent, left);
+  const rightRoot = findClusterRoot(parent, right);
+  if (leftRoot === rightRoot) {
+    return false;
+  }
+  return unionClusterRoots(parent, sourceGroups, leftRoot, rightRoot);
+}
+
+function unionClusterRoots(
+  parent: number[],
+  sourceGroups: Set<string>[],
+  leftRoot: number,
+  rightRoot: number
+): boolean {
+  const leftSources = sourceGroups[leftRoot]!;
+  const rightSources = sourceGroups[rightRoot]!;
+  parent[rightRoot] = leftRoot;
+  for (const sourceGroup of rightSources) {
+    leftSources.add(sourceGroup);
+  }
+  return true;
+}
+
+function getSourceObservations(item: SourceItemInput): SourceObservation[] {
+  if (item.sourceObservations !== undefined && item.sourceObservations.length > 0) {
+    return item.sourceObservations;
+  }
+  const deadlinePrecision = item.deadlinePrecision ?? inferDeadlinePrecision(item.deadline, item.deadline);
+  return [
+    createSourceObservation({
+      sourceGroup: item.sourceGroup,
+      sourceItemId: canonicalizeNotificationUrl(item.website),
+      title: getUsefulTextLength(item.description) === 0 ? "" : item.description,
+      website: item.website,
+      deadlineRaw: item.deadline,
+      deadline: item.deadline,
+      deadlinePrecision,
+      publishedAt: ""
+    })
+  ];
+}
+
+function dedupeObservations(observations: SourceObservation[]): SourceObservation[] {
+  const seen = new Set<string>();
+  return observations
+    .filter((observation) => {
+      const key = [
+        observation.sourceGroup,
+        observation.sourceItemId || canonicalizeNotificationUrl(observation.website),
+        canonicalizeNotificationUrl(observation.website),
+        observation.deadline,
+        observation.title
+      ].join("\u0000");
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) => {
+      const sourceCompare = compareSourceGroups(left.sourceGroup, right.sourceGroup);
+      if (sourceCompare !== 0) {
+        return sourceCompare;
+      }
+      return `${left.website}\u0000${left.deadline}`.localeCompare(`${right.website}\u0000${right.deadline}`);
+    });
+}
+
+function chooseMergedField(
+  entries: SourceItemInput[],
+  primary: SourceItemInput,
+  field: "name" | "institute"
+): string {
+  if (field === "institute") {
+    return entries
+      .filter((entry) => entry.institute.trim() !== "")
+      .sort((left, right) => {
+        const annotationCompare =
+          getInstituteAnnotationPenalty(left.institute) -
+          getInstituteAnnotationPenalty(right.institute);
+        if (annotationCompare !== 0) {
+          return annotationCompare;
+        }
+        const sourceCompare =
+          getSourcePriority(right.sourceGroup) - getSourcePriority(left.sourceGroup);
+        if (sourceCompare !== 0) {
+          return sourceCompare;
+        }
+        return (
+          right.institute.trim().length - left.institute.trim().length ||
+          left.institute.localeCompare(right.institute)
+        );
+      })[0]?.institute.trim() ?? "";
+  }
+  const primaryValue = primary[field].trim();
+  if (primaryValue !== "") {
+    return primaryValue;
+  }
+  return entries
+    .map((entry) => entry[field].trim())
+    .sort((left, right) => right.length - left.length || left.localeCompare(right))[0] ?? "";
+}
+
+function getInstituteAnnotationPenalty(value: string): number {
+  return /[-—–].*(?:发布|报名|审核|活动时间|举办|招生简介|本校学生|即刻报名|截止|考核|分批|\d{1,2}月|\d{1,2}日)/u.test(
+    value
+  )
+    ? 1
+    : 0;
+}
+
+function chooseMergedDescription(
+  entries: SourceItemInput[],
+  observations: SourceObservation[],
+  primary: SourceItemInput
+): string {
+  const titles = observations
+    .map((observation) => observation.title.trim())
+    .filter((title) => title !== "" && title !== "保研信息平台补充源");
+  if (titles.length > 0) {
+    return titles.sort((left, right) => right.length - left.length || left.localeCompare(right))[0]!;
+  }
+  if (getUsefulTextLength(primary.description) > 0) {
+    return primary.description.trim();
+  }
+  return entries
+    .map((entry) => entry.description.trim())
+    .sort((left, right) => right.length - left.length || left.localeCompare(right))[0] ?? "";
+}
+
+function choosePreferredWebsite(entries: SourceItemInput[], primary: SourceItemInput): string {
+  return entries
+    .map((entry) => entry.website.trim())
+    .filter((website) => canonicalizeNotificationUrl(website) !== "")
+    .sort((left, right) => {
+      const qualityCompare = getWebsiteQuality(right) - getWebsiteQuality(left);
+      if (qualityCompare !== 0) {
+        return qualityCompare;
+      }
+      const leftPrimary = left === primary.website ? 1 : 0;
+      const rightPrimary = right === primary.website ? 1 : 0;
+      if (leftPrimary !== rightPrimary) {
+        return rightPrimary - leftPrimary;
+      }
+      return left.localeCompare(right);
+    })[0] ?? primary.website;
+}
+
+function getAlternateWebsites(entries: SourceItemInput[], selectedWebsite: string): string[] {
+  const selected = canonicalizeNotificationUrl(selectedWebsite);
+  const byCanonicalUrl = new Map<string, string>();
   for (const entry of entries) {
-    const duplicateKey = getSourceDuplicateKey(entry);
-    if (duplicateKey === "") {
-      items.push(entry);
-      continue;
-    }
-
-    const existingIndex = keyToIndex.get(duplicateKey);
-    if (existingIndex === undefined) {
-      keyToIndex.set(duplicateKey, items.length);
-      items.push(entry);
-      continue;
-    }
-
-    duplicateCount += 1;
-    const existing = items[existingIndex];
-    if (existing !== undefined && shouldPreferSourceItem(entry, existing)) {
-      items[existingIndex] = entry;
+    for (const website of [entry.website, ...(entry.alternateWebsites ?? [])]) {
+      const canonical = canonicalizeNotificationUrl(website);
+      if (canonical !== "" && canonical !== selected && !byCanonicalUrl.has(canonical)) {
+        byCanonicalUrl.set(canonical, website);
+      }
     }
   }
-
-  return { items, duplicateCount };
+  return Array.from(byCanonicalUrl.values()).sort((left, right) => left.localeCompare(right));
 }
 
-function getSourceDuplicateKey(item: SourceItemInput): string {
-  const canonicalUrl = canonicalizeNotificationUrl(item.website);
-  if (canonicalUrl === "") {
+function selectMergedDeadline(observations: SourceObservation[]): {
+  value: string;
+  precision: DeadlinePrecision;
+  conflict: boolean;
+  source: string;
+} {
+  const groups = new Map<
+    string,
+    { observations: SourceObservation[]; precision: DeadlinePrecision }
+  >();
+  for (const observation of observations) {
+    const deadline = parseComparableDeadline(observation.deadline);
+    if (deadline === null) {
+      continue;
+    }
+    const key = deadline.toISOString();
+    const group = groups.get(key);
+    if (group === undefined) {
+      groups.set(key, {
+        observations: [observation],
+        precision: observation.deadlinePrecision
+      });
+      continue;
+    }
+    group.observations.push(observation);
+    if (getDeadlinePrecisionRank(observation.deadlinePrecision) > getDeadlinePrecisionRank(group.precision)) {
+      group.precision = observation.deadlinePrecision;
+    }
+  }
+  const candidates = Array.from(groups.entries());
+  if (candidates.length === 0) {
+    return { value: "", precision: "unknown", conflict: false, source: "" };
+  }
+  candidates.sort(([leftKey, left], [rightKey, right]) => {
+    const precisionCompare =
+      getDeadlinePrecisionRank(right.precision) - getDeadlinePrecisionRank(left.precision);
+    if (precisionCompare !== 0) {
+      return precisionCompare;
+    }
+    const countCompare = right.observations.length - left.observations.length;
+    if (countCompare !== 0) {
+      return countCompare;
+    }
+    const priorityCompare =
+      getHighestObservationPriority(right.observations) -
+      getHighestObservationPriority(left.observations);
+    if (priorityCompare !== 0) {
+      return priorityCompare;
+    }
+    return leftKey.localeCompare(rightKey);
+  });
+  const [value, selected] = candidates[0]!;
+  const selectedSourceGroups = Array.from(
+    new Set(selected.observations.map((observation) => observation.sourceGroup))
+  );
+  return {
+    value,
+    precision: selected.precision,
+    conflict: candidates.length > 1,
+    source:
+      selectedSourceGroups.length > 1
+        ? "multi-source-consensus"
+        : selectedSourceGroups[0] ?? ""
+  };
+}
+
+function selectMergedActivityType(
+  entries: SourceItemInput[],
+  title: string,
+  institute: string
+): ActivityTypeDetails {
+  const textDetails = getActivityTypeFromText(`${title} ${institute}`);
+  if (textDetails.activityType !== "unknown") {
+    return textDetails;
+  }
+  return entries
+    .map((entry) => getActivityTypeDetails(entry))
+    .filter((details) => details.activityType !== "unknown")
+    .sort((left, right) => {
+      const sourceCompare = getActivityTypeSourceRank(right.activityTypeSource) -
+        getActivityTypeSourceRank(left.activityTypeSource);
+      if (sourceCompare !== 0) {
+        return sourceCompare;
+      }
+      return left.activityType.localeCompare(right.activityType);
+    })[0] ?? { activityType: "unknown", activityTypeSource: "unknown" };
+}
+
+function getActivityTypeSourceRank(source: ActivityTypeSource): number {
+  if (source === "classification") {
+    return 4;
+  }
+  if (source === "text") {
+    return 3;
+  }
+  if (source === "source") {
+    return 2;
+  }
+  if (source === "source_group") {
+    return 1;
+  }
+  return 0;
+}
+
+function shouldPreferMergedSourceItem(candidate: SourceItemInput, current: SourceItemInput): boolean {
+  const priorityCompare = getSourcePriority(candidate.sourceGroup) - getSourcePriority(current.sourceGroup);
+  if (priorityCompare !== 0) {
+    return priorityCompare > 0;
+  }
+  const websiteQualityCompare = getWebsiteQuality(candidate.website) - getWebsiteQuality(current.website);
+  if (websiteQualityCompare !== 0) {
+    return websiteQualityCompare > 0;
+  }
+  const precisionCompare =
+    getDeadlinePrecisionRank(candidate.deadlinePrecision ?? "unknown") -
+    getDeadlinePrecisionRank(current.deadlinePrecision ?? "unknown");
+  if (precisionCompare !== 0) {
+    return precisionCompare > 0;
+  }
+  return shouldPreferSourceItem(candidate, current);
+}
+
+function getSourcePriority(sourceGroup: string): number {
+  if (sourceGroup === MANUAL_SOURCE_GROUP) {
+    return 1_000;
+  }
+  if (
+    sourceGroup === BAOYANXINXI_SOURCE_GROUP ||
+    sourceGroup === BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_GROUP
+  ) {
+    return 900;
+  }
+  if (sourceGroup === XINGKE_SOURCE_GROUP) {
+    return 800;
+  }
+  if (sourceGroup === ZSCAMPUS_SOURCE_GROUP) {
+    return 700;
+  }
+  return 0;
+}
+
+function compareSourceGroups(left: string, right: string): number {
+  const priorityCompare = getSourcePriority(right) - getSourcePriority(left);
+  return priorityCompare !== 0 ? priorityCompare : left.localeCompare(right);
+}
+
+function getWebsiteQuality(value: string): number {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    let quality = url.protocol === "https:" ? 20 : 0;
+    if (/\.edu\.cn$|\.ac\.cn$|\.cas\.cn$|\.org\.cn$/u.test(host)) {
+      quality += 40;
+    }
+    if (host === "mp.weixin.qq.com") {
+      quality += 10;
+    }
+    if (host.includes("baoyan") || host.includes("zscampus")) {
+      quality -= 30;
+    }
+    return quality;
+  } catch {
+    return 0;
+  }
+}
+
+function getDeadlinePrecisionRank(precision: DeadlinePrecision): number {
+  if (precision === "exact") {
+    return 2;
+  }
+  if (precision === "date") {
+    return 1;
+  }
+  return 0;
+}
+
+function getHighestObservationPriority(observations: SourceObservation[]): number {
+  return observations.reduce(
+    (highest, observation) => Math.max(highest, getSourcePriority(observation.sourceGroup)),
+    0
+  );
+}
+
+function normalizeComparableTitle(value: string, school: string, institute: string): string {
+  return decodeHtml(value)
+    .replaceAll(school, "")
+    .replaceAll(institute, "")
+    .replace(/[^\p{L}\p{N}]/gu, "")
+    .toLowerCase();
+}
+
+function getDeadlineDay(value: string): string {
+  const deadline = parseComparableDeadline(value);
+  return deadline === null ? "" : SHANGHAI_DATE_FORMATTER.format(deadline);
+}
+
+function buildMergeReviewCandidates(items: SourceItemInput[]): SourceReviewCandidateInput[] {
+  return items
+    .filter((item) => item.deadlineConflict === true || item.mergeReason === "title_match")
+    .flatMap((item) => {
+      const normalizedUrl = canonicalizeNotificationUrl(item.website);
+      if (normalizedUrl === "") {
+        return [];
+      }
+      const sourceSummary = (item.sourceObservations ?? [])
+        .map((observation) => `${observation.sourceGroup}:${observation.deadlineRaw || "未给出"}`)
+        .join("；");
+      return [
+        {
+          normalizedUrl,
+          sourceGroup: "multi-source-merge",
+          reason: item.deadlineConflict === true ? "deadline-conflict" : "title-match",
+          payload: {
+            sourceGroup: "multi-source-merge",
+            name: item.name,
+            institute: item.institute,
+            description: item.description,
+            deadline: item.deadline,
+            website: item.website,
+            note: `待核验合并：${sourceSummary}`
+          }
+        }
+      ];
+    });
+}
+
+function enrichSourceStats(
+  sourceStats: SourceStats[],
+  merged: MergeSourceItemsResult
+): SourceStats[] {
+  return sourceStats.map((stats) => {
+    const matchingItems = merged.items.filter((item) =>
+      (item.sourceGroups ?? [item.sourceGroup]).includes(stats.sourceGroup)
+    );
+    return {
+      ...stats,
+      duplicateCount:
+        stats.duplicateCount + (merged.duplicateCountsBySource.get(stats.sourceGroup) ?? 0),
+      exclusiveCount: matchingItems.filter(
+        (item) => (item.sourceGroups ?? [item.sourceGroup]).length === 1
+      ).length,
+      crossSourceDuplicateCount: matchingItems.filter(
+        (item) => (item.sourceGroups ?? [item.sourceGroup]).length > 1
+      ).length,
+      conflictCount: matchingItems.filter((item) => item.deadlineConflict === true).length,
+      reviewCandidateCount: matchingItems.filter(
+        (item) => item.deadlineConflict === true || item.mergeReason === "title_match"
+      ).length
+    };
+  });
+}
+
+function getSourceYear(env: Env): number {
+  const configured = Number.parseInt(env.SOURCE_YEAR?.trim() ?? "", 10);
+  if (Number.isInteger(configured) && configured >= 2020 && configured <= 2100) {
+    return configured;
+  }
+  return Number.parseInt(SHANGHAI_YEAR_FORMATTER.format(new Date()), 10);
+}
+
+function readObjectArray(data: unknown, key: string): Array<Record<string, unknown>> {
+  if (!isRecord(data) || !Array.isArray(data[key])) {
+    throw new Error(`缺少 ${key} 数组`);
+  }
+  return data[key] as Array<Record<string, unknown>>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object";
+}
+
+function getAggregateActivityType(category: string, title: string): ActivityTypeDetails {
+  const textDetails = getActivityTypeFromText(title);
+  if (textDetails.activityType !== "unknown") {
+    return textDetails;
+  }
+  if (/预推免|预免推|九推|推荐免试/u.test(category)) {
+    return { activityType: "pre_recommendation", activityTypeSource: "source" };
+  }
+  if (/夏令营|暑期学校|开放日/u.test(category)) {
+    return { activityType: "summer_camp", activityTypeSource: "source" };
+  }
+  return { activityType: "unknown", activityTypeSource: "unknown" };
+}
+
+function normalizePublishedAt(value: string): string {
+  if (value === "") {
     return "";
   }
-  return [
-    canonicalUrl,
-    normalizeDuplicateText(item.name),
-    normalizeDuplicateText(item.institute),
-    getComparableDeadlineKey(item.deadline)
-  ].join("\u0000");
+  const normalized = normalizeBaoyanXinxiDeadline(value);
+  return parseComparableDeadline(normalized) === null ? "" : normalized;
+}
+
+function getLatestTimestamp(current: string, candidate: string): string {
+  return candidate > current ? candidate : current;
+}
+
+function inferDeadlinePrecision(value: string, normalized: string): DeadlinePrecision {
+  if (normalized === "" || parseComparableDeadline(normalized) === null) {
+    return "unknown";
+  }
+  const compact = decodeHtml(value).trim().replace(/\s+/gu, "T");
+  if (/^\d{4}-\d{1,2}-\d{1,2}$/u.test(compact)) {
+    return "date";
+  }
+  if (/T?23:59(?::59)?(?:Z|[+-]\d{1,2}:?\d{2})?$/u.test(compact)) {
+    return "date";
+  }
+  return "exact";
+}
+
+function inferManualDeadlinePrecision(normalized: string): DeadlinePrecision {
+  return normalized === "" ? "unknown" : "exact";
+}
+
+function createSourceObservation(observation: SourceObservation): SourceObservation {
+  return {
+    ...observation,
+    sourceItemId:
+      observation.sourceItemId.trim() === ""
+        ? canonicalizeNotificationUrl(observation.website)
+        : observation.sourceItemId.trim(),
+    title: observation.title.trim(),
+    website: observation.website.trim(),
+    deadlineRaw: observation.deadlineRaw.trim(),
+    deadline: observation.deadline.trim(),
+    publishedAt: observation.publishedAt.trim()
+  };
 }
 
 function shouldPreferSourceItem(candidate: SourceItemInput, current: SourceItemInput): boolean {
@@ -791,20 +2070,29 @@ async function finalizeSourceItems(items: SourceItemInput[]): Promise<{ items: N
   const prepared = [];
 
   for (const item of items) {
+    const canonicalUrl = canonicalizeNotificationUrl(item.website);
     const baseKey = await sha256Hex(
       stableStringify({
-        sourceGroup: item.sourceGroup,
-        name: item.name,
-        institute: item.institute
+        identity:
+          canonicalUrl === ""
+            ? {
+                sourceGroup: item.sourceGroup,
+                name: normalizeDuplicateText(item.name),
+                institute: normalizeDuplicateText(item.institute),
+                deadline: getComparableDeadlineKey(item.deadline)
+              }
+            : canonicalUrl
       })
     );
     prepared.push({ baseKey, item });
   }
 
   prepared.sort((left, right) => {
-    const groupCompare = left.item.sourceGroup.localeCompare(right.item.sourceGroup);
-    if (groupCompare !== 0) {
-      return groupCompare;
+    const urlCompare = canonicalizeNotificationUrl(left.item.website).localeCompare(
+      canonicalizeNotificationUrl(right.item.website)
+    );
+    if (urlCompare !== 0) {
+      return urlCompare;
     }
     const nameCompare = left.item.name.localeCompare(right.item.name);
     if (nameCompare !== 0) {
@@ -833,6 +2121,19 @@ async function finalizeSourceItems(items: SourceItemInput[]): Promise<{ items: N
   }
 
   return { items: finalized };
+}
+
+export async function mergeNormalizedItems(items: NormalizedItem[]): Promise<NormalizedItem[]> {
+  const sourceItems = items.map(({ key: _key, contentHash: _contentHash, ...item }) => item);
+  return (await finalizeSourceItems(mergeSourceItems(sourceItems).items)).items;
+}
+
+export async function rehashNormalizedItem(item: NormalizedItem): Promise<NormalizedItem> {
+  const { key: _key, contentHash: _contentHash, ...sourceItem } = item;
+  return {
+    ...item,
+    contentHash: await sha256Hex(stableStringify(sourceItem))
+  };
 }
 
 function normalizeCsRecords(
@@ -1032,7 +2333,20 @@ function toCleanString(value: unknown): string {
   if (typeof value !== "string") {
     return "";
   }
-  return value.trim();
+  return value
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function toSourceItemId(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return "";
 }
 
 function mergeTags(baseTags: string[], extraTags: string[]): string[] {
@@ -1058,7 +2372,7 @@ function isNonTierTag(tag: string): boolean {
 }
 
 function stripTags(value: string): string {
-  return decodeHtml(value.replace(/<[^>]*>/gu, "")).replace(/\s+/gu, " ").trim();
+  return toCleanString(decodeHtml(value.replace(/<[^>]*>/gu, "")));
 }
 
 function decodeHtml(value: string): string {

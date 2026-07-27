@@ -2,6 +2,9 @@ export interface Env {
   DB: D1Database;
   BAOYANXINXI_SOURCE_URL?: string;
   BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_URL?: string;
+  XINGKE_SOURCE_URL?: string;
+  ZSCAMPUS_SOURCE_URL?: string;
+  SOURCE_YEAR?: string;
   APP_BASE_URL?: string;
   MAIL_PROVIDER?: string;
   SENDER_NAME?: string;
@@ -24,6 +27,41 @@ export type ActivityTypeSource =
   | "text"
   | "classification"
   | "unknown";
+export type DeadlinePrecision = "exact" | "date" | "unknown";
+export type SourceMergeReason = "single" | "exact_url" | "title_match";
+
+export interface SourceObservation {
+  sourceGroup: string;
+  sourceItemId: string;
+  title: string;
+  website: string;
+  deadlineRaw: string;
+  deadline: string;
+  deadlinePrecision: DeadlinePrecision;
+  publishedAt: string;
+}
+
+export interface OfficialItemVerification {
+  normalizedUrl: string;
+  title: string;
+  deadline: string;
+  deadlinePrecision: DeadlinePrecision;
+  reason: string;
+  verifier: string;
+  verifiedAt: string;
+}
+
+export interface OfficialItemVerificationRow {
+  normalized_url: string;
+  title: string;
+  deadline: string;
+  deadline_precision: DeadlinePrecision;
+  reason: string;
+  verifier: string;
+  verified_at: string;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface ItemActivityTypeClassification {
   normalizedUrl: string;
@@ -85,6 +123,15 @@ export interface NormalizedItem {
   deadline: string;
   website: string;
   tags: string[];
+  sourceGroups?: string[];
+  sourceObservations?: SourceObservation[];
+  alternateWebsites?: string[];
+  mergeReason?: SourceMergeReason;
+  deadlinePrecision?: DeadlinePrecision;
+  deadlineConflict?: boolean;
+  deadlineSource?: string;
+  officialTitle?: string;
+  officialVerifiedAt?: string;
   activityType?: ActivityType;
   activityTypeSource?: ActivityTypeSource;
   activityTypeReason?: string;
@@ -144,6 +191,12 @@ export interface SourceStats {
   reviewCandidateCount?: number;
   duplicateCount: number;
   supplementedDeadlineCount: number;
+  pageCount?: number;
+  exclusiveCount?: number;
+  crossSourceDuplicateCount?: number;
+  conflictCount?: number;
+  unknownDeadlineCount?: number;
+  latestPublishedAt?: string;
   activityType?: ActivityType;
   error?: string;
 }

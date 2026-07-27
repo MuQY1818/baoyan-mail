@@ -8,7 +8,10 @@ import type {
   NewDeadlineNotificationRow,
   NewDeadlineNotificationWithItem,
   NormalizedItem,
+  OfficialItemVerification,
+  OfficialItemVerificationRow,
   ReviewCandidatePayload,
+  SourceStats,
   SourceReviewCandidateRow,
   SourceReviewCandidateWithPayload,
   SubscriberRow,
@@ -172,6 +175,46 @@ export async function setAppState(
     .run();
 }
 
+export async function acquireAppStateLock(
+  env: Env,
+  key: string,
+  value: string,
+  now: string,
+  staleBefore: string
+): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `
+      INSERT INTO app_state (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = excluded.updated_at
+      WHERE app_state.value = '' OR app_state.updated_at < ?
+    `
+  )
+    .bind(key, value, now, staleBefore)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+export async function releaseAppStateLock(
+  env: Env,
+  key: string,
+  expectedValue: string,
+  now: string
+): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `
+      UPDATE app_state
+      SET value = '', updated_at = ?
+      WHERE key = ? AND value = ?
+    `
+  )
+    .bind(now, key, expectedValue)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
 export async function getSnapshots(env: Env): Promise<Map<string, ItemSnapshotRow>> {
   const result = await env.DB.prepare("SELECT * FROM item_snapshots").all<ItemSnapshotRow>();
   const rows = result.results ?? [];
@@ -181,6 +224,165 @@ export async function getSnapshots(env: Env): Promise<Map<string, ItemSnapshotRo
 export async function getSnapshotRows(env: Env): Promise<ItemSnapshotRow[]> {
   const result = await env.DB.prepare("SELECT * FROM item_snapshots").all<ItemSnapshotRow>();
   return result.results ?? [];
+}
+
+export async function getSnapshotLastSeenCount(env: Env, lastSeenAt: string): Promise<number> {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM item_snapshots WHERE last_seen_at = ?"
+  )
+    .bind(lastSeenAt)
+    .first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
+export async function getExternalSourceSyncItemCount(
+  env: Env,
+  runId: string
+): Promise<number> {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM external_source_sync_items WHERE run_id = ?"
+  )
+    .bind(runId)
+    .first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
+export async function stageExternalSourceSyncItems(
+  env: Env,
+  runId: string,
+  items: NormalizedItem[],
+  now: string
+): Promise<void> {
+  const statements = items.map((item) =>
+    env.DB.prepare(
+      `
+        INSERT INTO external_source_sync_items (
+          run_id,
+          item_key,
+          content_hash,
+          payload,
+          source_group,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id, item_key) DO UPDATE SET
+          content_hash = excluded.content_hash,
+          payload = excluded.payload,
+          source_group = excluded.source_group
+      `
+    ).bind(
+      runId,
+      item.key,
+      item.contentHash,
+      JSON.stringify(item),
+      item.sourceGroup,
+      now
+    )
+  );
+  await runBatchInChunks(env, statements);
+}
+
+export async function discardExternalSourceSyncItems(
+  env: Env,
+  runId: string
+): Promise<void> {
+  await env.DB.prepare("DELETE FROM external_source_sync_items WHERE run_id = ?")
+    .bind(runId)
+    .run();
+}
+
+export async function discardExternalSourceSyncItemsCreatedBefore(
+  env: Env,
+  createdBefore: string
+): Promise<void> {
+  await env.DB.prepare("DELETE FROM external_source_sync_items WHERE created_at < ?")
+    .bind(createdBefore)
+    .run();
+}
+
+export async function publishExternalSourceSyncItems(
+  env: Env,
+  runId: string,
+  sourceGroups: string[],
+  now: string,
+  sourceStats: SourceStats[],
+  lockKey: string,
+  expectedLockValue: string
+): Promise<number> {
+  const placeholders = sourceGroups.map(() => "?").join(", ");
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `
+        INSERT INTO item_snapshots (
+          item_key,
+          content_hash,
+          payload,
+          source_group,
+          first_seen_at,
+          updated_at,
+          last_seen_at,
+          missing_since
+        )
+        SELECT
+          item_key,
+          content_hash,
+          payload,
+          source_group,
+          ?,
+          ?,
+          ?,
+          NULL
+        FROM external_source_sync_items
+        WHERE run_id = ?
+        ON CONFLICT(item_key) DO UPDATE SET
+          content_hash = excluded.content_hash,
+          payload = excluded.payload,
+          source_group = excluded.source_group,
+          updated_at = CASE
+            WHEN item_snapshots.content_hash <> excluded.content_hash THEN excluded.updated_at
+            ELSE item_snapshots.updated_at
+          END,
+          last_seen_at = excluded.last_seen_at,
+          missing_since = NULL
+      `
+    ).bind(now, now, now, runId),
+    env.DB.prepare(
+      `
+        UPDATE item_snapshots
+        SET missing_since = ?
+        WHERE source_group IN (${placeholders})
+          AND COALESCE(last_seen_at, '') <> ?
+          AND missing_since IS NULL
+      `
+    ).bind(now, ...sourceGroups, now),
+    env.DB.prepare(
+      `
+        INSERT INTO app_state (key, value, updated_at)
+        VALUES ('last_synced_at', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = excluded.updated_at
+      `
+    ).bind(now, now),
+    env.DB.prepare(
+      `
+        INSERT INTO app_state (key, value, updated_at)
+        VALUES ('last_source_stats', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = excluded.updated_at
+      `
+    ).bind(JSON.stringify(sourceStats), now),
+    env.DB.prepare("DELETE FROM external_source_sync_items WHERE run_id = ?").bind(runId),
+    env.DB.prepare(
+      `
+        UPDATE app_state
+        SET value = '', updated_at = ?
+        WHERE key = ? AND value = ?
+      `
+    ).bind(now, lockKey, expectedLockValue)
+  ]);
+  return results[1]?.meta.changes ?? 0;
 }
 
 export async function getSnapshotRowsBySourceGroups(
@@ -195,6 +397,30 @@ export async function getSnapshotRowsBySourceGroups(
     `SELECT * FROM item_snapshots WHERE source_group IN (${placeholders})`
   )
     .bind(...sourceGroups)
+    .all<ItemSnapshotRow>();
+  return result.results ?? [];
+}
+
+export async function getSnapshotRowsPageBySourceGroups(
+  env: Env,
+  sourceGroups: string[],
+  cursor: string,
+  limit: number
+): Promise<ItemSnapshotRow[]> {
+  if (sourceGroups.length === 0) {
+    return [];
+  }
+  const placeholders = sourceGroups.map(() => "?").join(", ");
+  const result = await env.DB.prepare(
+    `
+      SELECT *
+      FROM item_snapshots
+      WHERE source_group IN (${placeholders}) AND item_key > ?
+      ORDER BY item_key ASC
+      LIMIT ?
+    `
+  )
+    .bind(...sourceGroups, cursor, limit)
     .all<ItemSnapshotRow>();
   return result.results ?? [];
 }
@@ -398,6 +624,73 @@ export async function upsertItemActivityTypeClassifications(
   return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
 }
 
+export async function getOfficialItemVerifications(
+  env: Env,
+  normalizedUrls: string[]
+): Promise<Map<string, OfficialItemVerification>> {
+  const uniqueUrls = Array.from(new Set(normalizedUrls.filter((url) => url !== "")));
+  const rows: OfficialItemVerificationRow[] = [];
+  for (let index = 0; index < uniqueUrls.length; index += SQL_BATCH_SIZE) {
+    const chunk = uniqueUrls.slice(index, index + SQL_BATCH_SIZE);
+    if (chunk.length === 0) {
+      continue;
+    }
+    const placeholders = chunk.map(() => "?").join(", ");
+    const result = await env.DB.prepare(
+      `SELECT * FROM item_official_verifications WHERE normalized_url IN (${placeholders})`
+    )
+      .bind(...chunk)
+      .all<OfficialItemVerificationRow>();
+    rows.push(...(result.results ?? []));
+  }
+  return new Map(rows.map((row) => [row.normalized_url, hydrateOfficialItemVerification(row)]));
+}
+
+export async function upsertOfficialItemVerifications(
+  env: Env,
+  entries: OfficialItemVerification[],
+  now: string
+): Promise<number> {
+  const statements = entries.map((entry) =>
+    env.DB.prepare(
+      `
+        INSERT INTO item_official_verifications (
+          normalized_url,
+          title,
+          deadline,
+          deadline_precision,
+          reason,
+          verifier,
+          verified_at,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(normalized_url) DO UPDATE SET
+          title = excluded.title,
+          deadline = excluded.deadline,
+          deadline_precision = excluded.deadline_precision,
+          reason = excluded.reason,
+          verifier = excluded.verifier,
+          verified_at = excluded.verified_at,
+          updated_at = excluded.updated_at
+      `
+    ).bind(
+      entry.normalizedUrl,
+      entry.title,
+      entry.deadline,
+      entry.deadlinePrecision,
+      entry.reason,
+      entry.verifier,
+      entry.verifiedAt,
+      now,
+      now
+    )
+  );
+  const results = await runBatchInChunks(env, statements);
+  return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
+}
+
 export async function upsertSnapshots(
   env: Env,
   items: NormalizedItem[],
@@ -458,6 +751,30 @@ export async function markSnapshotsMissing(
   );
   const results = await runBatchInChunks(env, statements);
   return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
+}
+
+export async function markSnapshotsMissingExceptLastSeenAt(
+  env: Env,
+  sourceGroups: string[],
+  lastSeenAt: string,
+  now: string
+): Promise<number> {
+  if (sourceGroups.length === 0) {
+    return 0;
+  }
+  const placeholders = sourceGroups.map(() => "?").join(", ");
+  const result = await env.DB.prepare(
+    `
+      UPDATE item_snapshots
+      SET missing_since = ?
+      WHERE source_group IN (${placeholders})
+        AND COALESCE(last_seen_at, '') <> ?
+        AND missing_since IS NULL
+    `
+  )
+    .bind(now, ...sourceGroups, lastSeenAt)
+    .run();
+  return result.meta.changes ?? 0;
 }
 
 export async function upsertReviewCandidates(
@@ -746,6 +1063,20 @@ function hydrateItemActivityTypeClassification(
     reason: row.reason,
     classifier: row.classifier,
     classifiedAt: row.classified_at
+  };
+}
+
+function hydrateOfficialItemVerification(
+  row: OfficialItemVerificationRow
+): OfficialItemVerification {
+  return {
+    normalizedUrl: row.normalized_url,
+    title: row.title,
+    deadline: row.deadline,
+    deadlinePrecision: row.deadline_precision,
+    reason: row.reason,
+    verifier: row.verifier,
+    verifiedAt: row.verified_at
   };
 }
 

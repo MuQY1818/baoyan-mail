@@ -32,6 +32,14 @@ export interface DdlItem {
   activityTypeClassifiedAt: string | null;
   sourceGroup: string;
   sourceLabel: string;
+  sourceGroups: string[];
+  sourceLabels: string[];
+  sourceCount: number;
+  mergeReason: "single" | "exact_url" | "title_match";
+  deadlinePrecision: "exact" | "date" | "unknown";
+  deadlineConflict: boolean;
+  deadlineSource: string | null;
+  officialVerifiedAt: string | null;
   website: string;
   firstSeenAt: string | null;
   updatedAt: string | null;
@@ -147,7 +155,7 @@ export type TimelineExpansion = "collapsed" | "expanded";
 
 export type TierFilter = "Top2" | "华五" | "C9" | "985" | "211" | "其他";
 export type RangeFilter = "today" | "3" | "7" | "15" | "future";
-export type SourceFilter = "all" | "baoyanxinxi" | "manual";
+export type SourceFilter = "all" | "baoyanxinxi" | "xingke" | "zscampus" | "manual";
 export type RecentFilter = "all" | "new" | "updated";
 export type ViewMode = "cards" | "table";
 export type ThemeMode = "light" | "dark";

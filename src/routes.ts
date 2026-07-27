@@ -1,45 +1,68 @@
 import {
+  acquireAppStateLock,
   approveReviewCandidate,
+  discardExternalSourceSyncItems,
+  discardExternalSourceSyncItemsCreatedBefore,
   getAppState,
   getItemActivityTypeClassifications,
   getItemRelevanceClassifications,
+  getExternalSourceSyncItemCount,
+  getOfficialItemVerifications,
   getPendingReviewCandidates,
   getReviewCandidateById,
+  getSnapshotRowsPageBySourceGroups,
   getSnapshotRowsBySourceGroups,
   getVisitDailyStats,
   incrementVisitDailyStat,
   insertReviewRule,
+  publishExternalSourceSyncItems,
   rejectReviewCandidate,
+  releaseAppStateLock,
+  setAppState,
+  stageExternalSourceSyncItems,
   unsubscribeByToken,
   upsertItemActivityTypeClassifications,
   upsertItemRelevanceClassifications,
-  upsertManualItem
+  upsertOfficialItemVerifications,
+  upsertManualItem,
+  upsertReviewCandidates,
+  upsertSnapshots
 } from "./db";
 import { buildDdlResponse, getDdlEntryNormalizedUrls } from "./ddl";
-import { runCheck } from "./checker";
+import { LAST_SOURCE_STATS_STATE_KEY } from "./checker";
 import { sha256Hex } from "./crypto";
 import {
   BAOYAN_AREA_OPTIONS,
-  BAOYANXINXI_SOURCE_GROUP,
+  AUTOMATIC_SOURCE_GROUPS,
   MANUAL_SOURCE_GROUP,
   canonicalizeNotificationUrl,
   createManualItemFromReviewPayload,
   normalizeBaoyanXinxiDeadline
 } from "./source";
-import { upsertReviewCandidates, upsertSnapshots } from "./db";
+import type { SourceReviewCandidateInput } from "./source";
 import type {
   ActivityType,
+  DeadlinePrecision,
   Env,
   ItemActivityTypeClassification,
   ItemRelevanceClassification,
+  NormalizedItem,
+  OfficialItemVerification,
   Relevance,
   ReviewCandidatePayload,
+  SourceStats,
   VisitDailyStatRow
 } from "./types";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const REVIEW_COOKIE_NAME = "baoyan_review_auth";
 const REVIEW_SESSION_MAX_AGE_SECONDS = 6 * 60 * 60;
+const EXTERNAL_SYNC_STATE_KEY = "external_source_sync_active_run";
+const EXTERNAL_SYNC_BATCH_LIMIT = 20;
+const EXTERNAL_SYNC_INDEX_LIMIT = 100;
+const EXTERNAL_SYNC_LOCK_TIMEOUT_MS = 30 * 60 * 1000;
+const EXTERNAL_SYNC_STAGING_RETENTION_MS = 24 * 60 * 60 * 1000;
+const VERIFICATION_CANDIDATE_LIMIT = 100;
 const COUNTRY_NAMES: Record<string, string> = {
   AU: "澳大利亚",
   CA: "加拿大",
@@ -104,16 +127,49 @@ export async function handleRequest(
       return await handleMissingLink(request, env);
     }
     if (request.method === "GET" && url.pathname === "/api/admin/run-check") {
-      return await handleManualRun(request, env, ctx);
+      return await handleManualRun(request, env);
     }
     if (request.method === "GET" && url.pathname === "/api/admin/sync-sources") {
-      return await handleSyncSources(request, env, ctx);
+      return await handleSyncSources(request, env);
+    }
+    if (request.method === "GET" && url.pathname === "/api/admin/source-health") {
+      return await handleSourceHealth(request, env);
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/api/admin/verification-candidates"
+    ) {
+      return await handleVerificationCandidates(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/api/admin/source-sync/start") {
+      return await handleExternalSourceSyncStart(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/api/admin/source-sync/index") {
+      return await handleExternalSourceSyncIndex(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/api/admin/source-sync/items") {
+      return await handleExternalSourceSyncItems(request, env);
+    }
+    if (
+      request.method === "POST" &&
+      url.pathname === "/api/admin/source-sync/review-candidates"
+    ) {
+      return await handleExternalSourceSyncReviewCandidates(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/api/admin/source-sync/finalize") {
+      return await handleExternalSourceSyncFinalize(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/api/admin/source-sync/abort") {
+      return await handleExternalSourceSyncAbort(request, env);
     }
     if (request.method === "POST" && url.pathname === "/api/admin/relevance-classifications") {
       return await handleRelevanceClassifications(request, env);
     }
     if (request.method === "POST" && url.pathname === "/api/admin/activity-type-classifications") {
       return await handleActivityTypeClassifications(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/api/admin/official-verifications") {
+      return await handleOfficialItemVerifications(request, env);
     }
     if (request.method === "GET" && url.pathname === "/api/admin/review") {
       return await handleReviewPage(request, env);
@@ -171,43 +227,408 @@ async function handleUnsubscribe(url: URL, env: Env): Promise<Response> {
 
 async function handleManualRun(
   request: Request,
-  env: Env,
-  ctx: ExecutionContext
+  env: Env
 ): Promise<Response> {
   if (!isAuthorizedAdmin(request, env)) {
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
-
-  const resultPromise = runCheck(env, getPublicBaseUrl(env, request), { sendEmails: false });
-  ctx.waitUntil(resultPromise);
-  const result = await resultPromise;
-  return jsonResponse({ ok: true, result });
+  return externalSyncRequiredResponse();
 }
 
 async function handleSyncSources(
   request: Request,
-  env: Env,
-  ctx: ExecutionContext
+  env: Env
 ): Promise<Response> {
   if (!isAuthorizedAdmin(request, env)) {
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
+  return externalSyncRequiredResponse();
+}
 
-  const resultPromise = runCheck(env, getPublicBaseUrl(env, request), { sendEmails: false });
-  ctx.waitUntil(resultPromise);
-  const result = await resultPromise;
-  return jsonResponse({ ok: true, result });
+function externalSyncRequiredResponse(): Response {
+  return jsonResponse(
+    {
+      ok: false,
+      error: "external_sync_required",
+      message: "Worker 不执行重型抓取，请使用 npm run sync:sources:external 分批同步。"
+    },
+    409
+  );
+}
+
+async function handleSourceHealth(request: Request, env: Env): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const rawStats = await getAppState(env, LAST_SOURCE_STATS_STATE_KEY);
+  let sourceStats: unknown[] = [];
+  if (rawStats !== null) {
+    try {
+      const parsed = JSON.parse(rawStats) as unknown;
+      sourceStats = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      sourceStats = [];
+    }
+  }
+  return jsonResponse({
+    ok: true,
+    syncMode: "external-batched",
+    lastSyncedAt: await getAppState(env, "last_synced_at"),
+    sourceStats
+  });
+}
+
+async function handleVerificationCandidates(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const body = (await request.json()) as Record<string, unknown>;
+  const cursor = readString(body.cursor);
+  const requestedLimit = readInteger(body.limit) ?? VERIFICATION_CANDIDATE_LIMIT;
+  if (
+    cursor.length > 200 ||
+    requestedLimit < 1 ||
+    requestedLimit > VERIFICATION_CANDIDATE_LIMIT
+  ) {
+    return jsonResponse({ ok: false, error: "invalid_candidate_request" }, 400);
+  }
+  const rows = await getSnapshotRowsPageBySourceGroups(
+    env,
+    [...AUTOMATIC_SOURCE_GROUPS],
+    cursor,
+    requestedLimit + 1
+  );
+  const pageRows = rows.slice(0, requestedLimit);
+  const normalizedUrls = getDdlEntryNormalizedUrls(pageRows);
+  const [relevanceClassifications, activityTypeClassifications, officialVerifications] =
+    await Promise.all([
+      getItemRelevanceClassifications(env, normalizedUrls),
+      getItemActivityTypeClassifications(env, normalizedUrls),
+      getOfficialItemVerifications(env, normalizedUrls)
+    ]);
+  const candidates = pageRows.flatMap((row) => {
+    if (row.missing_since !== null) {
+      return [];
+    }
+    try {
+      const item = JSON.parse(row.payload) as NormalizedItem;
+      const urls = [item.website, ...(item.alternateWebsites ?? [])]
+        .map(canonicalizeNotificationUrl)
+        .filter((url) => url !== "");
+      const relevance = urls.map((url) => relevanceClassifications.get(url)).find(Boolean);
+      const activityType = urls.map((url) => activityTypeClassifications.get(url)).find(Boolean);
+      const verification = urls.map((url) => officialVerifications.get(url)).find(Boolean);
+      const sourceUpdatedAt = getLatestSourcePublishedAt(item) || row.updated_at;
+      const reasons: string[] = [];
+      if (item.deadline === "") {
+        reasons.push("unknown-deadline");
+      } else if (item.deadlinePrecision !== "exact") {
+        reasons.push("date-level-deadline");
+      }
+      if (item.deadlineConflict === true) {
+        reasons.push("deadline-conflict");
+      }
+      if (relevance === undefined) {
+        reasons.push("unclassified-relevance");
+      } else if (relevance.classifiedAt < sourceUpdatedAt) {
+        reasons.push("stale-relevance-classification");
+      }
+      if (activityType === undefined) {
+        reasons.push("unclassified-activity-type");
+      } else if (activityType.classifiedAt < sourceUpdatedAt) {
+        reasons.push("stale-activity-type-classification");
+      }
+      if (
+        verification !== undefined &&
+        verification.verifiedAt >= sourceUpdatedAt
+      ) {
+        const deadlineIndex = reasons.indexOf("unknown-deadline");
+        if (deadlineIndex >= 0) {
+          reasons.splice(deadlineIndex, 1);
+        }
+        const dateLevelIndex = reasons.indexOf("date-level-deadline");
+        if (dateLevelIndex >= 0) {
+          reasons.splice(dateLevelIndex, 1);
+        }
+        const conflictIndex = reasons.indexOf("deadline-conflict");
+        if (conflictIndex >= 0) {
+          reasons.splice(conflictIndex, 1);
+        }
+      }
+      if (reasons.length === 0) {
+        return [];
+      }
+      return [
+        {
+          key: row.item_key,
+          school: item.name,
+          institute: item.institute,
+          title: item.description,
+          website: item.website,
+          alternateWebsites: item.alternateWebsites ?? [],
+          deadline: item.deadline,
+          deadlinePrecision: item.deadlinePrecision ?? "unknown",
+          deadlineConflict: item.deadlineConflict ?? false,
+          activityType: item.activityType ?? "unknown",
+          areas: item.areas ?? [],
+          sourceGroups: item.sourceGroups ?? [item.sourceGroup],
+          sourceUpdatedAt,
+          reasons
+        }
+      ];
+    } catch {
+      return [];
+    }
+  });
+  return jsonResponse({
+    ok: true,
+    candidates,
+    nextCursor: rows.length > requestedLimit ? pageRows.at(-1)?.item_key ?? null : null
+  });
+}
+
+function getLatestSourcePublishedAt(item: NormalizedItem): string {
+  return (item.sourceObservations ?? []).reduce(
+    (latest, observation) =>
+      observation.publishedAt > latest ? observation.publishedAt : latest,
+    ""
+  );
+}
+
+interface ExternalSourceSyncRun {
+  runId: string;
+  expectedCount: number;
+  reviewCandidateCount: number;
+  sourceStats: SourceStats[];
+  activityTypeCounts: Record<ActivityType, number>;
+}
+
+async function handleExternalSourceSyncStart(request: Request, env: Env): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const metadata = readExternalSourceSyncRun(await request.json());
+  if (metadata === null) {
+    return jsonResponse({ ok: false, error: "invalid_sync_run" }, 400);
+  }
+  const now = new Date().toISOString();
+  const serializedMetadata = JSON.stringify(metadata);
+  const staleBefore = new Date(Date.now() - EXTERNAL_SYNC_LOCK_TIMEOUT_MS).toISOString();
+  const acquired = await acquireAppStateLock(
+    env,
+    EXTERNAL_SYNC_STATE_KEY,
+    serializedMetadata,
+    now,
+    staleBefore
+  );
+  if (!acquired) {
+    const activeRun = await getActiveExternalSourceSyncRun(env, metadata.runId);
+    if (activeRun === null) {
+      return jsonResponse({ ok: false, error: "sync_run_active" }, 409);
+    }
+  } else {
+    await discardExternalSourceSyncItemsCreatedBefore(
+      env,
+      new Date(Date.now() - EXTERNAL_SYNC_STAGING_RETENTION_MS).toISOString()
+    );
+    await discardExternalSourceSyncItems(env, metadata.runId);
+  }
+  return jsonResponse({
+    ok: true,
+    runId: metadata.runId,
+    expectedCount: metadata.expectedCount
+  });
+}
+
+async function handleExternalSourceSyncIndex(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const body = (await request.json()) as Record<string, unknown>;
+  const metadata = await getActiveExternalSourceSyncRun(env, readString(body.runId));
+  const cursor = readString(body.cursor);
+  const requestedLimit = readInteger(body.limit) ?? EXTERNAL_SYNC_INDEX_LIMIT;
+  if (
+    metadata === null ||
+    cursor.length > 200 ||
+    requestedLimit < 1 ||
+    requestedLimit > EXTERNAL_SYNC_INDEX_LIMIT
+  ) {
+    return jsonResponse({ ok: false, error: "invalid_index_request" }, 400);
+  }
+  const rows = await getSnapshotRowsPageBySourceGroups(
+    env,
+    [...AUTOMATIC_SOURCE_GROUPS],
+    cursor,
+    requestedLimit
+  );
+  const items = rows.flatMap((row) => {
+    try {
+      const item = JSON.parse(row.payload) as NormalizedItem;
+      return [
+        {
+          key: row.item_key,
+          school: item.name,
+          institute: item.institute,
+          deadlineAt: item.deadline,
+          website: item.website,
+          alternateWebsites: item.alternateWebsites ?? [],
+          active: row.missing_since === null,
+          lastSeenAt: row.last_seen_at ?? ""
+        }
+      ];
+    } catch {
+      return [];
+    }
+  });
+  return jsonResponse({
+    ok: true,
+    items,
+    nextCursor: rows.length === requestedLimit ? rows.at(-1)?.item_key ?? null : null
+  });
+}
+
+async function handleExternalSourceSyncItems(request: Request, env: Env): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const body = (await request.json()) as Record<string, unknown>;
+  const metadata = await getActiveExternalSourceSyncRun(env, readString(body.runId));
+  if (metadata === null) {
+    return jsonResponse({ ok: false, error: "sync_run_not_active" }, 409);
+  }
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  if (rawItems.length === 0 || rawItems.length > EXTERNAL_SYNC_BATCH_LIMIT) {
+    return jsonResponse({ ok: false, error: "invalid_items" }, 400);
+  }
+  const items = rawItems.map(readExternalSourceSyncItem);
+  if (
+    items.some((item) => item === null) ||
+    new Set(items.map((item) => item?.key)).size !== items.length
+  ) {
+    return jsonResponse({ ok: false, error: "invalid_sync_item" }, 400);
+  }
+  await stageExternalSourceSyncItems(
+    env,
+    metadata.runId,
+    items as NormalizedItem[],
+    new Date().toISOString()
+  );
+  return jsonResponse({ ok: true, runId: metadata.runId, accepted: items.length });
+}
+
+async function handleExternalSourceSyncReviewCandidates(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const body = (await request.json()) as Record<string, unknown>;
+  const metadata = await getActiveExternalSourceSyncRun(env, readString(body.runId));
+  if (metadata === null) {
+    return jsonResponse({ ok: false, error: "sync_run_not_active" }, 409);
+  }
+  const rawCandidates = Array.isArray(body.items) ? body.items : [];
+  if (rawCandidates.length === 0 || rawCandidates.length > EXTERNAL_SYNC_BATCH_LIMIT) {
+    return jsonResponse({ ok: false, error: "invalid_items" }, 400);
+  }
+  const candidates = rawCandidates.map(readExternalSourceReviewCandidate);
+  if (candidates.some((candidate) => candidate === null)) {
+    return jsonResponse({ ok: false, error: "invalid_review_candidate" }, 400);
+  }
+  await upsertReviewCandidates(
+    env,
+    candidates as SourceReviewCandidateInput[],
+    metadata.runId
+  );
+  return jsonResponse({ ok: true, runId: metadata.runId, accepted: candidates.length });
+}
+
+async function handleExternalSourceSyncFinalize(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const body = (await request.json()) as Record<string, unknown>;
+  const metadata = await getActiveExternalSourceSyncRun(env, readString(body.runId));
+  if (metadata === null) {
+    return jsonResponse({ ok: false, error: "sync_run_not_active" }, 409);
+  }
+  const writtenCount = await getExternalSourceSyncItemCount(env, metadata.runId);
+  if (writtenCount !== metadata.expectedCount) {
+    return jsonResponse(
+      {
+        ok: false,
+        error: "sync_item_count_mismatch",
+        expectedCount: metadata.expectedCount,
+        writtenCount
+      },
+      409
+    );
+  }
+  const now = new Date().toISOString();
+  const missingCount = await publishExternalSourceSyncItems(
+    env,
+    metadata.runId,
+    [...AUTOMATIC_SOURCE_GROUPS],
+    now,
+    metadata.sourceStats,
+    EXTERNAL_SYNC_STATE_KEY,
+    JSON.stringify(metadata)
+  );
+  return jsonResponse({
+    ok: true,
+    result: {
+      scanned: metadata.expectedCount,
+      missingCount,
+      lastSyncedAt: now,
+      sourceStats: metadata.sourceStats,
+      activityTypeCounts: metadata.activityTypeCounts
+    }
+  });
+}
+
+async function handleExternalSourceSyncAbort(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+  const body = (await request.json()) as Record<string, unknown>;
+  const metadata = await getActiveExternalSourceSyncRun(env, readString(body.runId));
+  if (metadata === null) {
+    return jsonResponse({ ok: false, error: "sync_run_not_active" }, 409);
+  }
+  await discardExternalSourceSyncItems(env, metadata.runId);
+  const released = await releaseAppStateLock(
+    env,
+    EXTERNAL_SYNC_STATE_KEY,
+    JSON.stringify(metadata),
+    new Date().toISOString()
+  );
+  return jsonResponse({ ok: released, runId: metadata.runId }, released ? 200 : 409);
 }
 
 async function handleDdl(env: Env, url: URL): Promise<Response> {
   const rows = await getSnapshotRowsBySourceGroups(env, [
-    BAOYANXINXI_SOURCE_GROUP,
+    ...AUTOMATIC_SOURCE_GROUPS,
     MANUAL_SOURCE_GROUP
   ]);
   const normalizedUrls = getDdlEntryNormalizedUrls(rows);
-  const [classifications, activityTypeClassifications] = await Promise.all([
+  const [classifications, activityTypeClassifications, officialVerifications] = await Promise.all([
     getItemRelevanceClassifications(env, normalizedUrls),
-    getItemActivityTypeClassifications(env, normalizedUrls)
+    getItemActivityTypeClassifications(env, normalizedUrls),
+    getOfficialItemVerifications(env, normalizedUrls)
   ]);
   const response = buildDdlResponse(
     rows,
@@ -216,7 +637,8 @@ async function handleDdl(env: Env, url: URL): Promise<Response> {
     classifications,
     {
       includeExpired: isTruthyQueryParam(url.searchParams.get("includeExpired")),
-      activityTypeClassifications
+      activityTypeClassifications,
+      officialVerifications
     }
   );
   return jsonResponse(response, 200, {
@@ -312,6 +734,31 @@ async function handleActivityTypeClassifications(request: Request, env: Env): Pr
     accepted: entries.length,
     changed
   });
+}
+
+async function handleOfficialItemVerifications(request: Request, env: Env): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+
+  const body = (await request.json()) as Record<string, unknown>;
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  if (rawItems.length === 0 || rawItems.length > 500) {
+    return jsonResponse({ ok: false, error: "invalid_items" }, 400);
+  }
+
+  const now = new Date().toISOString();
+  const entries = rawItems.map((entry) => readOfficialItemVerification(entry, now));
+  if (entries.some((entry) => entry === null)) {
+    return jsonResponse({ ok: false, error: "invalid_verification" }, 400);
+  }
+
+  const changed = await upsertOfficialItemVerifications(
+    env,
+    entries as OfficialItemVerification[],
+    now
+  );
+  return jsonResponse({ ok: true, accepted: entries.length, changed });
 }
 
 async function handleMissingLink(request: Request, env: Env): Promise<Response> {
@@ -527,19 +974,6 @@ function buildReviewSessionCookie(request: Request, value: string): string {
   ]
     .filter((part) => part !== "")
     .join("; ");
-}
-
-function getRequestBaseUrl(request: Request): string {
-  const url = new URL(request.url);
-  return `${url.protocol}//${url.host}`;
-}
-
-function getPublicBaseUrl(env: Env, request: Request): string {
-  const baseUrl = env.APP_BASE_URL?.trim();
-  if (baseUrl !== undefined && baseUrl !== "") {
-    return baseUrl.replace(/\/+$/, "");
-  }
-  return getRequestBaseUrl(request);
 }
 
 function htmlResponse(html: string, status = 200): Response {
@@ -1154,12 +1588,293 @@ function readActivityTypeClassification(
   };
 }
 
+function readOfficialItemVerification(
+  value: unknown,
+  now: string
+): OfficialItemVerification | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const normalizedUrl = canonicalizeNotificationUrl(
+    readString(record.normalizedUrl) || readString(record.website)
+  );
+  const title = readString(record.title).trim();
+  const rawDeadline = readString(record.deadline).trim();
+  const deadline = normalizeBaoyanXinxiDeadline(rawDeadline);
+  const requestedPrecision = readString(record.deadlinePrecision).trim();
+  const deadlinePrecision = isValidDeadlinePrecision(requestedPrecision)
+    ? requestedPrecision
+    : inferVerificationDeadlinePrecision(rawDeadline, deadline);
+  const reason = readString(record.reason).trim();
+  const verifier = readString(record.verifier).trim() || "luna-high";
+  const verifiedAt = readString(record.verifiedAt).trim() || now;
+
+  if (
+    normalizedUrl === "" ||
+    title.length > 500 ||
+    reason === "" ||
+    reason.length > 500 ||
+    verifier.length > 64 ||
+    (deadline !== "" && Number.isNaN(new Date(deadline).getTime())) ||
+    Number.isNaN(new Date(verifiedAt).getTime())
+  ) {
+    return null;
+  }
+  return {
+    normalizedUrl,
+    title,
+    deadline,
+    deadlinePrecision,
+    reason,
+    verifier,
+    verifiedAt
+  };
+}
+
+function readExternalSourceSyncRun(value: unknown): ExternalSourceSyncRun | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const runId = readString(record.runId).trim();
+  const expectedCount = readInteger(record.expectedCount);
+  const reviewCandidateCount = readInteger(record.reviewCandidateCount);
+  const sourceStats = readExternalSourceStats(record.sourceStats);
+  const activityTypeCounts = readActivityTypeCounts(record.activityTypeCounts);
+  const runDate = new Date(runId);
+  const now = Date.now();
+  if (
+    runId === "" ||
+    Number.isNaN(runDate.getTime()) ||
+    Math.abs(now - runDate.getTime()) > 24 * 60 * 60 * 1000 ||
+    expectedCount === null ||
+    expectedCount <= 0 ||
+    expectedCount > 10_000 ||
+    reviewCandidateCount === null ||
+    reviewCandidateCount < 0 ||
+    reviewCandidateCount > 10_000 ||
+    sourceStats === null ||
+    activityTypeCounts === null ||
+    Object.values(activityTypeCounts).reduce((sum, count) => sum + count, 0) !== expectedCount
+  ) {
+    return null;
+  }
+  return {
+    runId: runDate.toISOString(),
+    expectedCount,
+    reviewCandidateCount,
+    sourceStats,
+    activityTypeCounts
+  };
+}
+
+function readExternalSourceStats(value: unknown): SourceStats[] | null {
+  if (!Array.isArray(value) || value.length < 3 || value.length > 10) {
+    return null;
+  }
+  const allowedGroups = new Set<string>(AUTOMATIC_SOURCE_GROUPS);
+  const results: SourceStats[] = [];
+  const seenGroups = new Set<string>();
+  for (const entry of value) {
+    if (entry === null || typeof entry !== "object") {
+      return null;
+    }
+    const record = entry as Record<string, unknown>;
+    const sourceGroup = readString(record.sourceGroup).trim();
+    const url = readString(record.url).trim();
+    const rawCount = readInteger(record.rawCount);
+    const acceptedCount = readInteger(record.acceptedCount);
+    const filteredCount = readInteger(record.filteredCount);
+    const duplicateCount = readInteger(record.duplicateCount);
+    const supplementedDeadlineCount = readInteger(record.supplementedDeadlineCount);
+    if (
+      !allowedGroups.has(sourceGroup) ||
+      seenGroups.has(sourceGroup) ||
+      canonicalizeNotificationUrl(url) === "" ||
+      rawCount === null ||
+      rawCount <= 0 ||
+      acceptedCount === null ||
+      acceptedCount <= 0 ||
+      filteredCount === null ||
+      filteredCount < 0 ||
+      duplicateCount === null ||
+      duplicateCount < 0 ||
+      supplementedDeadlineCount === null ||
+      supplementedDeadlineCount < 0 ||
+      readString(record.error).trim() !== ""
+    ) {
+      return null;
+    }
+    seenGroups.add(sourceGroup);
+    results.push(entry as SourceStats);
+  }
+  return results;
+}
+
+function readActivityTypeCounts(value: unknown): Record<ActivityType, number> | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const summerCamp = readInteger(record.summer_camp);
+  const preRecommendation = readInteger(record.pre_recommendation);
+  const unknown = readInteger(record.unknown);
+  if (
+    summerCamp === null ||
+    summerCamp < 0 ||
+    preRecommendation === null ||
+    preRecommendation < 0 ||
+    unknown === null ||
+    unknown < 0
+  ) {
+    return null;
+  }
+  return {
+    summer_camp: summerCamp,
+    pre_recommendation: preRecommendation,
+    unknown
+  };
+}
+
+function readExternalSourceSyncItem(value: unknown): NormalizedItem | null {
+  if (value === null || typeof value !== "object" || JSON.stringify(value).length > 200_000) {
+    return null;
+  }
+  const item = value as Partial<NormalizedItem>;
+  const allowedGroups = new Set<string>(AUTOMATIC_SOURCE_GROUPS);
+  const sourceGroups = Array.isArray(item.sourceGroups) ? item.sourceGroups : [];
+  if (
+    typeof item.key !== "string" ||
+    !/^[a-zA-Z0-9_-]{1,200}$/u.test(item.key) ||
+    typeof item.contentHash !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(item.contentHash) ||
+    typeof item.sourceGroup !== "string" ||
+    !allowedGroups.has(item.sourceGroup) ||
+    sourceGroups.length === 0 ||
+    sourceGroups.some(
+      (sourceGroup) => typeof sourceGroup !== "string" || !allowedGroups.has(sourceGroup)
+    ) ||
+    typeof item.name !== "string" ||
+    item.name.trim() === "" ||
+    item.name.length > 300 ||
+    typeof item.institute !== "string" ||
+    item.institute.length > 500 ||
+    typeof item.description !== "string" ||
+    item.description.length > 2_000 ||
+    typeof item.deadline !== "string" ||
+    (item.deadline !== "" && Number.isNaN(new Date(item.deadline).getTime())) ||
+    typeof item.website !== "string" ||
+    canonicalizeNotificationUrl(item.website) === "" ||
+    !Array.isArray(item.tags) ||
+    item.tags.some((tag) => typeof tag !== "string") ||
+    !Array.isArray(item.sourceObservations) ||
+    item.sourceObservations.length > 100 ||
+    !Array.isArray(item.alternateWebsites) ||
+    item.alternateWebsites.some((website) => typeof website !== "string")
+  ) {
+    return null;
+  }
+  return item as NormalizedItem;
+}
+
+function readExternalSourceReviewCandidate(
+  value: unknown
+): SourceReviewCandidateInput | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const normalizedUrl = canonicalizeNotificationUrl(readString(record.normalizedUrl));
+  const sourceGroup = readString(record.sourceGroup).trim();
+  const reason = readString(record.reason).trim();
+  const payload = record.payload;
+  if (
+    normalizedUrl === "" ||
+    sourceGroup !== "multi-source-merge" ||
+    !/^(deadline-conflict|title-match)$/u.test(reason) ||
+    payload === null ||
+    typeof payload !== "object"
+  ) {
+    return null;
+  }
+  const payloadRecord = payload as Record<string, unknown>;
+  const name = readString(payloadRecord.name).trim();
+  const institute = readString(payloadRecord.institute).trim();
+  const description = readString(payloadRecord.description).trim();
+  const deadline = readString(payloadRecord.deadline).trim();
+  const website = readString(payloadRecord.website).trim();
+  const note = readString(payloadRecord.note).trim();
+  if (
+    name === "" ||
+    name.length > 300 ||
+    institute.length > 500 ||
+    description.length > 2_000 ||
+    (deadline !== "" && Number.isNaN(new Date(deadline).getTime())) ||
+    canonicalizeNotificationUrl(website) === "" ||
+    note.length > 2_000
+  ) {
+    return null;
+  }
+  return {
+    normalizedUrl,
+    sourceGroup,
+    reason,
+    payload: {
+      sourceGroup,
+      name,
+      institute,
+      description,
+      deadline,
+      website,
+      note
+    }
+  };
+}
+
+async function getActiveExternalSourceSyncRun(
+  env: Env,
+  runId: string
+): Promise<ExternalSourceSyncRun | null> {
+  if (runId === "") {
+    return null;
+  }
+  const rawMetadata = await getAppState(env, EXTERNAL_SYNC_STATE_KEY);
+  if (rawMetadata === null || rawMetadata === "") {
+    return null;
+  }
+  try {
+    const metadata = readExternalSourceSyncRun(JSON.parse(rawMetadata));
+    return metadata?.runId === new Date(runId).toISOString() ? metadata : null;
+  } catch {
+    return null;
+  }
+}
+
+function readInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
 function isValidRelevance(value: string): value is Relevance {
   return value === "strong" || value === "possible" || value === "unrelated";
 }
 
 function isValidActivityType(value: string): value is ActivityType {
   return value === "summer_camp" || value === "pre_recommendation" || value === "unknown";
+}
+
+function isValidDeadlinePrecision(value: string): value is DeadlinePrecision {
+  return value === "exact" || value === "date" || value === "unknown";
+}
+
+function inferVerificationDeadlinePrecision(
+  rawDeadline: string,
+  deadline: string
+): DeadlinePrecision {
+  if (deadline === "") {
+    return "unknown";
+  }
+  return /^\d{4}-\d{1,2}-\d{1,2}$/u.test(rawDeadline) ? "date" : "exact";
 }
 
 function areValidAreas(areas: string[]): boolean {

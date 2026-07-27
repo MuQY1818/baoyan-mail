@@ -67,10 +67,7 @@ export function filterItems(
         return false;
       }
     }
-    if (source === "baoyanxinxi" && item.sourceGroup !== "baoyanxinxi2026jsjby") {
-      return false;
-    }
-    if (source === "manual" && item.sourceGroup !== "manual") {
+    if (!matchesSourceFilter(item, source)) {
       return false;
     }
     if (recent === "new" && !isWithinRecentDays(item.firstSeenAt)) {
@@ -86,6 +83,26 @@ export function filterItems(
       .toLowerCase()
       .includes(keyword);
   });
+}
+
+function matchesSourceFilter(item: DdlItem, source: SourceFilter): boolean {
+  if (source === "all") {
+    return true;
+  }
+  const sourceGroups = item.sourceGroups.length > 0 ? item.sourceGroups : [item.sourceGroup];
+  if (source === "baoyanxinxi") {
+    return sourceGroups.some(
+      (sourceGroup) =>
+        sourceGroup === "baoyanxinxi2026jsjby" || sourceGroup === "baoyanxinxi2026yutuimian"
+    );
+  }
+  if (source === "xingke") {
+    return sourceGroups.includes("xingkebaoyan");
+  }
+  if (source === "zscampus") {
+    return sourceGroups.includes("zscampus");
+  }
+  return sourceGroups.includes("manual");
 }
 
 function matchesRelevance(item: DdlItem, relevance: RelevanceFilter): boolean {
