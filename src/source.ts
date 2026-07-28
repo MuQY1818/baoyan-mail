@@ -18,6 +18,8 @@ const DEFAULT_ZSCAMPUS_SOURCE_URL =
 const SOURCE_PAGE_SIZE = 100;
 const MAX_ZSCAMPUS_PAGES = 30;
 const SOURCE_FETCH_TIMEOUT_MS = 20_000;
+const MIN_COMPARABLE_TITLE_LENGTH = 5;
+const MIN_CORROBORATED_ALIAS_TITLE_LENGTH = 8;
 export const BAOYANXINXI_SOURCE_GROUP = "baoyanxinxi2026jsjby";
 export const BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_GROUP =
   "baoyanxinxi2026yutuimian";
@@ -62,6 +64,15 @@ const URL_TRACKING_PARAMS = new Set([
   "timestamp",
   "version",
   "platform"
+]);
+
+const EXACT_URL_SCHOOL_ALIASES = new Map<string, string>([
+  ["清华大学深圳国际研究生院", "清华大学"],
+  ["东北大学秦皇岛分校", "东北大学"],
+  ["中国人民解放军军事科学院", "军事科学院"],
+  ["中国海军工程大学", "海军工程大学"],
+  ["中国人民解放军国防科技大学", "国防科技大学"],
+  ["国防科学技术大学", "国防科技大学"]
 ]);
 
 const NON_TIER_TAG_KEYWORDS = ["保研信息平台", "计算机大类"];
@@ -719,6 +730,25 @@ export function canonicalizeNotificationUrl(value: string): string {
   }
 }
 
+export function getNotificationUrlMatchKey(value: string): string {
+  const canonicalUrl = canonicalizeNotificationUrl(value);
+  if (canonicalUrl === "") {
+    return "";
+  }
+
+  try {
+    const url = new URL(canonicalUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return canonicalUrl;
+    }
+    url.protocol = "https:";
+    url.hostname = url.hostname.replace(/^www\./u, "");
+    return url.toString();
+  } catch {
+    return canonicalUrl;
+  }
+}
+
 export function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((entry) => stableStringify(entry)).join(",")}]`;
@@ -1077,12 +1107,12 @@ export function mergeSourceItems(entries: SourceItemInput[]): MergeSourceItemsRe
   const byNoticeIdentity = new Map<string, SourceItemInput[]>();
 
   for (const [index, entry] of entries.entries()) {
-    const canonicalUrl = canonicalizeNotificationUrl(entry.website);
+    const urlMatchKey = getNotificationUrlMatchKey(entry.website);
     const key =
-      canonicalUrl === ""
+      urlMatchKey === ""
         ? `empty:${index}`
         : [
-            canonicalUrl,
+            urlMatchKey,
             normalizeDuplicateText(entry.name),
             normalizeDuplicateText(entry.institute),
             getDeadlineDay(entry.deadline)
@@ -1152,7 +1182,14 @@ export function mergeSourceItems(entries: SourceItemInput[]): MergeSourceItemsRe
       if (
         otherProfile !== null &&
         areConservativeTitleMatches(profile, otherProfile) &&
-        unionClustersIfSourceDisjoint(parent, clusterSourceGroups, index, otherIndex)
+        (unionClustersIfSourceDisjoint(
+          parent,
+          clusterSourceGroups,
+          index,
+          otherIndex
+        ) ||
+          (areCorroboratedSameSourceTitleAliases(profile, otherProfile) &&
+            unionClusters(parent, clusterSourceGroups, index, otherIndex)))
       ) {
         titleMatchedIndices.add(index);
         titleMatchedIndices.add(otherIndex);
@@ -1240,7 +1277,9 @@ function mergeSourceCluster(
 function getExactUrlMatchProfile(entries: SourceItemInput[]): {
   bucketKey: string;
   canonicalUrl: string;
+  urlMatchKey: string;
   school: string;
+  schoolMatchKey: string;
   institute: string;
   title: string;
   placeholderTitle: boolean;
@@ -1251,7 +1290,9 @@ function getExactUrlMatchProfile(entries: SourceItemInput[]): {
     shouldPreferMergedSourceItem(entry, current) ? entry : current
   );
   const canonicalUrl = canonicalizeNotificationUrl(primary.website);
+  const urlMatchKey = getNotificationUrlMatchKey(primary.website);
   const school = normalizeDuplicateText(primary.name);
+  const schoolMatchKey = getNotificationSchoolMatchKey(primary.name);
   const institute = normalizeDuplicateText(primary.institute);
   const mergedTitle = chooseMergedDescription(
     entries,
@@ -1259,13 +1300,20 @@ function getExactUrlMatchProfile(entries: SourceItemInput[]): {
     primary
   );
   const deadline = parseComparableDeadline(primary.deadline);
-  if (canonicalUrl === "" || school === "") {
+  if (
+    canonicalUrl === "" ||
+    urlMatchKey === "" ||
+    school === "" ||
+    schoolMatchKey === ""
+  ) {
     return null;
   }
   return {
-    bucketKey: `${canonicalUrl}\u0000${school}`,
+    bucketKey: `${urlMatchKey}\u0000${schoolMatchKey}`,
     canonicalUrl,
+    urlMatchKey,
     school,
+    schoolMatchKey,
     institute,
     title: normalizeComparableTitle(mergedTitle, primary.name, ""),
     placeholderTitle: isAggregatePlaceholderTitle(mergedTitle),
@@ -1279,11 +1327,12 @@ function areCrossSourceExactUrlMatches(
   right: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
 ): boolean {
   if (
-    left.canonicalUrl !== right.canonicalUrl ||
-    left.school !== right.school
+    left.urlMatchKey !== right.urlMatchKey ||
+    left.schoolMatchKey !== right.schoolMatchKey
   ) {
     return false;
   }
+  const exactSchoolMatch = left.school === right.school;
   if (isSpecificNoticeUrl(left.canonicalUrl)) {
     const institutesCompatible = areInstituteAliasesOrEmpty(
       left.institute,
@@ -1299,6 +1348,7 @@ function areCrossSourceExactUrlMatches(
     );
   }
   if (
+    !exactSchoolMatch ||
     left.institute !== right.institute ||
     left.deadlineDay === "" ||
     left.deadlineDay !== right.deadlineDay ||
@@ -1320,7 +1370,7 @@ function areStrongSameSourceExactUrlDuplicates(
   right: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
 ): boolean {
   return (
-    left.canonicalUrl === right.canonicalUrl &&
+    left.urlMatchKey === right.urlMatchKey &&
     left.school === right.school &&
     isSpecificNoticeUrl(left.canonicalUrl) &&
     !left.placeholderTitle &&
@@ -1361,7 +1411,9 @@ function haveEquivalentExactUrlTitles(
   };
   const leftTitle = normalize(left.title);
   const rightTitle = normalize(right.title);
-  return leftTitle.length >= 10 && leftTitle === rightTitle;
+  return (
+    leftTitle.length >= MIN_COMPARABLE_TITLE_LENGTH && leftTitle === rightTitle
+  );
 }
 
 function areInstituteAliasesOrEmpty(left: string, right: string): boolean {
@@ -1385,6 +1437,14 @@ function normalizeComparableEntity(value: string): string {
   return normalizeDuplicateText(value).replace(/[^\p{L}\p{N}]/gu, "");
 }
 
+export function getNotificationSchoolMatchKey(value: string): string {
+  const normalized = normalizeComparableEntity(value);
+  if (normalized.startsWith("中国科学院")) {
+    return "中国科学院";
+  }
+  return EXACT_URL_SCHOOL_ALIASES.get(normalized) ?? normalized;
+}
+
 function isAggregatePlaceholderTitle(value: string): boolean {
   const normalized = normalizeComparableEntity(value);
   return (
@@ -1401,6 +1461,22 @@ export function isSpecificNoticeUrl(value: string): boolean {
     if (url.hostname === "mp.weixin.qq.com" && path.startsWith("/s/")) {
       return true;
     }
+    const hasDetailId = Array.from(url.searchParams.entries()).some(
+      ([key, entryValue]) =>
+        /^(?:id|article_?id|news_?id|xqid)$/iu.test(key) &&
+        /^\d+$/u.test(entryValue)
+    );
+    const hasDetailAction = Array.from(url.searchParams.entries()).some(
+      ([key, entryValue]) =>
+        /^(?:a|action|m|q|type)$/iu.test(key) &&
+        /^(?:show|detail|moredetail|content)$/iu.test(entryValue)
+    );
+    if (
+      (hasDetailId && hasDetailAction) ||
+      /\/(?:[^/?#]*detail[^/?#]*)(?:[/?#]|$)/iu.test(url.hash)
+    ) {
+      return true;
+    }
     if (
       /(?:^|\/)(?:index|default|login|logon|signin|signup|sign_up|apply|application)(?:\.[a-z0-9]+)?$/iu.test(
         path
@@ -1413,7 +1489,8 @@ export function isSpecificNoticeUrl(value: string): boolean {
       /(?:\/info\/|\/notice(?:\/|$)|\/news(?:\/|$)|\/(?:home\/)?detail(?:\/|$)|\/node\/\d+(?:\/|$)|\/20\d{2}\/|\.(?:html?|shtml)$)/iu.test(
         path
       ) ||
-      /\/pages?_\d+_\d+\.aspx$/iu.test(path)
+      /\/pages?_\d+_\d+\.aspx$/iu.test(path) ||
+      /\/\d{3,}(?:[-_]\d{2,})+(?:\.[a-z0-9]+)?$/iu.test(path)
     ) {
       return true;
     }
@@ -1425,6 +1502,7 @@ export function isSpecificNoticeUrl(value: string): boolean {
 
 function getClusterMatchProfile(entries: SourceItemInput[]): {
   bucketKey: string;
+  canonicalUrl: string;
   school: string;
   institute: string;
   title: string;
@@ -1441,12 +1519,17 @@ function getClusterMatchProfile(entries: SourceItemInput[]): {
   );
   const deadlineDay = getDeadlineDay(primary.deadline);
   const school = normalizeDuplicateText(primary.name);
-  if (title.length < 10 || deadlineDay === "" || school === "") {
+  if (
+    title.length < MIN_COMPARABLE_TITLE_LENGTH ||
+    deadlineDay === "" ||
+    school === ""
+  ) {
     return null;
   }
   const activityType = getActivityTypeDetails(primary).activityType;
   return {
     bucketKey: `${school}\u0000${deadlineDay}`,
+    canonicalUrl: canonicalizeNotificationUrl(primary.website),
     school,
     institute: normalizeDuplicateText(primary.institute),
     title,
@@ -1476,14 +1559,30 @@ function areConservativeTitleMatches(
   ) {
     return false;
   }
-  const shorterLength = Math.min(left.title.length, right.title.length);
-  if (left.title === right.title) {
-    return true;
+  return left.title === right.title;
+}
+
+function areCorroboratedSameSourceTitleAliases(
+  left: NonNullable<ReturnType<typeof getClusterMatchProfile>>,
+  right: NonNullable<ReturnType<typeof getClusterMatchProfile>>
+): boolean {
+  if (
+    left.title.length < MIN_CORROBORATED_ALIAS_TITLE_LENGTH ||
+    !isSpecificNoticeUrl(left.canonicalUrl) ||
+    !isSpecificNoticeUrl(right.canonicalUrl)
+  ) {
+    return false;
   }
-  if (shorterLength >= 12 && (left.title.includes(right.title) || right.title.includes(left.title))) {
-    return true;
-  }
-  return false;
+  const leftIsSubset = Array.from(left.sourceGroups).every((sourceGroup) =>
+    right.sourceGroups.has(sourceGroup)
+  );
+  const rightIsSubset = Array.from(right.sourceGroups).every((sourceGroup) =>
+    left.sourceGroups.has(sourceGroup)
+  );
+  return (
+    (left.sourceGroups.size > 1 || right.sourceGroups.size > 1) &&
+    (leftIsSubset || rightIsSubset)
+  );
 }
 
 function findClusterRoot(parent: number[], index: number): number {
@@ -1867,11 +1966,66 @@ function getHighestObservationPriority(observations: SourceObservation[]): numbe
 }
 
 function normalizeComparableTitle(value: string, school: string, institute: string): string {
-  return decodeHtml(value)
+  let normalized = stripComparableTitleSiteSuffix(
+    decodeHtml(value),
+    school,
+    institute
+  )
     .replaceAll(school, "")
     .replaceAll(institute, "")
+    .replace(/[（(]\s*(?:含|包括)?\s*(?:本科)?(?:直博生?|直接攻博|直博)\s*[）)]/gu, "")
+    .replace(/(?:含|包括)(?:本科)?(?:直博生?|直接攻博|直博)/gu, "")
+    .replace(/20\d{2}\s*[年级]?/gu, "")
+    .replace(
+      /优秀应届本科毕业生(?:推荐)?免试攻读(?:硕士)?研究生/gu,
+      "推免生"
+    )
+    .replace(
+      /(?:推荐免试(?:攻读)?(?:硕士)?研究生|推荐免试生|推免(?:硕士)?研究生)/gu,
+      "推免生"
+    )
     .replace(/[^\p{L}\p{N}]/gu, "")
     .toLowerCase();
+
+  for (const entity of [school, institute]) {
+    const entityKey = normalizeComparableEntity(entity);
+    if (entityKey !== "") {
+      normalized = normalized.replaceAll(entityKey, "");
+    }
+  }
+
+  return normalized
+    .replace(/^(?:(?:重要|报名|招生)通知|关于(?:举办)?)/u, "")
+    .replace(/(?:的)?(?:通知|公告|说明)$/u, "");
+}
+
+function stripComparableTitleSiteSuffix(
+  value: string,
+  school: string,
+  institute: string
+): string {
+  const entities = [school, institute]
+    .map((entity) => normalizeComparableEntity(entity))
+    .filter((entity) => entity !== "");
+  if (entities.length === 0) {
+    return value;
+  }
+
+  const delimiters = Array.from(value.matchAll(/-{1,4}|—{1,4}|–{1,4}/gu));
+  for (let index = delimiters.length - 1; index >= 0; index -= 1) {
+    const delimiter = delimiters[index]!;
+    const delimiterIndex = delimiter.index ?? -1;
+    if (delimiterIndex <= 0) {
+      continue;
+    }
+    const suffix = normalizeComparableEntity(
+      value.slice(delimiterIndex + delimiter[0].length)
+    );
+    if (entities.some((entity) => suffix.includes(entity))) {
+      return value.slice(0, delimiterIndex);
+    }
+  }
+  return value;
 }
 
 function getDeadlineDay(value: string): string {

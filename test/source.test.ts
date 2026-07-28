@@ -1511,6 +1511,188 @@ describe("source normalization", () => {
     });
   });
 
+  it("merges equivalent http and www variants without changing the preferred URL", () => {
+    const base = {
+      name: "中国科学院",
+      institute: "国家空间科学中心",
+      description: "中国科学院国家空间科学中心2027年招收推免研究生公告",
+      deadline: "2026-09-28T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: []
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "baoyanxinxi2026jsjby",
+        website:
+          "https://nssc.cas.cn/yjsb/zsxx/zsdt/202607/t20260703_8241596.html"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        website:
+          "http://www.nssc.cas.cn/yjsb/zsxx/zsdt/202607/t20260703_8241596.html"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      website: "https://nssc.cas.cn/yjsb/zsxx/zsdt/202607/t20260703_8241596.html",
+      mergeReason: "exact_url",
+      sourceGroups: ["baoyanxinxi2026jsjby", "zscampus"]
+    });
+  });
+
+  it("merges controlled school aliases on the same specific notice", () => {
+    const base = {
+      institute: "国家空间科学中心",
+      description: "中国科学院国家空间科学中心2027年招收推免研究生公告",
+      deadlinePrecision: "date" as const,
+      website:
+        "https://nssc.cas.cn/yjsb/zsxx/zsdt/202607/t20260703_8241596.html",
+      tags: []
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        name: "中国科学院",
+        deadline: "2026-09-28T15:59:59.000Z"
+      },
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        name: "中国科学院大学",
+        deadline: "2026-09-30T15:59:59.000Z"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      deadlineConflict: true,
+      mergeReason: "exact_url",
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+  });
+
+  it("recognizes query-parameter article pages as specific notices", () => {
+    const base = {
+      description: "中国科学院沈阳计算技术研究所接收2027年推荐免试硕士研究生的通知",
+      deadline: "2026-10-20T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      website:
+        "https://yjs.sict.ac.cn/index.php?m=content&c=index&a=show&catid=15&id=189",
+      tags: []
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        name: "中国科学院",
+        institute: "沈阳计算技术研究所"
+      },
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        name: "中国科学院沈阳计算技术研究所",
+        institute: ""
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.sourceGroups).toEqual(["xingkebaoyan", "zscampus"]);
+  });
+
+  it("recognizes SPA detail routes when merging controlled school aliases", () => {
+    const base = {
+      description: "东北大学秦皇岛分校2027年推免预报名通知",
+      deadlinePrecision: "date" as const,
+      website:
+        "https://yjszs.neu.edu.cn/yjszs/plugins/zs/ytmxsd/entrance#/tmfwksdExemptionEntranceDetail?a=1784261498698001298&b=1784085098695001298",
+      tags: []
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        name: "东北大学",
+        institute: "秦皇岛分校",
+        deadline: "2026-09-16T04:00:00.000Z"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        name: "东北大学秦皇岛分校",
+        institute: "全校类",
+        deadline: "2026-09-16T15:59:59.000Z"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      deadlineConflict: true,
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+  });
+
+  it("keeps genuinely different institutions separate on a shared official notice", () => {
+    const base = {
+      institute: "合肥物质科学研究院",
+      description: "2026年优秀大学生夏令营通知",
+      deadline: "2026-07-30T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      website:
+        "https://hf.cas.cn/sbpy/yjsc/zs/zs_zsxc/zsxc_dxsxly/202607/t20260702_8237108.html",
+      tags: []
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "baoyanxinxi2026jsjby",
+        name: "中国科学技术大学"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        name: "中国科学院"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("treats numeric article paths as specific notices across deadline conflicts", () => {
+    const base = {
+      name: "中国科学院大学",
+      institute: "数学科学学院",
+      description: "中国科学院大学数学科学学院2027年接收推荐免试研究生公告",
+      deadlinePrecision: "date" as const,
+      website: "https://math.ucas.ac.cn/index.php/zh-CN/zsjy/sszs/3317-2027",
+      tags: []
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        deadline: "2026-08-18T15:59:59.000Z"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        description:
+          "2026年中国科学院大学数学科学学院2027年接收推荐免试研究生公告",
+        deadline: "2026-08-30T15:59:59.000Z"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      deadlineConflict: true,
+      mergeReason: "exact_url",
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+  });
+
   it("merges a specific official notice despite different aggregator titles", () => {
     const merged = mergeSourceItems([
       {
@@ -1870,6 +2052,103 @@ describe("source normalization", () => {
     expect(merged[0]?.alternateWebsites).toEqual(["https://mp.weixin.qq.com/s/example"]);
   });
 
+  it("merges cross-source titles that differ only by fixed notice boilerplate", () => {
+    const base = {
+      name: "厦门大学",
+      institute: "新闻传播学院",
+      deadline: "2026-08-20T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: ["985"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        description:
+          "厦门大学新闻传播学院关于2027年接收推荐免试研究生（含直博生）预报名的通知",
+        website: "https://mp.weixin.qq.com/s/2SX2j6asHAimqWYvNS0UGw"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        description:
+          "2026年厦门大学新闻传播学院关于2027年接收推荐免试研究生预报名通知",
+        website: "https://comm.xmu.edu.cn/info/1451/67382.htm"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      website: "https://comm.xmu.edu.cn/info/1451/67382.htm",
+      mergeReason: "title_match",
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+    expect(merged[0]?.alternateWebsites).toEqual([
+      "https://mp.weixin.qq.com/s/2SX2j6asHAimqWYvNS0UGw"
+    ]);
+  });
+
+  it("merges site-title suffixes and about-hosting boilerplate conservatively", () => {
+    const base = {
+      name: "吉林大学",
+      institute: "药学院",
+      deadline: "2026-09-01T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: ["985"]
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        description:
+          "关于举办吉林大学药学院2026年校园学术活动开放日的通知-吉林大学药学院",
+        website: "https://yxy.jlu.edu.cn/info/1059/3785.htm"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        description: "2026年吉林大学药学院2026年校园学术活动开放日的通知",
+        website: "https://yxy.jlu.edu.cn/info/1257/3784.htm"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.mergeReason).toBe("title_match");
+  });
+
+  it("keeps named special programs separate after title normalization", () => {
+    const base = {
+      name: "上海财经大学",
+      institute: "数字经济学院",
+      deadline: "2026-08-20T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: ["211"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        description:
+          "2026年上海财经大学数字经济学院2027年接收推荐免试研究生预报名通知",
+        website: "https://example.edu.cn/standard"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        description:
+          "2026年上海财经大学数字经济学院2027年接收推荐免试研究生（住企培养专项）预报名通知",
+        website: "https://example.edu.cn/enterprise-program"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(2);
+    expect(merged.every((item) => item.mergeReason === "single")).toBe(true);
+  });
+
   it("does not let a school-wide notice bridge separate institute notices", () => {
     const base = {
       name: "东南大学",
@@ -1973,6 +2252,50 @@ describe("source normalization", () => {
           (item.sourceGroups ?? [item.sourceGroup]).length
       )
     ).toBe(true);
+  });
+
+  it("merges a same-source alias only after another source corroborates it", () => {
+    const base = {
+      name: "同济大学",
+      institute: "数学科学学院",
+      deadline: "2026-09-08T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: ["985"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        description:
+          "同济大学数学科学学院2027年接收推荐免试研究生（含直接攻博）预报名通知-同济大学数学科学学院",
+        website: "https://math.tongji.edu.cn/info/1037/13364.htm"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        description:
+          "2026年同济大学数学科学学院2027年接收推荐免试研究生（含直接攻博）预报名通知",
+        website: "https://math.tongji.edu.cn/info/1037/13364.htm"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        description:
+          "2026年同济大学数学科学学院2027年接收推荐免试研究生（含直接攻博）预报名通知",
+        website: "https://math.tongji.edu.cn/info/1180/13366.htm"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      mergeReason: "title_match",
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+    expect(merged[0]?.alternateWebsites).toEqual([
+      "https://math.tongji.edu.cn/info/1180/13366.htm"
+    ]);
   });
 
   it("keeps notices separate when a school reuses one application URL", () => {
@@ -2574,6 +2897,119 @@ describe("DDL API", () => {
 
     expect(response.total).toBe(1);
     expect(response.items[0]?.key).toBe("active-merged");
+  });
+
+  it("hides grace aliases covered by a current title-match alternate URL", () => {
+    const response = buildDdlResponse(
+      [
+        {
+          item_key: "active-title-merge",
+          content_hash: "c".repeat(64),
+          payload: JSON.stringify({
+            key: "active-title-merge",
+            contentHash: "c".repeat(64),
+            sourceGroup: "xingkebaoyan",
+            sourceGroups: ["xingkebaoyan", "zscampus"],
+            mergeReason: "title_match",
+            name: "厦门大学",
+            institute: "新闻传播学院",
+            description: "2027年接收推荐免试研究生预报名通知",
+            deadline: "2026-08-20T15:59:59.000Z",
+            website: "https://comm.xmu.edu.cn/info/1451/67382.htm",
+            alternateWebsites: [
+              "https://mp.weixin.qq.com/s/2SX2j6asHAimqWYvNS0UGw"
+            ],
+            tags: []
+          }),
+          source_group: "xingkebaoyan",
+          first_seen_at: "2026-07-28T00:00:00.000Z",
+          updated_at: "2026-07-28T00:00:00.000Z",
+          last_seen_at: "2026-07-28T00:00:00.000Z",
+          missing_since: null
+        },
+        {
+          item_key: "grace-title-alias",
+          content_hash: "d".repeat(64),
+          payload: JSON.stringify({
+            key: "grace-title-alias",
+            contentHash: "d".repeat(64),
+            sourceGroup: "xingkebaoyan",
+            sourceGroups: ["xingkebaoyan"],
+            name: "厦门大学",
+            institute: "新闻传播学院",
+            description: "2027年接收推荐免试研究生预报名通知",
+            deadline: "2026-08-20T15:59:59.000Z",
+            website: "https://mp.weixin.qq.com/s/2SX2j6asHAimqWYvNS0UGw",
+            tags: []
+          }),
+          source_group: "xingkebaoyan",
+          first_seen_at: "2026-07-27T00:00:00.000Z",
+          updated_at: "2026-07-27T00:00:00.000Z",
+          last_seen_at: "2026-07-27T00:00:00.000Z",
+          missing_since: "2026-07-28T00:00:00.000Z"
+        }
+      ],
+      new Date("2026-07-28T01:00:00.000Z")
+    );
+
+    expect(response.total).toBe(1);
+    expect(response.items[0]?.key).toBe("active-title-merge");
+  });
+
+  it("hides grace aliases that use a controlled school-name variant", () => {
+    const website =
+      "https://nssc.cas.cn/yjsb/zsxx/zsdt/202607/t20260703_8241596.html";
+    const response = buildDdlResponse(
+      [
+        {
+          item_key: "active-school-alias-merge",
+          content_hash: "e".repeat(64),
+          payload: JSON.stringify({
+            key: "active-school-alias-merge",
+            contentHash: "e".repeat(64),
+            sourceGroup: "xingkebaoyan",
+            sourceGroups: ["xingkebaoyan", "zscampus"],
+            mergeReason: "exact_url",
+            name: "中国科学院",
+            institute: "国家空间科学中心",
+            description: "2027年招收推免研究生公告",
+            deadline: "2026-09-28T15:59:59.000Z",
+            website,
+            tags: []
+          }),
+          source_group: "xingkebaoyan",
+          first_seen_at: "2026-07-28T00:00:00.000Z",
+          updated_at: "2026-07-28T00:00:00.000Z",
+          last_seen_at: "2026-07-28T00:00:00.000Z",
+          missing_since: null
+        },
+        {
+          item_key: "grace-school-alias",
+          content_hash: "f".repeat(64),
+          payload: JSON.stringify({
+            key: "grace-school-alias",
+            contentHash: "f".repeat(64),
+            sourceGroup: "xingkebaoyan",
+            sourceGroups: ["xingkebaoyan"],
+            name: "中国科学院大学",
+            institute: "国家空间科学中心",
+            description: "2027年招收推免研究生公告",
+            deadline: "2026-09-30T15:59:59.000Z",
+            website,
+            tags: []
+          }),
+          source_group: "xingkebaoyan",
+          first_seen_at: "2026-07-27T00:00:00.000Z",
+          updated_at: "2026-07-27T00:00:00.000Z",
+          last_seen_at: "2026-07-27T00:00:00.000Z",
+          missing_since: "2026-07-28T00:00:00.000Z"
+        }
+      ],
+      new Date("2026-07-28T01:00:00.000Z")
+    );
+
+    expect(response.total).toBe(1);
+    expect(response.items[0]?.key).toBe("active-school-alias-merge");
   });
 
   it("reports source statistics for every source represented by a merged item", () => {

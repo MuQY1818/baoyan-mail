@@ -3,8 +3,9 @@ import {
   classifyBaoyanXinxiRecord,
   getActivityTypeDetails,
   getBaoyanXinxiAreas,
-  getSchoolTierTags,
-  isSpecificNoticeUrl
+  getNotificationSchoolMatchKey,
+  getNotificationUrlMatchKey,
+  getSchoolTierTags
 } from "./source";
 import type {
   ActivityType,
@@ -113,7 +114,8 @@ export function buildDdlResponse(
       .map((context) => serializeDdlItem(context, now))
       .filter((item): item is DdlApiItem => item !== null)
       .reduce(dedupeDdlItems(), [])
-      .sort(compareDdlItems)
+      .sort(compareDdlItems),
+    contexts
   );
   const ddlItems = serializedItems.filter(
     (item) =>
@@ -137,14 +139,27 @@ export function buildDdlResponse(
   };
 }
 
-function hideSupersededGraceAliases(items: DdlApiItem[]): DdlApiItem[] {
-  const activeMergedItems = items.filter(
-    (item) =>
-      item.sourceVisibility === "current" &&
-      item.mergeReason === "exact_url" &&
-      item.sourceCount > 1 &&
-      isSpecificNoticeUrl(item.website)
-  );
+function hideSupersededGraceAliases(
+  items: DdlApiItem[],
+  contexts: DdlContext[]
+): DdlApiItem[] {
+  const contextsByKey = new Map(contexts.map((context) => [context.item.key, context]));
+  const activeMergedItems = items.flatMap((item) => {
+    if (
+      item.sourceVisibility !== "current" ||
+      item.mergeReason === "single" ||
+      item.sourceCount <= 1
+    ) {
+      return [];
+    }
+    const context = contextsByKey.get(item.key);
+    const urlMatchKeys = context === undefined
+      ? getUrlMatchKeys([item.website])
+      : getItemUrlMatchKeys(context.item);
+    return urlMatchKeys.size === 0
+      ? []
+      : [{ item, school: getNotificationSchoolMatchKey(item.school), urlMatchKeys }];
+  });
   if (activeMergedItems.length === 0) {
     return items;
   }
@@ -152,13 +167,18 @@ function hideSupersededGraceAliases(items: DdlApiItem[]): DdlApiItem[] {
     if (item.sourceVisibility !== "grace") {
       return true;
     }
-    const canonicalUrl = canonicalizeNotificationUrl(item.website);
-    const school = normalizeDuplicateText(item.school);
+    const context = contextsByKey.get(item.key);
+    const urlMatchKeys = context === undefined
+      ? getUrlMatchKeys([item.website])
+      : getItemUrlMatchKeys(context.item);
+    const school = getNotificationSchoolMatchKey(item.school);
     return !activeMergedItems.some(
-      (activeItem) =>
-        canonicalizeNotificationUrl(activeItem.website) === canonicalUrl &&
-        normalizeDuplicateText(activeItem.school) === school &&
-        item.sourceGroups.every((sourceGroup) => activeItem.sourceGroups.includes(sourceGroup))
+      (active) =>
+        active.school === school &&
+        Array.from(urlMatchKeys).some((url) => active.urlMatchKeys.has(url)) &&
+        item.sourceGroups.every((sourceGroup) =>
+          active.item.sourceGroups.includes(sourceGroup)
+        )
     );
   });
 }
@@ -649,6 +669,18 @@ function getItemNormalizedUrls(item: NormalizedItem): string[] {
         .map((website) => canonicalizeNotificationUrl(website))
         .filter((website) => website !== "")
     )
+  );
+}
+
+function getItemUrlMatchKeys(item: NormalizedItem): Set<string> {
+  return getUrlMatchKeys([item.website, ...(item.alternateWebsites ?? [])]);
+}
+
+function getUrlMatchKeys(websites: string[]): Set<string> {
+  return new Set(
+    websites
+      .map((website) => getNotificationUrlMatchKey(website))
+      .filter((website) => website !== "")
   );
 }
 
