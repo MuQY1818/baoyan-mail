@@ -711,6 +711,109 @@ describe("source normalization", () => {
     }
   });
 
+  it("retries a transient source network failure", async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    let xingkeAttempts = 0;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("xingkebaoyan")) {
+        xingkeAttempts += 1;
+        if (xingkeAttempts === 1) {
+          throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+        }
+        return Response.json({
+          items: [
+            {
+              school: "北京邮电大学",
+              department: "计算机学院",
+              title: "预推免报名通知",
+              signup_end: "2099-09-10 17:00",
+              url: "https://example.com/bupt-recommendation"
+            }
+          ]
+        });
+      }
+      if (url.includes("baoyanxinxi")) {
+        return new Response("", { status: 200 });
+      }
+      return Response.json({ code: 10000, data: { total: 0, list: [] } });
+    };
+
+    try {
+      const resultPromise = fetchSourceItemsWithStats({} as Env);
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(xingkeAttempts).toBe(2);
+      expect(result.stats.find((stats) => stats.sourceGroup === "xingkebaoyan"))
+        .toMatchObject({ acceptedCount: 1 });
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops after three retryable source failures", async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    let xingkeAttempts = 0;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("xingkebaoyan")) {
+        xingkeAttempts += 1;
+        throw new TypeError("fetch failed");
+      }
+      if (url.includes("baoyanxinxi")) {
+        return new Response("", { status: 200 });
+      }
+      return Response.json({ code: 10000, data: { total: 0, list: [] } });
+    };
+
+    try {
+      const resultPromise = fetchSourceItemsWithStats({} as Env);
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+      const xingkeStats = result.stats.find(
+        (stats) => stats.sourceGroup === "xingkebaoyan"
+      );
+
+      expect(xingkeAttempts).toBe(3);
+      expect(xingkeStats?.error).toContain("fetch failed");
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry a deterministic source client error", async () => {
+    const originalFetch = globalThis.fetch;
+    let xingkeAttempts = 0;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("xingkebaoyan")) {
+        xingkeAttempts += 1;
+        return new Response("not found", { status: 404, statusText: "Not Found" });
+      }
+      if (url.includes("baoyanxinxi")) {
+        return new Response("", { status: 200 });
+      }
+      return Response.json({ code: 10000, data: { total: 0, list: [] } });
+    };
+
+    try {
+      const result = await fetchSourceItemsWithStats({} as Env);
+      const xingkeStats = result.stats.find(
+        (stats) => stats.sourceGroup === "xingkebaoyan"
+      );
+
+      expect(xingkeAttempts).toBe(1);
+      expect(xingkeStats?.error).toContain("404 Not Found");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("dedupes CS records with the same URL, school, institute, and deadline across groups", async () => {
     const items = await normalizeSourceData({
       camp2027: [

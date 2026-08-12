@@ -17,7 +17,9 @@ const DEFAULT_ZSCAMPUS_SOURCE_URL =
   "https://api.zscampus.com/zs-baoyan-summer/summer/getListWithConditions";
 const SOURCE_PAGE_SIZE = 100;
 const MAX_ZSCAMPUS_PAGES = 30;
-const SOURCE_FETCH_TIMEOUT_MS = 20_000;
+const SOURCE_FETCH_TIMEOUT_MS = 30_000;
+const SOURCE_FETCH_MAX_ATTEMPTS = 3;
+const SOURCE_FETCH_RETRY_DELAYS_MS = [1_000, 3_000] as const;
 const MIN_COMPARABLE_TITLE_LENGTH = 5;
 const MIN_CORROBORATED_ALIAS_TITLE_LENGTH = 8;
 export const BAOYANXINXI_SOURCE_GROUP = "baoyanxinxi2026jsjby";
@@ -1064,17 +1066,56 @@ async function fetchZscampusPage(
 }
 
 async function fetchSourceResponse(url: string, accept: string): Promise<Response> {
-  const response = await fetch(url, {
-    headers: {
-      Accept: accept,
-      "User-Agent": "baoyan-mail-worker"
-    },
-    signal: AbortSignal.timeout(SOURCE_FETCH_TIMEOUT_MS)
-  });
-  if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= SOURCE_FETCH_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          Accept: accept,
+          "User-Agent": "baoyan-mail-worker"
+        },
+        signal: AbortSignal.timeout(SOURCE_FETCH_TIMEOUT_MS)
+      });
+      if (response.ok) {
+        return response;
+      }
+
+      const error = new Error(`${response.status} ${response.statusText}`.trim());
+      if (!isRetryableSourceStatus(response.status)) {
+        throw error;
+      }
+      lastError = error;
+    } catch (error) {
+      if (!isRetryableSourceError(error)) {
+        throw error;
+      }
+      lastError = error;
+    }
+
+    if (attempt < SOURCE_FETCH_MAX_ATTEMPTS) {
+      await delaySourceRetry(SOURCE_FETCH_RETRY_DELAYS_MS[attempt - 1]!);
+    }
   }
-  return response;
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function isRetryableSourceStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function isRetryableSourceError(error: unknown): boolean {
+  if (error instanceof TypeError) {
+    return true;
+  }
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return error.name === "AbortError" || error.name === "TimeoutError";
+}
+
+function delaySourceRetry(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function createSourceErrorResult(
