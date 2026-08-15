@@ -822,16 +822,20 @@ export async function createManualItemFromReviewPayload(
 async function fetchBaoyanXinxiItems(
   definition: BaoyanXinxiSourceDefinition
 ): Promise<SourceFetchResult> {
-  const response = await fetchSourceResponse(definition.url, "text/html");
-  return normalizeBaoyanXinxiHtml(await response.text(), definition.url, {
+  const html = await fetchSourceBody(definition.url, "text/html", (response) =>
+    response.text()
+  );
+  return normalizeBaoyanXinxiHtml(html, definition.url, {
     activityType: definition.activityType,
     sourceGroup: definition.sourceGroup
   });
 }
 
 async function fetchXingkeItems(sourceUrl: string): Promise<SourceFetchResult> {
-  const response = await fetchSourceResponse(sourceUrl, "application/json");
-  return normalizeXingkeData(await response.json(), sourceUrl);
+  const data = await fetchSourceBody(sourceUrl, "application/json", (response) =>
+    response.json()
+  );
+  return normalizeXingkeData(data, sourceUrl);
 }
 
 export function normalizeXingkeData(
@@ -1051,8 +1055,11 @@ async function fetchZscampusPage(
   for (const [key, value] of Object.entries(query)) {
     url.searchParams.set(key, value);
   }
-  const response = await fetchSourceResponse(url.toString(), "application/json");
-  const payload = (await response.json()) as Record<string, unknown>;
+  const payload = await fetchSourceBody<Record<string, unknown>>(
+    url.toString(),
+    "application/json",
+    (response) => response.json() as Promise<Record<string, unknown>>
+  );
   if (Number(payload.code) !== 10000 || !isRecord(payload.data)) {
     throw new Error(`第 ${page} 页返回格式异常`);
   }
@@ -1065,7 +1072,11 @@ async function fetchZscampusPage(
   return { total, records };
 }
 
-async function fetchSourceResponse(url: string, accept: string): Promise<Response> {
+async function fetchSourceBody<T>(
+  url: string,
+  accept: string,
+  readBody: (response: Response) => Promise<T>
+): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= SOURCE_FETCH_MAX_ATTEMPTS; attempt += 1) {
     try {
@@ -1076,15 +1087,15 @@ async function fetchSourceResponse(url: string, accept: string): Promise<Respons
         },
         signal: AbortSignal.timeout(SOURCE_FETCH_TIMEOUT_MS)
       });
-      if (response.ok) {
-        return response;
+      if (!response.ok) {
+        const error = new Error(`${response.status} ${response.statusText}`.trim());
+        if (!isRetryableSourceStatus(response.status)) {
+          throw error;
+        }
+        lastError = error;
+      } else {
+        return await readBody(response);
       }
-
-      const error = new Error(`${response.status} ${response.statusText}`.trim());
-      if (!isRetryableSourceStatus(response.status)) {
-        throw error;
-      }
-      lastError = error;
     } catch (error) {
       if (!isRetryableSourceError(error)) {
         throw error;
