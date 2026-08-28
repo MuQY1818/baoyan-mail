@@ -629,7 +629,7 @@ export function getActivityTypeFromSourceGroup(sourceGroup: string): ActivityTyp
 
 export function getActivityTypeFromText(value: string): ActivityTypeDetails {
   const hasPreRecommendation =
-    /预推免|预免推|九推|推荐免试|免试攻读研究生|推免生接收|推免研究生|推免面试/u.test(
+    /预推免|预免推|九推|推荐免试|免试攻读研究生|推免生接收|接收推免|推免生预报名|推免报名|推免研究生|推免面试/u.test(
       value
     );
   const hasSummerCamp =
