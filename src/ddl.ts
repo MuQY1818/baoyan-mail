@@ -21,6 +21,7 @@ import type {
 } from "./types";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const VERIFICATION_DEADLINE_TOLERANCE_MS = 1_000;
 const STALE_GRACE_HOURS = 48;
 const STALE_GRACE_MS = STALE_GRACE_HOURS * 60 * 60 * 1000;
 const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
@@ -515,7 +516,10 @@ export function doesOfficialVerificationResolveDeadline(
   if (verifiedDeadline === null) {
     return false;
   }
-  return verifiedDeadline.getTime() <= sourceDeadline.getTime();
+  return (
+    verifiedDeadline.getTime() <=
+    sourceDeadline.getTime() + VERIFICATION_DEADLINE_TOLERANCE_MS
+  );
 }
 
 function isOfficialItemVerificationFresh(

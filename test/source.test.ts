@@ -3028,6 +3028,47 @@ describe("DDL API", () => {
     });
   });
 
+  it("treats a one-second source boundary difference as the same deadline", () => {
+    const item: NormalizedItem = {
+      key: "one-second-boundary",
+      contentHash: "hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "南开大学",
+      institute: "人工智能学院",
+      description: "预推免报名通知",
+      deadline: "2026-08-24T03:59:59.000Z",
+      deadlinePrecision: "exact",
+      deadlineSource: "baoyanxinxi2026jsjby",
+      website: "https://example.com/one-second-boundary",
+      tags: []
+    };
+    const verification: OfficialItemVerification = {
+      itemKey: item.key,
+      normalizedUrl: item.website,
+      title: "官方预推免报名通知",
+      deadline: "2026-08-24T04:00:00.000Z",
+      deadlinePrecision: "exact",
+      reason: "官网写明12:00截止",
+      verifier: "luna-high",
+      verifiedAt: "2026-08-20T00:00:00.000Z"
+    };
+
+    const response = buildDdlResponse(
+      [item],
+      new Date("2026-08-20T00:00:00.000Z"),
+      null,
+      new Map(),
+      { officialVerifications: new Map([[verification.itemKey, verification]]) }
+    );
+
+    expect(response.items[0]).toMatchObject({
+      deadlineAt: verification.deadline,
+      deadlineConflict: false,
+      deadlineSource: "official-verification",
+      officialVerifiedAt: verification.verifiedAt
+    });
+  });
+
   it("does not share an official verification between items with the same URL", () => {
     const sharedWebsite = "https://gsas.fudan.edu.cn/shared-portal";
     const firstItem: NormalizedItem = {
