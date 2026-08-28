@@ -50,6 +50,9 @@ export function filterItems(
   const keyword = query.trim().toLowerCase();
   const rangeConfig = RANGE_OPTIONS.find((option) => option.value === range);
   return items.filter((item) => {
+    if (range === "unknown" && item.status !== "unknown") {
+      return false;
+    }
     if (!matchesRelevance(item, relevance)) {
       return false;
     }
@@ -63,7 +66,7 @@ export function filterItems(
       return false;
     }
     if (rangeConfig?.maxDays !== null && rangeConfig?.maxDays !== undefined) {
-      if (item.remainingDays > rangeConfig.maxDays) {
+      if (item.remainingDays === null || item.remainingDays > rangeConfig.maxDays) {
         return false;
       }
     }
@@ -166,19 +169,30 @@ export function buildStats(items: DdlItem[]): {
   sevenDays: number;
   fifteenDays: number;
   later: number;
+  unknown: number;
 } {
   return {
-    today: items.filter((item) => item.remainingDays <= 0).length,
-    threeDays: items.filter((item) => item.remainingDays >= 0 && item.remainingDays <= 3).length,
-    sevenDays: items.filter((item) => item.remainingDays >= 0 && item.remainingDays <= 7).length,
-    fifteenDays: items.filter((item) => item.remainingDays >= 0 && item.remainingDays <= 15).length,
-    later: items.filter((item) => item.remainingDays > 15).length
+    today: items.filter((item) => item.remainingDays !== null && item.remainingDays <= 0).length,
+    threeDays: items.filter(
+      (item) => item.remainingDays !== null && item.remainingDays >= 0 && item.remainingDays <= 3
+    ).length,
+    sevenDays: items.filter(
+      (item) => item.remainingDays !== null && item.remainingDays >= 0 && item.remainingDays <= 7
+    ).length,
+    fifteenDays: items.filter(
+      (item) => item.remainingDays !== null && item.remainingDays >= 0 && item.remainingDays <= 15
+    ).length,
+    later: items.filter((item) => item.remainingDays !== null && item.remainingDays > 15).length,
+    unknown: items.filter((item) => item.status === "unknown").length
   };
 }
 
 export function buildTimeline(items: DdlItem[]): TimelineStop[] {
   const byDay = new Map<number, DdlItem[]>();
   for (const item of items) {
+    if (item.remainingDays === null) {
+      continue;
+    }
     const day = Math.max(0, item.remainingDays);
     const bucket = byDay.get(day);
     if (bucket === undefined) {

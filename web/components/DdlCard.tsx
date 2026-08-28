@@ -45,8 +45,16 @@ export const DdlCard = React.memo(function DdlCard({
   return (
     <li className={classes.join(" ")} id={`ddl-${item.key}`}>
       <div className="date-block" aria-label={item.remainingText}>
-        <strong>{item.status === "today" ? "今日" : item.remainingDays}</strong>
-        <span>{item.status === "today" ? "截止" : "天后"}</span>
+        <strong>
+          {item.status === "unknown"
+            ? "待定"
+            : item.status === "today"
+              ? "今日"
+              : item.remainingDays}
+        </strong>
+        <span>
+          {item.status === "unknown" ? "DDL" : item.status === "today" ? "截止" : "天后"}
+        </span>
       </div>
       <article>
         <div className="card-head">

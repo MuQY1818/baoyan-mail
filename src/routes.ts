@@ -14,6 +14,7 @@ import {
   getSnapshotRowsBySourceGroups,
   getVisitDailyStats,
   incrementVisitDailyStat,
+  recordClassificationFeedback,
   insertReviewRule,
   publishExternalSourceSyncItems,
   rejectReviewCandidate,
@@ -28,7 +29,12 @@ import {
   upsertReviewCandidates,
   upsertSnapshots
 } from "./db";
-import { buildDdlResponse, getDdlEntryNormalizedUrls } from "./ddl";
+import {
+  buildDdlResponse,
+  doesOfficialVerificationResolveDeadline,
+  getDdlEntryNormalizedUrls,
+  getDdlEntryOfficialVerificationTargets
+} from "./ddl";
 import { LAST_SOURCE_STATS_STATE_KEY } from "./checker";
 import { sha256Hex } from "./crypto";
 import {
@@ -45,6 +51,9 @@ import type {
   DeadlinePrecision,
   Env,
   ItemActivityTypeClassification,
+  ClassificationFeedback,
+  ClassificationFeedbackSource,
+  ClassificationKind,
   ItemRelevanceClassification,
   NormalizedItem,
   OfficialItemVerification,
@@ -170,6 +179,9 @@ export async function handleRequest(
     }
     if (request.method === "POST" && url.pathname === "/api/admin/official-verifications") {
       return await handleOfficialItemVerifications(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/api/admin/classification-feedback") {
+      return await handleClassificationFeedback(request, env);
     }
     if (request.method === "GET" && url.pathname === "/api/admin/review") {
       return await handleReviewPage(request, env);
@@ -307,7 +319,7 @@ async function handleVerificationCandidates(
     await Promise.all([
       getItemRelevanceClassifications(env, normalizedUrls),
       getItemActivityTypeClassifications(env, normalizedUrls),
-      getOfficialItemVerifications(env, normalizedUrls)
+      getOfficialItemVerifications(env, getDdlEntryOfficialVerificationTargets(pageRows), false)
     ]);
   const candidates = pageRows.flatMap((row) => {
     if (row.missing_since !== null) {
@@ -320,8 +332,11 @@ async function handleVerificationCandidates(
         .filter((url) => url !== "");
       const relevance = urls.map((url) => relevanceClassifications.get(url)).find(Boolean);
       const activityType = urls.map((url) => activityTypeClassifications.get(url)).find(Boolean);
-      const verification = urls.map((url) => officialVerifications.get(url)).find(Boolean);
+      const verification = officialVerifications.get(row.item_key);
       const sourceUpdatedAt = getLatestSourcePublishedAt(item) || row.updated_at;
+      const verificationResolvesDeadline =
+        verification !== undefined &&
+        doesOfficialVerificationResolveDeadline(item, verification, sourceUpdatedAt);
       const reasons: string[] = [];
       if (item.deadline === "") {
         reasons.push("unknown-deadline");
@@ -342,8 +357,15 @@ async function handleVerificationCandidates(
         reasons.push("stale-activity-type-classification");
       }
       if (
-        verification !== undefined &&
-        verification.verifiedAt >= sourceUpdatedAt
+        /预推免|预免推|九推|推荐免试|免试攻读研究生|推免生接收|推免研究生|推免面试/u.test(
+          `${item.name} ${item.institute} ${item.description}`
+        ) &&
+        activityType?.activityType !== "pre_recommendation"
+      ) {
+        reasons.push("activity-type-rule-feedback");
+      }
+      if (
+        verificationResolvesDeadline
       ) {
         const deadlineIndex = reasons.indexOf("unknown-deadline");
         if (deadlineIndex >= 0) {
@@ -356,6 +378,19 @@ async function handleVerificationCandidates(
         const conflictIndex = reasons.indexOf("deadline-conflict");
         if (conflictIndex >= 0) {
           reasons.splice(conflictIndex, 1);
+        }
+      }
+      if (verification !== undefined && !verificationResolvesDeadline) {
+        if (verification.verifiedAt < sourceUpdatedAt) {
+          reasons.push("stale-official-verification");
+        } else if (verification.deadline === "" && item.deadline !== "") {
+          reasons.push("official-deadline-unknown");
+        } else if (
+          item.deadline !== "" &&
+          verification.deadline !== "" &&
+          new Date(verification.deadline).getTime() > new Date(item.deadline).getTime()
+        ) {
+          reasons.push("official-deadline-later-than-source");
         }
       }
       if (reasons.length === 0) {
@@ -376,6 +411,8 @@ async function handleVerificationCandidates(
           areas: item.areas ?? [],
           sourceGroups: item.sourceGroups ?? [item.sourceGroup],
           sourceUpdatedAt,
+          officialDeadline: verification?.deadline ?? null,
+          officialVerifiedAt: verification?.verifiedAt ?? null,
           reasons
         }
       ];
@@ -628,7 +665,7 @@ async function handleDdl(env: Env, url: URL): Promise<Response> {
   const [classifications, activityTypeClassifications, officialVerifications] = await Promise.all([
     getItemRelevanceClassifications(env, normalizedUrls),
     getItemActivityTypeClassifications(env, normalizedUrls),
-    getOfficialItemVerifications(env, normalizedUrls)
+    getOfficialItemVerifications(env, getDdlEntryOfficialVerificationTargets(rows))
   ]);
   const response = buildDdlResponse(
     rows,
@@ -700,10 +737,24 @@ async function handleRelevanceClassifications(request: Request, env: Env): Promi
     entries as ItemRelevanceClassification[],
     now
   );
+  const feedbackWritten = await recordClassificationFeedback(
+    env,
+    (entries as ItemRelevanceClassification[]).map((entry) => ({
+      normalizedUrl: entry.normalizedUrl,
+      classificationKind: "relevance" as const,
+      modelValue: entry.relevance,
+      correctedValue: entry.relevance,
+      reason: entry.reason,
+      source: "model" as const,
+      classifier: entry.classifier,
+      createdAt: now
+    }))
+  );
   return jsonResponse({
     ok: true,
     accepted: entries.length,
-    changed
+    changed,
+    feedbackWritten
   });
 }
 
@@ -729,10 +780,24 @@ async function handleActivityTypeClassifications(request: Request, env: Env): Pr
     entries as ItemActivityTypeClassification[],
     now
   );
+  const feedbackWritten = await recordClassificationFeedback(
+    env,
+    (entries as ItemActivityTypeClassification[]).map((entry) => ({
+      normalizedUrl: entry.normalizedUrl,
+      classificationKind: "activity_type" as const,
+      modelValue: entry.activityType,
+      correctedValue: entry.activityType,
+      reason: entry.reason,
+      source: "model" as const,
+      classifier: entry.classifier,
+      createdAt: now
+    }))
+  );
   return jsonResponse({
     ok: true,
     accepted: entries.length,
-    changed
+    changed,
+    feedbackWritten
   });
 }
 
@@ -759,6 +824,27 @@ async function handleOfficialItemVerifications(request: Request, env: Env): Prom
     now
   );
   return jsonResponse({ ok: true, accepted: entries.length, changed });
+}
+
+async function handleClassificationFeedback(request: Request, env: Env): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) {
+    return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  }
+
+  const body = (await request.json()) as Record<string, unknown>;
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  if (rawItems.length === 0 || rawItems.length > 500) {
+    return jsonResponse({ ok: false, error: "invalid_items" }, 400);
+  }
+
+  const now = new Date().toISOString();
+  const entries = rawItems.map((entry) => readClassificationFeedback(entry, now));
+  if (entries.some((entry) => entry === null)) {
+    return jsonResponse({ ok: false, error: "invalid_feedback" }, 400);
+  }
+  const accepted = entries as ClassificationFeedback[];
+  const written = await recordClassificationFeedback(env, accepted);
+  return jsonResponse({ ok: true, accepted: accepted.length, written });
 }
 
 async function handleMissingLink(request: Request, env: Env): Promise<Response> {
@@ -1511,6 +1597,50 @@ function readString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function readClassificationFeedback(
+  value: unknown,
+  now: string
+): ClassificationFeedback | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const normalizedUrl = canonicalizeNotificationUrl(
+    readString(record.normalizedUrl) || readString(record.website)
+  );
+  const classificationKind = readString(record.classificationKind) as ClassificationKind;
+  const modelValue = readString(record.modelValue).trim();
+  const correctedValue = readString(record.correctedValue).trim();
+  const reason = readString(record.reason).trim();
+  const source = readString(record.source) as ClassificationFeedbackSource;
+  const classifier = readString(record.classifier).trim() || "luna-high-feedback";
+  const createdAt = readString(record.createdAt).trim() || now;
+
+  if (
+    normalizedUrl === "" ||
+    !isValidClassificationKind(classificationKind) ||
+    !isValidFeedbackValue(classificationKind, modelValue) ||
+    !isValidFeedbackValue(classificationKind, correctedValue) ||
+    !isValidFeedbackSource(source) ||
+    reason === "" ||
+    reason.length > 500 ||
+    classifier.length > 64 ||
+    Number.isNaN(new Date(createdAt).getTime())
+  ) {
+    return null;
+  }
+  return {
+    normalizedUrl,
+    classificationKind,
+    modelValue,
+    correctedValue,
+    reason,
+    source,
+    classifier,
+    createdAt
+  };
+}
+
 function readRelevanceClassification(
   value: unknown,
   now: string
@@ -1596,6 +1726,7 @@ function readOfficialItemVerification(
     return null;
   }
   const record = value as Record<string, unknown>;
+  const itemKey = readString(record.itemKey).trim() || readString(record.key).trim();
   const normalizedUrl = canonicalizeNotificationUrl(
     readString(record.normalizedUrl) || readString(record.website)
   );
@@ -1611,6 +1742,8 @@ function readOfficialItemVerification(
   const verifiedAt = readString(record.verifiedAt).trim() || now;
 
   if (
+    itemKey === "" ||
+    itemKey.length > 128 ||
     normalizedUrl === "" ||
     title.length > 500 ||
     reason === "" ||
@@ -1622,6 +1755,7 @@ function readOfficialItemVerification(
     return null;
   }
   return {
+    itemKey,
     normalizedUrl,
     title,
     deadline,
@@ -1861,6 +1995,18 @@ function isValidRelevance(value: string): value is Relevance {
 
 function isValidActivityType(value: string): value is ActivityType {
   return value === "summer_camp" || value === "pre_recommendation" || value === "unknown";
+}
+
+function isValidClassificationKind(value: string): value is ClassificationKind {
+  return value === "relevance" || value === "activity_type";
+}
+
+function isValidFeedbackSource(value: string): value is ClassificationFeedbackSource {
+  return value === "model" || value === "rule_guard" || value === "manual";
+}
+
+function isValidFeedbackValue(kind: ClassificationKind, value: string): boolean {
+  return kind === "relevance" ? isValidRelevance(value) : isValidActivityType(value);
 }
 
 function isValidDeadlinePrecision(value: string): value is DeadlinePrecision {

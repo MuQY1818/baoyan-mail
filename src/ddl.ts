@@ -2,6 +2,7 @@ import {
   canonicalizeNotificationUrl,
   classifyBaoyanXinxiRecord,
   getActivityTypeDetails,
+  getActivityTypeFromText,
   getBaoyanXinxiAreas,
   getNotificationSchoolMatchKey,
   getNotificationUrlMatchKey,
@@ -15,6 +16,7 @@ import type {
   ItemSnapshotRow,
   NormalizedItem,
   OfficialItemVerification,
+  OfficialItemVerificationTarget,
   Relevance
 } from "./types";
 
@@ -37,9 +39,9 @@ export interface DdlApiItem {
   description: string;
   deadlineAt: string;
   deadlineText: string;
-  remainingDays: number;
+  remainingDays: number | null;
   remainingText: string;
-  status: "today" | "future" | "expired";
+  status: "today" | "future" | "expired" | "unknown";
   tier: string;
   areas: string[];
   relevance: Relevance;
@@ -223,7 +225,7 @@ function getDdlDuplicateKey(item: DdlApiItem): string {
     canonicalUrl,
     normalizeDuplicateText(item.school),
     normalizeDuplicateText(item.institute),
-    formatShanghaiDate(new Date(item.deadlineAt))
+    item.deadlineAt === "" ? "unknown" : formatShanghaiDate(new Date(item.deadlineAt))
   ].join("\u0000");
 }
 
@@ -259,6 +261,9 @@ function shouldPreferDdlItem(candidate: DdlApiItem, current: DdlApiItem): boolea
 
 function getSourceDeadlineYearDistance(item: DdlApiItem): number {
   const sourceYear = getSourceGroupYear(item.sourceGroup);
+  if (item.deadlineAt === "") {
+    return Number.MAX_SAFE_INTEGER;
+  }
   const deadlineYear = Number.parseInt(formatShanghaiDate(new Date(item.deadlineAt)).slice(0, 4), 10);
   if (sourceYear === null || Number.isNaN(deadlineYear)) {
     return Number.MAX_SAFE_INTEGER;
@@ -282,12 +287,11 @@ export function serializeDdlItem(
   const context = "item" in contextOrItem ? contextOrItem : toDdlContext(contextOrItem);
   const item = context.item;
   const deadline = parseDeadline(item.deadline);
-  if (deadline === null) {
-    return null;
-  }
-
-  const remainingDays = getShanghaiCalendarDaysUntil(now, deadline);
-  const status = getDeadlineStatus(deadline, remainingDays, now);
+  const remainingDays = deadline === null ? null : getShanghaiCalendarDaysUntil(now, deadline);
+  const status =
+    deadline === null
+      ? "unknown"
+      : getDeadlineStatus(deadline, getShanghaiCalendarDaysUntil(now, deadline), now);
   const tier = getSchoolTierTags(item.name)[0] ?? "其他";
   const relevance = getItemRelevance(item);
   const activityTypeDetails = getActivityTypeDetails(item);
@@ -299,8 +303,8 @@ export function serializeDdlItem(
     school: item.name,
     institute: item.institute,
     description: item.description === "_No response_" ? "" : item.description,
-    deadlineAt: deadline.toISOString(),
-    deadlineText: formatShanghaiDateTime(deadline),
+    deadlineAt: deadline?.toISOString() ?? "",
+    deadlineText: deadline === null ? "待确认" : formatShanghaiDateTime(deadline),
     remainingDays,
     remainingText: formatRemainingText(status, remainingDays),
     status,
@@ -319,7 +323,7 @@ export function serializeDdlItem(
     sourceLabels,
     sourceCount: sourceGroups.length,
     mergeReason: item.mergeReason ?? "single",
-    deadlinePrecision: item.deadlinePrecision ?? "unknown",
+    deadlinePrecision: deadline === null ? "unknown" : item.deadlinePrecision ?? "unknown",
     deadlineConflict: item.deadlineConflict ?? false,
     deadlineSource: item.deadlineSource ?? null,
     officialVerifiedAt: item.officialVerifiedAt ?? null,
@@ -355,6 +359,18 @@ export function getDdlEntryNormalizedUrls(entries: Array<NormalizedItem | ItemSn
       entries.flatMap((entry) => getItemNormalizedUrls(toDdlContext(entry).item))
     )
   );
+}
+
+export function getDdlEntryOfficialVerificationTargets(
+  entries: Array<NormalizedItem | ItemSnapshotRow>
+): OfficialItemVerificationTarget[] {
+  return entries.map((entry) => {
+    const item = toDdlContext(entry).item;
+    return {
+      itemKey: item.key,
+      normalizedUrls: getItemNormalizedUrls(item)
+    };
+  });
 }
 
 export function applyRelevanceClassificationsToItems(
@@ -419,6 +435,20 @@ export function applyActivityTypeClassification(
   if (classification === undefined) {
     return item;
   }
+  const explicitTextType = getActivityTypeFromText(`${item.institute} ${item.description}`);
+  if (
+    explicitTextType.activityType === "pre_recommendation" &&
+    classification.activityType !== "pre_recommendation"
+  ) {
+    return {
+      ...item,
+      activityType: "pre_recommendation",
+      activityTypeSource: "text",
+      activityTypeReason: `规则保护：官方文本明确预推免；模型判断为${formatActivityType(classification.activityType)}。`,
+      activityTypeClassifier: `${classification.classifier}+rule-guard`,
+      activityTypeClassifiedAt: classification.classifiedAt
+    };
+  }
   return {
     ...item,
     activityType: classification.activityType,
@@ -438,24 +468,77 @@ export function applyOfficialItemVerificationsToItems(
 
 export function applyOfficialItemVerification(
   item: NormalizedItem,
-  verifications: Map<string, OfficialItemVerification>
+  verifications: Map<string, OfficialItemVerification>,
+  sourceUpdatedAt = getLatestItemSourcePublishedAt(item)
 ): NormalizedItem {
-  const verification = getItemNormalizedUrls(item)
-    .map((url) => verifications.get(url))
-    .find((entry): entry is OfficialItemVerification => entry !== undefined);
-  if (verification === undefined) {
+  const verification = verifications.get(item.key);
+  if (
+    verification === undefined ||
+    !isOfficialItemVerificationFresh(verification, sourceUpdatedAt)
+  ) {
     return item;
   }
+  const resolvesDeadline = doesOfficialVerificationResolveDeadline(
+    item,
+    verification,
+    sourceUpdatedAt
+  );
   return {
     ...item,
     description: verification.title === "" ? item.description : verification.title,
-    deadline: verification.deadline,
-    deadlinePrecision: verification.deadlinePrecision,
-    deadlineConflict: false,
-    deadlineSource: "official-verification",
+    deadline: resolvesDeadline ? verification.deadline : item.deadline,
+    deadlinePrecision: resolvesDeadline
+      ? verification.deadlinePrecision
+      : item.deadlinePrecision ?? "unknown",
+    deadlineConflict: resolvesDeadline ? false : true,
+    deadlineSource: resolvesDeadline
+      ? "official-verification"
+      : item.deadlineSource ?? item.sourceGroup,
     officialTitle: verification.title,
     officialVerifiedAt: verification.verifiedAt
   };
+}
+
+export function doesOfficialVerificationResolveDeadline(
+  item: NormalizedItem,
+  verification: OfficialItemVerification,
+  sourceUpdatedAt = getLatestItemSourcePublishedAt(item)
+): boolean {
+  if (!isOfficialItemVerificationFresh(verification, sourceUpdatedAt)) {
+    return false;
+  }
+  const sourceDeadline = parseDeadline(item.deadline);
+  const verifiedDeadline = parseDeadline(verification.deadline);
+  if (sourceDeadline === null) {
+    return true;
+  }
+  if (verifiedDeadline === null) {
+    return false;
+  }
+  return verifiedDeadline.getTime() <= sourceDeadline.getTime();
+}
+
+function isOfficialItemVerificationFresh(
+  verification: OfficialItemVerification,
+  sourceUpdatedAt: string
+): boolean {
+  if (sourceUpdatedAt === "") {
+    return true;
+  }
+  const verifiedTime = Date.parse(verification.verifiedAt);
+  const sourceTime = Date.parse(sourceUpdatedAt);
+  if (Number.isNaN(verifiedTime) || Number.isNaN(sourceTime)) {
+    return verification.verifiedAt >= sourceUpdatedAt;
+  }
+  return verifiedTime >= sourceTime;
+}
+
+function getLatestItemSourcePublishedAt(item: NormalizedItem): string {
+  return (item.sourceObservations ?? []).reduce(
+    (latest, observation) =>
+      observation.publishedAt > latest ? observation.publishedAt : latest,
+    ""
+  );
 }
 
 export function parseDeadline(value: string): Date | null {
@@ -486,6 +569,11 @@ export function formatShanghaiDate(date: Date): string {
 }
 
 function compareDdlItems(left: DdlApiItem, right: DdlApiItem): number {
+  if (left.status === "unknown" || right.status === "unknown") {
+    if (left.status !== right.status) {
+      return left.status === "unknown" ? 1 : -1;
+    }
+  }
   const deadlineCompare = left.deadlineAt.localeCompare(right.deadlineAt);
   if (deadlineCompare !== 0) {
     return deadlineCompare;
@@ -508,7 +596,13 @@ function getDeadlineStatus(
   return remainingDays <= 0 ? "today" : "future";
 }
 
-function formatRemainingText(status: DdlApiItem["status"], remainingDays: number): string {
+function formatRemainingText(
+  status: DdlApiItem["status"],
+  remainingDays: number | null
+): string {
+  if (status === "unknown" || remainingDays === null) {
+    return "截止时间待确认";
+  }
   if (status === "expired") {
     return "已截止";
   }
@@ -602,7 +696,7 @@ function toDdlContext(
     return {
       item: applyActivityTypeClassification(
         applyRelevanceClassification(
-          applyOfficialItemVerification(item, officialVerifications),
+          applyOfficialItemVerification(item, officialVerifications, entry.updated_at),
           classifications
         ),
         activityTypeClassifications

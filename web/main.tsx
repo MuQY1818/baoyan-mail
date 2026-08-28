@@ -753,6 +753,7 @@ function App(): React.ReactElement {
                   <h2 id="results-title">DDL 结果</h2>
                   <p>
                     今日截止 {stats.today} 条，未来 15 天 {stats.fifteenDays} 条，
+                    截止待确认 {stats.unknown} 条，
                     {formatGeneratedAt(data?.lastSyncedAt ?? data?.generatedAt)}。
                   </p>
                 </div>

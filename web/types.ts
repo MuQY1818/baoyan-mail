@@ -5,7 +5,7 @@ import type {
   ApplicationTrackerData
 } from "./applicationTracker";
 
-export type DeadlineStatus = "today" | "future" | "expired";
+export type DeadlineStatus = "today" | "future" | "expired" | "unknown";
 export type Relevance = "strong" | "possible" | "unrelated";
 
 export interface DdlItem {
@@ -15,7 +15,7 @@ export interface DdlItem {
   description: string;
   deadlineAt: string;
   deadlineText: string;
-  remainingDays: number;
+  remainingDays: number | null;
   remainingText: string;
   status: DeadlineStatus;
   tier: TierFilter;
@@ -154,7 +154,7 @@ export interface TimelineStop {
 export type TimelineExpansion = "collapsed" | "expanded";
 
 export type TierFilter = "Top2" | "华五" | "C9" | "985" | "211" | "其他";
-export type RangeFilter = "today" | "3" | "7" | "15" | "future";
+export type RangeFilter = "today" | "3" | "7" | "15" | "unknown" | "future";
 export type SourceFilter = "all" | "baoyanxinxi" | "xingke" | "zscampus" | "manual";
 export type RecentFilter = "all" | "new" | "updated";
 export type ViewMode = "cards" | "table";

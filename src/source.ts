@@ -589,7 +589,16 @@ interface BaoyanXinxiSourceDefinition {
 export function getActivityTypeDetails(
   item: Pick<NormalizedItem, "activityType" | "activityTypeSource" | "sourceGroup" | "description" | "institute">
 ): ActivityTypeDetails {
+  const textDetails = getActivityTypeFromText(`${item.institute} ${item.description}`);
   if (item.activityType !== undefined) {
+    // Explicit official wording for pre-recommendation must override a stale
+    // model classification, while preserving an already authoritative source label.
+    if (
+      item.activityType !== "pre_recommendation" &&
+      textDetails.activityType === "pre_recommendation"
+    ) {
+      return textDetails;
+    }
     return {
       activityType: item.activityType,
       activityTypeSource: item.activityTypeSource ?? "unknown"
@@ -601,7 +610,7 @@ export function getActivityTypeDetails(
     return sourceGroupDetails;
   }
 
-  return getActivityTypeFromText(`${item.institute} ${item.description}`);
+  return textDetails;
 }
 
 export function getActivityTypeFromSourceGroup(sourceGroup: string): ActivityTypeDetails {
@@ -1518,12 +1527,14 @@ export function isSpecificNoticeUrl(value: string): boolean {
         /^(?:id|article_?id|news_?id|xqid)$/iu.test(key) &&
         /^\d+$/u.test(entryValue)
     );
+    const hasCmsNewsId = /^\d+$/u.test(url.searchParams.get("wbnewsid") ?? "");
     const hasDetailAction = Array.from(url.searchParams.entries()).some(
       ([key, entryValue]) =>
         /^(?:a|action|m|q|type)$/iu.test(key) &&
         /^(?:show|detail|moredetail|content)$/iu.test(entryValue)
     );
     if (
+      hasCmsNewsId ||
       (hasDetailId && hasDetailAction) ||
       /\/(?:[^/?#]*detail[^/?#]*)(?:[/?#]|$)/iu.test(url.hash)
     ) {

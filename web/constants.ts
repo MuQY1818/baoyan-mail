@@ -43,7 +43,8 @@ export const RANGE_OPTIONS: Array<{ value: RangeFilter; label: string; maxDays: 
   { value: "3", label: "3 天", maxDays: 3 },
   { value: "7", label: "7 天", maxDays: 7 },
   { value: "15", label: "15 天", maxDays: 15 },
-  { value: "future", label: "全部未来", maxDays: null }
+  { value: "unknown", label: "待确认", maxDays: null },
+  { value: "future", label: "全部项目", maxDays: null }
 ];
 export const SOURCE_OPTIONS: Array<{ value: SourceFilter; label: string }> = [
   { value: "all", label: "全部来源" },

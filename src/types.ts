@@ -27,6 +27,8 @@ export type ActivityTypeSource =
   | "text"
   | "classification"
   | "unknown";
+export type ClassificationKind = "relevance" | "activity_type";
+export type ClassificationFeedbackSource = "model" | "rule_guard" | "manual";
 export type DeadlinePrecision = "exact" | "date" | "unknown";
 export type SourceMergeReason = "single" | "exact_url" | "title_match";
 
@@ -42,6 +44,7 @@ export interface SourceObservation {
 }
 
 export interface OfficialItemVerification {
+  itemKey: string;
   normalizedUrl: string;
   title: string;
   deadline: string;
@@ -52,6 +55,7 @@ export interface OfficialItemVerification {
 }
 
 export interface OfficialItemVerificationRow {
+  item_key: string;
   normalized_url: string;
   title: string;
   deadline: string;
@@ -61,6 +65,11 @@ export interface OfficialItemVerificationRow {
   verified_at: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface OfficialItemVerificationTarget {
+  itemKey: string;
+  normalizedUrls: string[];
 }
 
 export interface ItemActivityTypeClassification {
@@ -99,6 +108,17 @@ export interface ItemRelevanceClassificationRow {
   classified_at: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface ClassificationFeedback {
+  normalizedUrl: string;
+  classificationKind: ClassificationKind;
+  modelValue: string;
+  correctedValue: string;
+  reason: string;
+  source: ClassificationFeedbackSource;
+  classifier: string;
+  createdAt: string;
 }
 
 export interface SubscriberRow {

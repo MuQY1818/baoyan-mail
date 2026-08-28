@@ -1,5 +1,6 @@
 import type {
   Env,
+  ClassificationFeedback,
   ItemActivityTypeClassification,
   ItemActivityTypeClassificationRow,
   ItemRelevanceClassification,
@@ -10,6 +11,7 @@ import type {
   NormalizedItem,
   OfficialItemVerification,
   OfficialItemVerificationRow,
+  OfficialItemVerificationTarget,
   ReviewCandidatePayload,
   SourceStats,
   SourceReviewCandidateRow,
@@ -502,6 +504,17 @@ export async function getItemRelevanceClassifications(
   normalizedUrls: string[]
 ): Promise<Map<string, ItemRelevanceClassification>> {
   const uniqueUrls = Array.from(new Set(normalizedUrls.filter((url) => url !== "")));
+  if (uniqueUrls.length > SQL_BATCH_SIZE * 8) {
+    const result = await env.DB.prepare(
+      "SELECT * FROM item_relevance_classifications"
+    ).all<ItemRelevanceClassificationRow>();
+    const requested = new Set(uniqueUrls);
+    return new Map(
+      (result.results ?? [])
+        .filter((row) => requested.has(row.normalized_url))
+        .map((row) => [row.normalized_url, hydrateItemRelevanceClassification(row)])
+    );
+  }
   const rows: ItemRelevanceClassificationRow[] = [];
   for (let index = 0; index < uniqueUrls.length; index += SQL_BATCH_SIZE) {
     const chunk = uniqueUrls.slice(index, index + SQL_BATCH_SIZE);
@@ -566,6 +579,17 @@ export async function getItemActivityTypeClassifications(
   normalizedUrls: string[]
 ): Promise<Map<string, ItemActivityTypeClassification>> {
   const uniqueUrls = Array.from(new Set(normalizedUrls.filter((url) => url !== "")));
+  if (uniqueUrls.length > SQL_BATCH_SIZE * 8) {
+    const result = await env.DB.prepare(
+      "SELECT * FROM item_activity_type_classifications"
+    ).all<ItemActivityTypeClassificationRow>();
+    const requested = new Set(uniqueUrls);
+    return new Map(
+      (result.results ?? [])
+        .filter((row) => requested.has(row.normalized_url))
+        .map((row) => [row.normalized_url, hydrateItemActivityTypeClassification(row)])
+    );
+  }
   const rows: ItemActivityTypeClassificationRow[] = [];
   for (let index = 0; index < uniqueUrls.length; index += SQL_BATCH_SIZE) {
     const chunk = uniqueUrls.slice(index, index + SQL_BATCH_SIZE);
@@ -626,24 +650,128 @@ export async function upsertItemActivityTypeClassifications(
 
 export async function getOfficialItemVerifications(
   env: Env,
-  normalizedUrls: string[]
+  targets: OfficialItemVerificationTarget[],
+  includeLegacyByUrl = true
 ): Promise<Map<string, OfficialItemVerification>> {
-  const uniqueUrls = Array.from(new Set(normalizedUrls.filter((url) => url !== "")));
-  const rows: OfficialItemVerificationRow[] = [];
-  for (let index = 0; index < uniqueUrls.length; index += SQL_BATCH_SIZE) {
-    const chunk = uniqueUrls.slice(index, index + SQL_BATCH_SIZE);
-    if (chunk.length === 0) {
+  const uniqueTargets = Array.from(
+    new Map(targets.filter((target) => target.itemKey !== "").map((target) => [target.itemKey, target])).values()
+  );
+  const itemKeys = uniqueTargets.map((target) => target.itemKey);
+  const exactRows: OfficialItemVerificationRow[] = [];
+  if (itemKeys.length > SQL_BATCH_SIZE * 8) {
+    const result = await env.DB.prepare(
+      "SELECT * FROM item_official_item_verifications"
+    ).all<OfficialItemVerificationRow>();
+    const requested = new Set(itemKeys);
+    exactRows.push(...(result.results ?? []).filter((row) => requested.has(row.item_key)));
+  } else {
+    for (let index = 0; index < itemKeys.length; index += SQL_BATCH_SIZE) {
+      const chunk = itemKeys.slice(index, index + SQL_BATCH_SIZE);
+      if (chunk.length === 0) {
+        continue;
+      }
+      const placeholders = chunk.map(() => "?").join(", ");
+      const result = await env.DB.prepare(
+        `SELECT * FROM item_official_item_verifications WHERE item_key IN (${placeholders})`
+      )
+        .bind(...chunk)
+        .all<OfficialItemVerificationRow>();
+      exactRows.push(...(result.results ?? []));
+    }
+  }
+  const verifications = new Map(
+    exactRows.map((row) => [row.item_key, hydrateOfficialItemVerification(row)])
+  );
+
+  const urlOwners = new Map<string, Set<string>>();
+  if (!includeLegacyByUrl) {
+    return verifications;
+  }
+  for (const target of uniqueTargets) {
+    for (const url of target.normalizedUrls.filter((value) => value !== "")) {
+      const owners = urlOwners.get(url) ?? new Set<string>();
+      owners.add(target.itemKey);
+      urlOwners.set(url, owners);
+    }
+  }
+  const uniqueUrls = Array.from(urlOwners.keys()).filter(
+    (url) => Array.from(urlOwners.get(url) ?? []).length === 1
+  );
+  const legacyRows: LegacyOfficialItemVerificationRow[] = [];
+  if (uniqueUrls.length > SQL_BATCH_SIZE * 8) {
+    const result = await env.DB.prepare(
+      "SELECT * FROM item_official_verifications"
+    ).all<LegacyOfficialItemVerificationRow>();
+    const requested = new Set(uniqueUrls);
+    legacyRows.push(...(result.results ?? []).filter((row) => requested.has(row.normalized_url)));
+  } else {
+    for (let index = 0; index < uniqueUrls.length; index += SQL_BATCH_SIZE) {
+      const chunk = uniqueUrls.slice(index, index + SQL_BATCH_SIZE);
+      if (chunk.length === 0) {
+        continue;
+      }
+      const placeholders = chunk.map(() => "?").join(", ");
+      const result = await env.DB.prepare(
+        `SELECT * FROM item_official_verifications WHERE normalized_url IN (${placeholders})`
+      )
+        .bind(...chunk)
+        .all<LegacyOfficialItemVerificationRow>();
+      legacyRows.push(...(result.results ?? []));
+    }
+  }
+  const legacyByUrl = new Map(
+    legacyRows.map((row) => [row.normalized_url, hydrateLegacyOfficialItemVerification(row)])
+  );
+  for (const target of uniqueTargets) {
+    if (verifications.has(target.itemKey)) {
       continue;
     }
-    const placeholders = chunk.map(() => "?").join(", ");
-    const result = await env.DB.prepare(
-      `SELECT * FROM item_official_verifications WHERE normalized_url IN (${placeholders})`
-    )
-      .bind(...chunk)
-      .all<OfficialItemVerificationRow>();
-    rows.push(...(result.results ?? []));
+    const legacy = target.normalizedUrls
+      .filter((url) => (urlOwners.get(url)?.size ?? 0) === 1)
+      .map((url) => legacyByUrl.get(url))
+      .find((entry): entry is OfficialItemVerification => entry !== undefined);
+    if (legacy !== undefined) {
+      verifications.set(target.itemKey, { ...legacy, itemKey: target.itemKey });
+    }
   }
-  return new Map(rows.map((row) => [row.normalized_url, hydrateOfficialItemVerification(row)]));
+  return verifications;
+}
+
+export async function recordClassificationFeedback(
+  env: Env,
+  entries: ClassificationFeedback[]
+): Promise<number> {
+  if (entries.length === 0) {
+    return 0;
+  }
+  const statements = entries.map((entry) =>
+    env.DB.prepare(
+      `
+        INSERT INTO classification_feedback (
+          normalized_url,
+          classification_kind,
+          model_value,
+          corrected_value,
+          reason,
+          source,
+          classifier,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `
+    ).bind(
+      entry.normalizedUrl,
+      entry.classificationKind,
+      entry.modelValue,
+      entry.correctedValue,
+      entry.reason,
+      entry.source,
+      entry.classifier,
+      entry.createdAt
+    )
+  );
+  const results = await runBatchInChunks(env, statements);
+  return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
 }
 
 export async function upsertOfficialItemVerifications(
@@ -654,7 +782,8 @@ export async function upsertOfficialItemVerifications(
   const statements = entries.map((entry) =>
     env.DB.prepare(
       `
-        INSERT INTO item_official_verifications (
+        INSERT INTO item_official_item_verifications (
+          item_key,
           normalized_url,
           title,
           deadline,
@@ -665,8 +794,9 @@ export async function upsertOfficialItemVerifications(
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(normalized_url) DO UPDATE SET
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(item_key) DO UPDATE SET
+          normalized_url = excluded.normalized_url,
           title = excluded.title,
           deadline = excluded.deadline,
           deadline_precision = excluded.deadline_precision,
@@ -674,8 +804,9 @@ export async function upsertOfficialItemVerifications(
           verifier = excluded.verifier,
           verified_at = excluded.verified_at,
           updated_at = excluded.updated_at
-      `
+    `
     ).bind(
+      entry.itemKey,
       entry.normalizedUrl,
       entry.title,
       entry.deadline,
@@ -1070,6 +1201,32 @@ function hydrateOfficialItemVerification(
   row: OfficialItemVerificationRow
 ): OfficialItemVerification {
   return {
+    itemKey: row.item_key,
+    normalizedUrl: row.normalized_url,
+    title: row.title,
+    deadline: row.deadline,
+    deadlinePrecision: row.deadline_precision,
+    reason: row.reason,
+    verifier: row.verifier,
+    verifiedAt: row.verified_at
+  };
+}
+
+interface LegacyOfficialItemVerificationRow {
+  normalized_url: string;
+  title: string;
+  deadline: string;
+  deadline_precision: OfficialItemVerification["deadlinePrecision"];
+  reason: string;
+  verifier: string;
+  verified_at: string;
+}
+
+function hydrateLegacyOfficialItemVerification(
+  row: LegacyOfficialItemVerificationRow
+): OfficialItemVerification {
+  return {
+    itemKey: "",
     normalizedUrl: row.normalized_url,
     title: row.title,
     deadline: row.deadline,

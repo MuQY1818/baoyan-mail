@@ -21,6 +21,7 @@ import {
 import {
   applyActivityTypeClassificationsToItems,
   applyOfficialItemVerificationsToItems,
+  getDdlEntryOfficialVerificationTargets,
   applyRelevanceClassificationsToItems,
   getDdlEntryNormalizedUrls
 } from "./ddl";
@@ -104,7 +105,7 @@ export async function runCheck(
   const [classifications, activityTypeClassifications, officialVerifications] = await Promise.all([
     getItemRelevanceClassifications(env, normalizedUrls),
     getItemActivityTypeClassifications(env, normalizedUrls),
-    getOfficialItemVerifications(env, normalizedUrls)
+    getOfficialItemVerifications(env, getDdlEntryOfficialVerificationTargets(items))
   ]);
   const verifiedItems = applyOfficialItemVerificationsToItems(items, officialVerifications);
   assertUniqueItemKeys(verifiedItems);

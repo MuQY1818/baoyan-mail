@@ -106,7 +106,7 @@ curl -X POST \
 curl -X POST \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  --data '{"items":[{"website":"https://example.com/notice","title":"2027年接收推免生预报名通知","deadline":"2026-09-10 17:00","deadlinePrecision":"exact","reason":"官方通知正文明确写明报名截止时间","verifier":"luna-high"}]}' \
+  --data '{"items":[{"itemKey":"snapshot-item-key","website":"https://example.com/notice","title":"2027年接收推免生预报名通知","deadline":"2026-09-10 17:00","deadlinePrecision":"exact","reason":"官方通知正文明确写明报名截止时间","verifier":"luna-high"}]}' \
   https://baoyan.example.com/api/admin/official-verifications
 ```
 
@@ -221,7 +221,8 @@ https://baoyan-mail.weijuebu.workers.dev/api/ddl
 系统有两条定时链路：
 
 - GitHub Actions 在北京时间 08:00-23:00 每小时整点运行 `npm run sync:sources:external`。每个来源独立抓取；任一源失败、为空或相对上一轮数量异常骤降时整轮停止，不会发布半套数据，也不会把旧条目标记为消失。仓库需要配置 Actions Secret `BAOYAN_ADMIN_TOKEN`。
-- Luna High 自动化每天北京时间 08:30 检查 `/api/admin/source-health` 的最新同步时间和各源统计，再分页读取 `/api/admin/verification-candidates`。它只访问官方通知并写回相关度、夏令营/预推免类型和官方 DDL，不再负责抓取聚合站。聚合站的默认 `23:59` 不得覆盖官方页面给出的精确时间。
+- Luna High 自动化每天北京时间 09:30 检查 `/api/admin/source-health` 的最新同步时间和各源统计，再分页读取 `/api/admin/verification-candidates`。它只访问官方通知并写回相关度、夏令营/预推免类型和官方 DDL，不再负责抓取聚合站。同一通知有多个节点时，主 DDL 取最早会导致申请资格失效的强制截止时间；后续材料或确认时间不得覆盖更早的系统报名截止。旧核验和晚于源数据的核验会继续进入复核队列。
+- 没有明确截止时间的当前项目不会从公开 API 消失，而是以 `status=unknown`、`deadlineText=待确认` 返回；网站可通过“待确认”时间筛选单独查看。
 
 Worker 不再配置 Cloudflare Cron，也不在请求或定时事件中执行重型抓取；这是为了适配 Cloudflare Free Worker 的 CPU 限制。
 

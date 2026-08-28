@@ -23,7 +23,7 @@ import {
   normalizeSourceData
 } from "../src/source";
 import type { SourceItemInput } from "../src/source";
-import { buildDdlResponse } from "../src/ddl";
+import { applyActivityTypeClassification, buildDdlResponse } from "../src/ddl";
 import { handleRequest, isValidEmail } from "../src/routes";
 import { assertNoUnexpectedMergedDrop, reuseExistingKeys } from "../scripts/sync-sources";
 import type { Env, NormalizedItem, OfficialItemVerification } from "../src/types";
@@ -82,6 +82,7 @@ class FakeD1Database {
   readonly appStateUpdatedAt = new Map<string, string>();
   readonly relevanceClassifications = new Map<string, unknown[]>();
   readonly activityTypeClassifications = new Map<string, unknown[]>();
+  readonly officialItemVerifications = new Map<string, unknown[]>();
   readonly newDeadlineNotifications: unknown[][] = [];
   readonly visitDailyStats = new Map<string, unknown[]>();
   readonly mailLogs: unknown[][] = [];
@@ -212,6 +213,23 @@ class FakeD1Database {
           classified_at: String(entry[4]),
           created_at: String(entry[5]),
           updated_at: String(entry[6])
+        })) as T[];
+    }
+    if (sql.includes("FROM item_official_item_verifications")) {
+      const itemKeys = new Set(bindings.map(String));
+      return Array.from(this.officialItemVerifications.entries())
+        .filter(([itemKey]) => itemKeys.has(itemKey))
+        .map(([itemKey, entry]) => ({
+          item_key: itemKey,
+          normalized_url: String(entry[1]),
+          title: String(entry[2]),
+          deadline: String(entry[3]),
+          deadline_precision: String(entry[4]),
+          reason: String(entry[5]),
+          verifier: String(entry[6]),
+          verified_at: String(entry[7]),
+          created_at: String(entry[8]),
+          updated_at: String(entry[9])
         })) as T[];
     }
     if (sql.includes("FROM visit_daily_stats")) {
@@ -382,6 +400,9 @@ class FakeD1Database {
       changes = 1;
     } else if (sql.includes("INSERT INTO item_activity_type_classifications")) {
       this.activityTypeClassifications.set(String(bindings[0]), bindings);
+      changes = 1;
+    } else if (sql.includes("INSERT INTO item_official_item_verifications")) {
+      this.officialItemVerifications.set(String(bindings[0]), bindings);
       changes = 1;
     } else if (sql.includes("INSERT INTO visit_daily_stats")) {
       const key = `${String(bindings[0])}:${String(bindings[1])}:${String(bindings[2])}`;
@@ -1754,6 +1775,44 @@ describe("source normalization", () => {
     expect(merged[0]?.sourceGroups).toEqual(["xingkebaoyan", "zscampus"]);
   });
 
+  it("recognizes wbnewsid JSP article pages across institute aliases", () => {
+    const base = {
+      description:
+        "哈尔滨工业大学（深圳）智能学部低空科学技术研究院关于2027年接收推免生报名的通知",
+      deadline: "2026-09-10T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      website:
+        "http://intelligence.hitsz.edu.cn/currency.jsp?urltype=news.NewsContentUrl&wbnewsid=1921&wbtreeid=1259",
+      tags: ["C9"]
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "baoyanxinxi2026jsjby",
+        name: "哈尔滨工业大学",
+        institute: "（深圳）智能学部低空科学技术研究院"
+      },
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        name: "哈尔滨工业大学（深圳）",
+        institute: "低空科学技术研究院"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        name: "哈尔滨工业大学（深圳）",
+        institute: "智能学部"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      mergeReason: "exact_url",
+      sourceGroups: ["baoyanxinxi2026jsjby", "xingkebaoyan", "zscampus"]
+    });
+  });
+
   it("recognizes SPA detail routes when merging controlled school aliases", () => {
     const base = {
       description: "东北大学秦皇岛分校2027年推免预报名通知",
@@ -2763,7 +2822,7 @@ describe("DDL API", () => {
       now
     );
 
-    expect(response.total).toBe(1);
+    expect(response.total).toBe(2);
     expect(response.items[0]).toMatchObject({
       key: "future",
       school: "北京大学",
@@ -2777,6 +2836,15 @@ describe("DDL API", () => {
     });
     expect(response.items[0]).not.toHaveProperty("contentHash");
     expect(response.items[0]).not.toHaveProperty("payload");
+    expect(response.items[1]).toMatchObject({
+      key: "unknown",
+      deadlineAt: "",
+      deadlineText: "待确认",
+      remainingDays: null,
+      remainingText: "截止时间待确认",
+      status: "unknown",
+      deadlinePrecision: "unknown"
+    });
   });
 
   it("uses verified official deadlines over conflicting aggregate values", () => {
@@ -2795,6 +2863,7 @@ describe("DDL API", () => {
       tags: ["211"]
     };
     const verification: OfficialItemVerification = {
+      itemKey: "multi-source",
       normalizedUrl: "https://scs.bupt.edu.cn/info/1050/4416.htm",
       title: "官方预报名通知",
       deadline: "2026-09-10T09:00:00.000Z",
@@ -2809,7 +2878,7 @@ describe("DDL API", () => {
       now,
       null,
       new Map(),
-      { officialVerifications: new Map([[verification.normalizedUrl, verification]]) }
+      { officialVerifications: new Map([[verification.itemKey, verification]]) }
     );
 
     expect(response.items[0]).toMatchObject({
@@ -2824,7 +2893,7 @@ describe("DDL API", () => {
     });
   });
 
-  it("keeps an officially verified unknown deadline out of the public timeline", () => {
+  it("keeps a conservative source deadline when official verification has no deadline", () => {
     const item: NormalizedItem = {
       key: "no-fixed-deadline",
       contentHash: "hash",
@@ -2839,6 +2908,7 @@ describe("DDL API", () => {
       tags: ["C9"]
     };
     const verification: OfficialItemVerification = {
+      itemKey: "no-fixed-deadline",
       normalizedUrl: item.website,
       title: item.description,
       deadline: "",
@@ -2853,10 +2923,160 @@ describe("DDL API", () => {
       now,
       null,
       new Map(),
-      { officialVerifications: new Map([[verification.normalizedUrl, verification]]) }
+      { officialVerifications: new Map([[verification.itemKey, verification]]) }
     );
 
-    expect(response.items).toHaveLength(0);
+    expect(response.items[0]).toMatchObject({
+      key: "no-fixed-deadline",
+      deadlineAt: "2026-09-20T15:59:59.000Z",
+      deadlineConflict: true,
+      deadlineSource: "xingkebaoyan",
+      officialVerifiedAt: "2026-07-28T00:00:00.000Z"
+    });
+  });
+
+  it("ignores a stale official verification after source data changes", () => {
+    const item: NormalizedItem = {
+      key: "nankai-ai",
+      contentHash: "hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "南开大学",
+      institute: "人工智能学院",
+      description: "预推免报名通知",
+      deadline: "2026-08-24T04:00:00.000Z",
+      deadlinePrecision: "exact",
+      deadlineSource: "baoyanxinxi2026jsjby",
+      website: "https://ai.nankai.edu.cn/info/1024/6632.htm",
+      tags: []
+    };
+    const verification: OfficialItemVerification = {
+      itemKey: item.key,
+      normalizedUrl: item.website,
+      title: "官方预推免报名通知",
+      deadline: "2026-08-25T04:00:00.000Z",
+      deadlinePrecision: "exact",
+      reason: "错误选择了材料上传截止时间",
+      verifier: "luna-high",
+      verifiedAt: "2026-08-17T01:47:56.334Z"
+    };
+    const row = {
+      item_key: item.key,
+      content_hash: item.contentHash,
+      payload: JSON.stringify(item),
+      source_group: item.sourceGroup,
+      first_seen_at: "2026-08-17T00:00:00.000Z",
+      updated_at: "2026-08-25T00:38:17.142Z",
+      last_seen_at: "2026-08-28T07:47:02.678Z",
+      missing_since: null
+    };
+
+    const response = buildDdlResponse(
+      [row],
+      new Date("2026-08-20T00:00:00.000Z"),
+      null,
+      new Map(),
+      { officialVerifications: new Map([[verification.itemKey, verification]]) }
+    );
+
+    expect(response.items[0]).toMatchObject({
+      description: item.description,
+      deadlineAt: "2026-08-24T04:00:00.000Z",
+      deadlineSource: "baoyanxinxi2026jsjby",
+      officialVerifiedAt: null
+    });
+  });
+
+  it("keeps the earlier source deadline when a fresh verification selects a later stage", () => {
+    const item: NormalizedItem = {
+      key: "multi-stage",
+      contentHash: "hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "测试大学",
+      institute: "人工智能学院",
+      description: "预推免报名通知",
+      deadline: "2026-08-24T04:00:00.000Z",
+      deadlinePrecision: "exact",
+      deadlineSource: "baoyanxinxi2026jsjby",
+      website: "https://example.com/multi-stage",
+      tags: []
+    };
+    const verification: OfficialItemVerification = {
+      itemKey: item.key,
+      normalizedUrl: item.website,
+      title: "官方预推免报名通知",
+      deadline: "2026-08-25T04:00:00.000Z",
+      deadlinePrecision: "exact",
+      reason: "材料上传截止晚于系统报名截止",
+      verifier: "luna-high",
+      verifiedAt: "2026-08-20T00:00:00.000Z"
+    };
+
+    const response = buildDdlResponse(
+      [item],
+      new Date("2026-08-20T00:00:00.000Z"),
+      null,
+      new Map(),
+      { officialVerifications: new Map([[verification.itemKey, verification]]) }
+    );
+
+    expect(response.items[0]).toMatchObject({
+      description: verification.title,
+      deadlineAt: "2026-08-24T04:00:00.000Z",
+      deadlineConflict: true,
+      deadlineSource: "baoyanxinxi2026jsjby",
+      officialVerifiedAt: verification.verifiedAt
+    });
+  });
+
+  it("does not share an official verification between items with the same URL", () => {
+    const sharedWebsite = "https://gsas.fudan.edu.cn/shared-portal";
+    const firstItem: NormalizedItem = {
+      key: "fudan-forensic",
+      contentHash: "hash-1",
+      sourceGroup: "xingkebaoyan",
+      name: "复旦大学",
+      institute: "法医学与法庭科学学院",
+      description: "法医学推免预报名通知",
+      deadline: "2026-08-15T15:59:59.000Z",
+      deadlinePrecision: "date",
+      website: sharedWebsite,
+      tags: []
+    };
+    const secondItem: NormalizedItem = {
+      ...firstItem,
+      key: "fudan-software",
+      institute: "软件学院",
+      description: "软件学院推免预报名通知",
+      deadline: "2026-08-20T15:59:59.000Z"
+    };
+    const verification: OfficialItemVerification = {
+      itemKey: firstItem.key,
+      normalizedUrl: sharedWebsite,
+      title: "法医学官方通知",
+      deadline: "2026-08-10T09:00:00.000Z",
+      deadlinePrecision: "exact",
+      reason: "官方页面明确截止时间",
+      verifier: "luna-high",
+      verifiedAt: "2026-08-08T00:00:00.000Z"
+    };
+
+    const response = buildDdlResponse(
+      [firstItem, secondItem],
+      now,
+      null,
+      new Map(),
+      { officialVerifications: new Map([[verification.itemKey, verification]]) }
+    );
+
+    expect(response.items).toHaveLength(2);
+    expect(response.items.find((item) => item.key === firstItem.key)).toMatchObject({
+      description: "法医学官方通知",
+      deadlinePrecision: "exact"
+    });
+    expect(response.items.find((item) => item.key === secondItem.key)).toMatchObject({
+      description: secondItem.description,
+      deadlinePrecision: "date"
+    });
   });
 
   it("can include expired items for local application link hydration", () => {
@@ -3758,6 +3978,18 @@ describe("DDL API", () => {
       authorization: "Bearer secret",
       "content-type": "application/json"
     };
+    db.officialItemVerifications.set("candidate-a", [
+      "candidate-a",
+      "https://example.com/candidate-a",
+      "测试大学1推免通知",
+      "2099-09-20T15:59:59.000Z",
+      "date",
+      "旧核验记录",
+      "luna-high",
+      "2099-06-01T00:00:00.000Z",
+      "2099-06-01T00:00:00.000Z",
+      "2099-06-01T00:00:00.000Z"
+    ]);
 
     const unauthorized = await handleRequest(
       new Request("https://example.com/api/admin/verification-candidates", {
@@ -3804,8 +4036,11 @@ describe("DDL API", () => {
             "date-level-deadline",
             "deadline-conflict",
             "unclassified-relevance",
-            "unclassified-activity-type"
-          ]
+            "unclassified-activity-type",
+            "stale-official-verification"
+          ],
+          officialDeadline: "2099-09-20T15:59:59.000Z",
+          officialVerifiedAt: "2099-06-01T00:00:00.000Z"
         }
       ],
       nextCursor: "candidate-a"
@@ -3815,6 +4050,28 @@ describe("DDL API", () => {
       candidates: [{ key: "candidate-b" }],
       nextCursor: null
     });
+
+    const missingItemKey = await handleRequest(
+      new Request("https://example.com/api/admin/official-verifications", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          items: [
+            {
+              website: "https://example.com/shared",
+              title: "共享入口",
+              deadline: "2099-09-01 17:00",
+              deadlinePrecision: "exact",
+              reason: "官方页面明确截止时间"
+            }
+          ]
+        })
+      }),
+      env,
+      context
+    );
+
+    expect(missingItemKey.status).toBe(400);
   });
 
   it("rejects legacy Worker-side source sync", async () => {
@@ -3953,6 +4210,40 @@ describe("DDL API", () => {
       activityType: "pre_recommendation",
       activityTypeLabel: "预推免",
       activityTypeSource: "source_group"
+    });
+  });
+
+  it("protects explicit pre-recommendation wording from a conflicting model type", () => {
+    const item: NormalizedItem = {
+      key: "guarded-pre",
+      contentHash: "hash",
+      sourceGroup: "baoyanxinxi2026jsjby",
+      name: "测试大学",
+      institute: "计算机学院",
+      description: "2026 年预推免报名通知",
+      deadline: "2099-09-01T23:59:59+08:00",
+      website: "https://example.com/guarded-pre",
+      tags: []
+    };
+    const classified = applyActivityTypeClassification(
+      item,
+      new Map([
+        [
+          item.website,
+          {
+            normalizedUrl: item.website,
+            activityType: "summer_camp",
+            reason: "模型未找到明确类型",
+            classifier: "luna-high-official",
+            classifiedAt: "2099-07-01T00:00:00.000Z"
+          }
+        ]
+      ])
+    );
+
+    expect(classified).toMatchObject({
+      activityType: "pre_recommendation",
+      activityTypeClassifier: "luna-high-official+rule-guard"
     });
   });
 });
