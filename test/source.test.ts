@@ -461,6 +461,9 @@ describe("source normalization", () => {
       getActivityTypeFromText("中国科学院软件研究所2027年接收推免生预报名公告")
         .activityType
     ).toBe("pre_recommendation");
+    expect(getActivityTypeFromText("夏令营/推免预报名入口").activityType).toBe(
+      "pre_recommendation"
+    );
     expect(getActivityTypeFromSourceGroup("baoyanxinxi2026jsjby").activityType).toBe(
       "unknown"
     );
