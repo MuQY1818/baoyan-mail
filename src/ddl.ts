@@ -6,7 +6,8 @@ import {
   getBaoyanXinxiAreas,
   getNotificationSchoolMatchKey,
   getNotificationUrlMatchKey,
-  getSchoolTierTags
+  getSchoolTierTags,
+  isSpecificNoticeUrl
 } from "./source";
 import type {
   ActivityType,
@@ -22,6 +23,12 @@ import type {
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const VERIFICATION_DEADLINE_TOLERANCE_MS = 1_000;
+const PUBLIC_PLACEHOLDER_VALUES = new Set([
+  "_No response_",
+  "No response",
+  "待补全",
+  "待识别"
+]);
 const STALE_GRACE_HOURS = 48;
 const STALE_GRACE_MS = STALE_GRACE_HOURS * 60 * 60 * 1000;
 const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
@@ -163,9 +170,18 @@ function hideSupersededGraceAliases(
       ? []
       : [{ item, school: getNotificationSchoolMatchKey(item.school), urlMatchKeys }];
   });
-  if (activeMergedItems.length === 0) {
-    return items;
-  }
+  const activeSpecificItems = items.flatMap((item) => {
+    if (item.sourceVisibility !== "current" || !isSpecificNoticeUrl(item.website)) {
+      return [];
+    }
+    const context = contextsByKey.get(item.key);
+    const urlMatchKeys = context === undefined
+      ? getUrlMatchKeys([item.website])
+      : getItemUrlMatchKeys(context.item);
+    return urlMatchKeys.size === 0
+      ? []
+      : [{ item, school: getNotificationSchoolMatchKey(item.school), urlMatchKeys }];
+  });
   return items.filter((item) => {
     if (item.sourceVisibility !== "grace") {
       return true;
@@ -175,7 +191,7 @@ function hideSupersededGraceAliases(
       ? getUrlMatchKeys([item.website])
       : getItemUrlMatchKeys(context.item);
     const school = getNotificationSchoolMatchKey(item.school);
-    return !activeMergedItems.some(
+    const coveredByMergedItem = activeMergedItems.some(
       (active) =>
         active.school === school &&
         Array.from(urlMatchKeys).some((url) => active.urlMatchKeys.has(url)) &&
@@ -183,6 +199,13 @@ function hideSupersededGraceAliases(
           active.item.sourceGroups.includes(sourceGroup)
         )
     );
+    const replacedAtSameSpecificUrl = activeSpecificItems.some(
+      (active) =>
+        active.item.key !== item.key &&
+        active.school === school &&
+        Array.from(urlMatchKeys).some((url) => active.urlMatchKeys.has(url))
+    );
+    return !coveredByMergedItem && !replacedAtSameSpecificUrl;
   });
 }
 
@@ -287,13 +310,21 @@ export function serializeDdlItem(
 ): DdlApiItem | null {
   const context = "item" in contextOrItem ? contextOrItem : toDdlContext(contextOrItem);
   const item = context.item;
+  const school = getPublicSchoolName(item);
+  if (
+    canonicalizeNotificationUrl(item.website) === "" ||
+    school === "" ||
+    PUBLIC_PLACEHOLDER_VALUES.has(item.description.trim())
+  ) {
+    return null;
+  }
   const deadline = parseDeadline(item.deadline);
   const remainingDays = deadline === null ? null : getShanghaiCalendarDaysUntil(now, deadline);
   const status =
     deadline === null
       ? "unknown"
       : getDeadlineStatus(deadline, getShanghaiCalendarDaysUntil(now, deadline), now);
-  const tier = getSchoolTierTags(item.name)[0] ?? "其他";
+  const tier = getSchoolTierTags(school)[0] ?? "其他";
   const relevance = getItemRelevance(item);
   const activityTypeDetails = getActivityTypeDetails(item);
   const sourceGroups = getItemSourceGroups(item);
@@ -301,7 +332,7 @@ export function serializeDdlItem(
 
   return {
     key: item.key,
-    school: item.name,
+    school,
     institute: item.institute,
     description: item.description === "_No response_" ? "" : item.description,
     deadlineAt: deadline?.toISOString() ?? "",
@@ -310,7 +341,7 @@ export function serializeDdlItem(
     remainingText: formatRemainingText(status, remainingDays),
     status,
     tier,
-    areas: normalizeDdlAreas(item.areas ?? getBaoyanXinxiAreas(item.name, item.institute)),
+    areas: normalizeDdlAreas(item.areas ?? getBaoyanXinxiAreas(school, item.institute)),
     relevance,
     relevanceReason: item.relevanceReason ?? null,
     relevanceClassifier: item.relevanceClassifier ?? "rule-fallback",
@@ -516,10 +547,33 @@ export function doesOfficialVerificationResolveDeadline(
   if (verifiedDeadline === null) {
     return false;
   }
-  return (
+  if (
     verifiedDeadline.getTime() <=
     sourceDeadline.getTime() + VERIFICATION_DEADLINE_TOLERANCE_MS
+  ) {
+    return true;
+  }
+  return hasExplicitDeadlineExtensionTitle(verification.title);
+}
+
+function hasExplicitDeadlineExtensionTitle(value: string): boolean {
+  return (
+    /(?:延长|延期|顺延)/u.test(value) &&
+    /(?:报名|申请|截止)/u.test(value)
   );
+}
+
+function getPublicSchoolName(item: NormalizedItem): string {
+  const school = item.name.trim();
+  if (!PUBLIC_PLACEHOLDER_VALUES.has(school)) {
+    return school;
+  }
+  const title = item.description
+    .trim()
+    .replace(/^\d{4}年/u, "")
+    .replace(/^(?:关于)?(?:举办|开展)?/u, "");
+  const match = /[\p{Script=Han}（）()·]{2,40}?(?:大学|学院|研究院|研究所|实验室|中心|总院)/u.exec(title);
+  return match?.[0].trim() ?? "";
 }
 
 function isOfficialItemVerificationFresh(

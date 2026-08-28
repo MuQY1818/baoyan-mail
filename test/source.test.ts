@@ -703,6 +703,8 @@ describe("source normalization", () => {
         "https://yjszs.neu.edu.cn/entrance#/detail?a=100&b=200"
       )
     ).toBe("https://yjszs.neu.edu.cn/entrance#/detail?a=100&b=200");
+    expect(canonicalizeNotificationUrl("--help")).toBe("");
+    expect(canonicalizeNotificationUrl("javascript:alert(1)")).toBe("");
   });
 
   it("dedupes BaoyanXinxi records by canonical source URL", async () => {
@@ -1553,6 +1555,43 @@ describe("source normalization", () => {
     );
   });
 
+  it("filters invalid URLs but retains valid placeholders for official verification", () => {
+    const result = normalizeXingkeData(
+      {
+        items: [
+          {
+            id: 1,
+            school: "待识别",
+            department: "",
+            title: "待补全",
+            category: "",
+            signup_end: "",
+            url: "https://example.com/placeholder"
+          },
+          {
+            id: 2,
+            school: "测试大学",
+            department: "计算机学院",
+            title: "2027年推免预报名通知",
+            category: "预推免",
+            signup_end: "",
+            url: "--help"
+          }
+        ]
+      },
+      "https://xingkebaoyan.com/data.json",
+      new Date("2026-07-27T00:00:00.000Z")
+    );
+
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]).toMatchObject({
+      name: "待识别",
+      description: "待补全",
+      website: "https://example.com/placeholder"
+    });
+    expect(result.stats).toMatchObject({ rawCount: 2, acceptedCount: 1, filteredCount: 1 });
+  });
+
   it("retains Xingke notices without a structured deadline for official verification", () => {
     const result = normalizeXingkeData(
       {
@@ -1677,9 +1716,116 @@ describe("source normalization", () => {
 
     expect(merged).toHaveLength(1);
     expect(merged[0]).toMatchObject({
+      deadline: "2026-09-10T15:59:59.000Z",
       deadlineConflict: true,
       mergeReason: "exact_url",
       sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+  });
+
+  it("uses a later conflicting deadline only when the notice explicitly extends报名", () => {
+    const base = {
+      name: "中央财经大学",
+      deadlinePrecision: "date" as const,
+      website: "https://gs.cufe.edu.cn/info/1028/7101.htm",
+      tags: ["211"],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        institute: "全校类",
+        description: "中央财经大学接收2027年推免生工作的通知",
+        deadline: "2026-08-31T15:59:59.000Z"
+      },
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        institute: "",
+        description: "关于延长中央财经大学接收2027年推免生报名时间至9月6日的通知",
+        deadline: "2026-09-06T04:00:00.000Z"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      deadline: "2026-09-06T04:00:00.000Z",
+      deadlineConflict: true,
+      mergeReason: "exact_url"
+    });
+  });
+
+  it("title-matches after exact-url clusters have first been combined", () => {
+    const base = {
+      name: "中国科学院",
+      institute: "上海高等研究院",
+      deadline: "2026-09-18T15:59:59.000Z",
+      deadlinePrecision: "date" as const,
+      tags: [],
+      activityType: "pre_recommendation" as const,
+      activityTypeSource: "text" as const
+    };
+    const merged = mergeSourceItems([
+      {
+        ...base,
+        sourceGroup: "baoyanxinxi2026jsjby",
+        description: "保研信息平台补充源",
+        website: "https://mp.weixin.qq.com/s/sari"
+      },
+      {
+        ...base,
+        sourceGroup: "xingkebaoyan",
+        description: "中国科学院上海高等研究院接收2027年推荐免试研究生招生简章",
+        website: "https://mp.weixin.qq.com/s/sari"
+      },
+      {
+        ...base,
+        sourceGroup: "zscampus",
+        description: "2026年中国科学院上海高等研究院接收2027年推荐免试研究生招生简章",
+        website: "https://sari.cas.cn/gradedu/202608/notice.html"
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      mergeReason: "title_match",
+      sourceGroups: ["baoyanxinxi2026jsjby", "xingkebaoyan", "zscampus"]
+    });
+  });
+
+  it("merges a mislabeled placeholder with the same specific official notice", () => {
+    const website =
+      "https://yjsy.ecnu.edu.cn/c7/d5/c42082a772053/page.htm";
+    const merged = mergeSourceItems([
+      {
+        sourceGroup: "baoyanxinxi2026jsjby",
+        name: "同济大学",
+        institute: "卓越工程师学院",
+        description: "保研信息平台补充源",
+        deadline: "2026-09-10T09:00:00.000Z",
+        deadlinePrecision: "exact",
+        website,
+        tags: ["985"]
+      },
+      {
+        sourceGroup: "zscampus",
+        name: "华东师范大学",
+        institute: "卓越工程师学院",
+        description: "华东师范大学卓越工程师学院2027年推免预报名通知",
+        deadline: "2026-09-10T15:59:59.000Z",
+        deadlinePrecision: "date",
+        website,
+        tags: ["985"]
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      name: "华东师范大学",
+      deadline: "2026-09-10T09:00:00.000Z",
+      sourceGroups: ["baoyanxinxi2026jsjby", "zscampus"]
     });
   });
 
@@ -1869,6 +2015,72 @@ describe("source normalization", () => {
     ]).items;
 
     expect(merged).toHaveLength(2);
+  });
+
+  it("merges the controlled USTC and CAS metal-institute affiliation notice", () => {
+    const website =
+      "https://gs.imr.ac.cn/zs/zs_sszs/zs_sszs_tzgg/202608/t20260824_854503.html";
+    const merged = mergeSourceItems([
+      {
+        sourceGroup: "zscampus",
+        name: "中国科学技术大学",
+        institute: "材料科学与工程学院",
+        description: "中国科学技术大学材料科学与工程学院2027年接收推免生的通知",
+        deadline: "2026-09-08T15:59:59.000Z",
+        deadlinePrecision: "date",
+        website,
+        tags: []
+      },
+      {
+        sourceGroup: "xingkebaoyan",
+        name: "中国科学院金属研究所",
+        institute: "材料科学与工程学院（金属所）",
+        description: "中国科学院金属研究所2027年接收推荐免试研究生报名通知",
+        deadline: "2026-09-08T15:59:59.000Z",
+        deadlinePrecision: "date",
+        website,
+        tags: []
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      name: "中国科学技术大学",
+      sourceGroups: ["xingkebaoyan", "zscampus"]
+    });
+  });
+
+  it("merges an unidentified aggregate placeholder into its official notice", () => {
+    const website = "https://www.cam.com.cn/YJSY/contents/1866/1888.html";
+    const merged = mergeSourceItems([
+      {
+        sourceGroup: "baoyanxinxi2026jsjby",
+        name: "中国机械科学研究总院集团有限公司",
+        institute: "中国机械科学研究总院集团有限公司",
+        description: "保研信息平台补充源",
+        deadline: "2026-07-05T03:59:59.000Z",
+        deadlinePrecision: "exact",
+        website,
+        tags: []
+      },
+      {
+        sourceGroup: "xingkebaoyan",
+        name: "待识别",
+        institute: "",
+        description: "待补全",
+        deadline: "",
+        deadlinePrecision: "unknown",
+        website,
+        tags: []
+      }
+    ]).items;
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({
+      name: "中国机械科学研究总院集团有限公司",
+      deadline: "2026-07-05T03:59:59.000Z",
+      sourceGroups: ["baoyanxinxi2026jsjby", "xingkebaoyan"]
+    });
   });
 
   it("treats numeric article paths as specific notices across deadline conflicts", () => {
@@ -3028,6 +3240,46 @@ describe("DDL API", () => {
     });
   });
 
+  it("accepts a later official deadline only when the official title says registration was extended", () => {
+    const item: NormalizedItem = {
+      key: "extended-deadline",
+      contentHash: "hash",
+      sourceGroup: "xingkebaoyan",
+      name: "中央财经大学",
+      institute: "金融学院",
+      description: "2027年接收推荐免试研究生预报名通知",
+      deadline: "2026-08-25T15:59:59.000Z",
+      deadlinePrecision: "date",
+      website: "https://example.com/extended-deadline",
+      tags: []
+    };
+    const verification: OfficialItemVerification = {
+      itemKey: item.key,
+      normalizedUrl: item.website,
+      title: "2027年接收推荐免试研究生预报名延期通知",
+      deadline: "2026-08-31T15:59:59.000Z",
+      deadlinePrecision: "date",
+      reason: "官方标题明确说明报名延期",
+      verifier: "luna-high",
+      verifiedAt: "2026-08-26T00:00:00.000Z"
+    };
+
+    const response = buildDdlResponse(
+      [item],
+      new Date("2026-08-20T00:00:00.000Z"),
+      null,
+      new Map(),
+      { officialVerifications: new Map([[verification.itemKey, verification]]) }
+    );
+
+    expect(response.items[0]).toMatchObject({
+      description: verification.title,
+      deadlineAt: verification.deadline,
+      deadlineConflict: false,
+      deadlineSource: "official-verification"
+    });
+  });
+
   it("treats a one-second source boundary difference as the same deadline", () => {
     const item: NormalizedItem = {
       key: "one-second-boundary",
@@ -3422,6 +3674,116 @@ describe("DDL API", () => {
 
     expect(response.total).toBe(1);
     expect(response.items[0]?.key).toBe("active-school-alias-merge");
+  });
+
+  it("hides a grace record replaced at the same specific notice URL", () => {
+    const website = "https://mp.weixin.qq.com/s/updated-notice";
+    const response = buildDdlResponse(
+      [
+        {
+          item_key: "current-update",
+          content_hash: "1".repeat(64),
+          payload: JSON.stringify({
+            key: "current-update",
+            contentHash: "1".repeat(64),
+            sourceGroup: "xingkebaoyan",
+            sourceGroups: ["xingkebaoyan"],
+            name: "中央财经大学",
+            institute: "国家数据工程与安全学院",
+            description: "报名时间延长至9月6日的通知",
+            deadline: "2026-09-06T04:00:00.000Z",
+            website,
+            tags: []
+          }),
+          source_group: "xingkebaoyan",
+          first_seen_at: "2026-08-28T00:00:00.000Z",
+          updated_at: "2026-08-28T00:00:00.000Z",
+          last_seen_at: "2026-08-28T00:00:00.000Z",
+          missing_since: null
+        },
+        {
+          item_key: "grace-old",
+          content_hash: "2".repeat(64),
+          payload: JSON.stringify({
+            key: "grace-old",
+            contentHash: "2".repeat(64),
+            sourceGroup: "xingkebaoyan",
+            sourceGroups: ["xingkebaoyan"],
+            name: "中央财经大学",
+            institute: "金融学院",
+            description: "报名补充说明",
+            deadline: "2026-08-31T04:00:00.000Z",
+            website,
+            tags: []
+          }),
+          source_group: "xingkebaoyan",
+          first_seen_at: "2026-08-27T00:00:00.000Z",
+          updated_at: "2026-08-27T00:00:00.000Z",
+          last_seen_at: "2026-08-27T00:00:00.000Z",
+          missing_since: "2026-08-28T00:00:00.000Z"
+        }
+      ],
+      new Date("2026-08-28T01:00:00.000Z")
+    );
+
+    expect(response.total).toBe(1);
+    expect(response.items[0]?.key).toBe("current-update");
+  });
+
+  it("does not publish malformed or unusable placeholder records", () => {
+    const response = buildDdlResponse(
+      [
+        {
+          key: "invalid-url",
+          contentHash: "hash-1",
+          sourceGroup: "xingkebaoyan",
+          name: "测试大学",
+          institute: "计算机学院",
+          description: "推免通知",
+          deadline: "",
+          website: "--help",
+          tags: []
+        },
+        {
+          key: "placeholder",
+          contentHash: "hash-2",
+          sourceGroup: "xingkebaoyan",
+          name: "待识别",
+          institute: "",
+          description: "待补全",
+          deadline: "",
+          website: "https://example.com/placeholder",
+          tags: []
+        }
+      ],
+      new Date("2026-08-28T01:00:00.000Z")
+    );
+
+    expect(response.total).toBe(0);
+  });
+
+  it("publishes a verified placeholder record after recovering its organization from the official title", () => {
+    const response = buildDdlResponse(
+      [
+        {
+          key: "verified-placeholder",
+          contentHash: "hash",
+          sourceGroup: "xingkebaoyan",
+          name: "待识别",
+          institute: "",
+          description: "关于举办中国机械总院2026年优秀大学生夏令营的通知",
+          deadline: "2026-09-01T15:59:59.000Z",
+          website: "https://www.cam.com.cn/YJSY/contents/1866/1888.html",
+          tags: []
+        }
+      ],
+      new Date("2026-08-28T01:00:00.000Z")
+    );
+
+    expect(response.items[0]).toMatchObject({
+      school: "中国机械总院",
+      description: "关于举办中国机械总院2026年优秀大学生夏令营的通知"
+    });
   });
 
   it("reports source statistics for every source represented by a merged item", () => {

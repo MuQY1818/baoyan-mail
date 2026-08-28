@@ -73,6 +73,7 @@ const EXACT_URL_SCHOOL_ALIASES = new Map<string, string>([
   ["东北大学秦皇岛分校", "东北大学"],
   ["中国人民解放军军事科学院", "军事科学院"],
   ["中国海军工程大学", "海军工程大学"],
+  ["怀柔国家实验室", "怀柔实验室"],
   ["中国人民解放军国防科技大学", "国防科技大学"],
   ["国防科学技术大学", "国防科技大学"]
 ]);
@@ -709,6 +710,9 @@ export function canonicalizeNotificationUrl(value: string): string {
 
   try {
     const url = new URL(trimmed);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return "";
+    }
     const applicationHash = /^#(?:!\/|\/)/u.test(url.hash) ? url.hash : "";
     url.hash = "";
     url.hostname = url.hostname.toLowerCase();
@@ -737,7 +741,7 @@ export function canonicalizeNotificationUrl(value: string): string {
     url.hash = applicationHash;
     return url.toString();
   } catch {
-    return trimmed.replace(/#.*$/u, "");
+    return "";
   }
 }
 
@@ -1200,7 +1204,6 @@ export function mergeSourceItems(entries: SourceItemInput[]): MergeSourceItemsRe
         cluster.flatMap((entry) => entry.sourceGroups ?? [entry.sourceGroup])
       )
   );
-  const titleMatchedIndices = new Set<number>();
   const exactUrlBuckets = new Map<string, number[]>();
   for (const [index, cluster] of clusters.entries()) {
     const profile = getExactUrlMatchProfile(cluster);
@@ -1231,26 +1234,41 @@ export function mergeSourceItems(entries: SourceItemInput[]): MergeSourceItemsRe
     bucket.push(index);
     exactUrlBuckets.set(profile.bucketKey, bucket);
   }
+
+  const exactClusters = collectClusterEntries(clusters, parent);
+  const titleParent = exactClusters.map((_cluster, index) => index);
+  const titleClusterSourceGroups = exactClusters.map(
+    (cluster) =>
+      new Set(
+        cluster.flatMap((entry) => entry.sourceGroups ?? [entry.sourceGroup])
+      )
+  );
+  const titleMatchedIndices = new Set<number>();
   const matchBuckets = new Map<string, number[]>();
-  for (const [index, cluster] of clusters.entries()) {
+  for (const [index, cluster] of exactClusters.entries()) {
     const profile = getClusterMatchProfile(cluster);
     if (profile === null) {
       continue;
     }
     const bucket = matchBuckets.get(profile.bucketKey) ?? [];
     for (const otherIndex of bucket) {
-      const otherProfile = getClusterMatchProfile(clusters[otherIndex]!);
+      const otherProfile = getClusterMatchProfile(exactClusters[otherIndex]!);
       if (
         otherProfile !== null &&
         areConservativeTitleMatches(profile, otherProfile) &&
         (unionClustersIfSourceDisjoint(
-          parent,
-          clusterSourceGroups,
+          titleParent,
+          titleClusterSourceGroups,
           index,
           otherIndex
         ) ||
           (areCorroboratedSameSourceTitleAliases(profile, otherProfile) &&
-            unionClusters(parent, clusterSourceGroups, index, otherIndex)))
+            unionClusters(
+              titleParent,
+              titleClusterSourceGroups,
+              index,
+              otherIndex
+            )))
       ) {
         titleMatchedIndices.add(index);
         titleMatchedIndices.add(otherIndex);
@@ -1261,8 +1279,8 @@ export function mergeSourceItems(entries: SourceItemInput[]): MergeSourceItemsRe
   }
 
   const groupedClusters = new Map<number, { entries: SourceItemInput[]; titleMatched: boolean }>();
-  for (const [index, cluster] of clusters.entries()) {
-    const root = findClusterRoot(parent, index);
+  for (const [index, cluster] of exactClusters.entries()) {
+    const root = findClusterRoot(titleParent, index);
     const current = groupedClusters.get(root);
     if (current === undefined) {
       groupedClusters.set(root, {
@@ -1283,6 +1301,20 @@ export function mergeSourceItems(entries: SourceItemInput[]): MergeSourceItemsRe
   };
 }
 
+function collectClusterEntries(
+  clusters: SourceItemInput[][],
+  parent: number[]
+): SourceItemInput[][] {
+  const entriesByRoot = new Map<number, SourceItemInput[]>();
+  for (const [index, cluster] of clusters.entries()) {
+    const root = findClusterRoot(parent, index);
+    const current = entriesByRoot.get(root) ?? [];
+    current.push(...cluster);
+    entriesByRoot.set(root, current);
+  }
+  return Array.from(entriesByRoot.values());
+}
+
 function mergeSourceCluster(
   entries: SourceItemInput[],
   titleMatched: boolean
@@ -1301,8 +1333,8 @@ function mergeSourceCluster(
   const alternateWebsites = getAlternateWebsites(entries, website);
   const deadline = selectMergedDeadline(observations);
   const title = chooseMergedDescription(entries, observations, primary);
-  const name = chooseMergedField(entries, primary, "name");
-  const institute = chooseMergedField(entries, primary, "institute");
+  const name = chooseMergedField(entries, primary, "name", title);
+  const institute = chooseMergedField(entries, primary, "institute", title);
   const activityTypeDetails = selectMergedActivityType(entries, title, institute);
   const distinctSourceUrls = new Set(
     observations.map((observation) => canonicalizeNotificationUrl(observation.website)).filter(Boolean)
@@ -1343,9 +1375,12 @@ function getExactUrlMatchProfile(entries: SourceItemInput[]): {
   schoolMatchKey: string;
   institute: string;
   title: string;
+  entityText: string;
   placeholderTitle: boolean;
+  deadlineExtension: boolean;
   deadlineDay: string;
   deadlineTimestamp: number | null;
+  sourceGroups: Set<string>;
 } | null {
   const primary = entries.reduce((current, entry) =>
     shouldPreferMergedSourceItem(entry, current) ? entry : current
@@ -1370,16 +1405,21 @@ function getExactUrlMatchProfile(entries: SourceItemInput[]): {
     return null;
   }
   return {
-    bucketKey: `${urlMatchKey}\u0000${schoolMatchKey}`,
+    bucketKey: urlMatchKey,
     canonicalUrl,
     urlMatchKey,
     school,
     schoolMatchKey,
     institute,
     title: normalizeComparableTitle(mergedTitle, primary.name, ""),
+    entityText: normalizeComparableEntity(mergedTitle),
     placeholderTitle: isAggregatePlaceholderTitle(mergedTitle),
+    deadlineExtension: hasDeadlineExtensionEvidence(mergedTitle),
     deadlineDay: getDeadlineDay(primary.deadline),
-    deadlineTimestamp: deadline?.getTime() ?? null
+    deadlineTimestamp: deadline?.getTime() ?? null,
+    sourceGroups: new Set(
+      entries.flatMap((entry) => entry.sourceGroups ?? [entry.sourceGroup])
+    )
   };
 }
 
@@ -1388,13 +1428,38 @@ function areCrossSourceExactUrlMatches(
   right: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
 ): boolean {
   if (
-    left.urlMatchKey !== right.urlMatchKey ||
-    left.schoolMatchKey !== right.schoolMatchKey
+    left.urlMatchKey !== right.urlMatchKey
   ) {
     return false;
   }
+  const specificNotice = isSpecificNoticeUrl(left.canonicalUrl);
+  if (left.schoolMatchKey !== right.schoolMatchKey) {
+    if (!specificNotice) {
+      return false;
+    }
+    if (
+      isUnidentifiedAggregateProfile(left) ||
+      isUnidentifiedAggregateProfile(right)
+    ) {
+      return true;
+    }
+    const namedInstitutesCompatible =
+      left.institute !== "" &&
+      right.institute !== "" &&
+      left.institute !== right.institute &&
+      areInstituteAliasesOrEmpty(left.institute, right.institute);
+    return (
+      (haveEquivalentDeadline(left, right) &&
+        (left.placeholderTitle ||
+          right.placeholderTitle ||
+          namedInstitutesCompatible ||
+          isKnownCrossSchoolAffiliationUrl(left.canonicalUrl))) ||
+      isPlaceholderProfileReferencedByNotice(left, right) ||
+      isPlaceholderProfileReferencedByNotice(right, left)
+    );
+  }
   const exactSchoolMatch = left.school === right.school;
-  if (isSpecificNoticeUrl(left.canonicalUrl)) {
+  if (specificNotice) {
     const institutesCompatible = areInstituteAliasesOrEmpty(
       left.institute,
       right.institute
@@ -1403,9 +1468,19 @@ function areCrossSourceExactUrlMatches(
       left.institute === right.institute ||
       haveEquivalentDeadline(left, right) ||
       (institutesCompatible &&
+        (left.deadlineExtension || right.deadlineExtension)) ||
+      (institutesCompatible &&
         (left.placeholderTitle ||
           right.placeholderTitle ||
-          haveEquivalentExactUrlTitles(left, right)))
+          haveEquivalentExactUrlTitles(left, right))) ||
+      (haveEquivalentExactUrlTitles(left, right) &&
+        (isNonDiscriminatingInstitute(left) ||
+          isNonDiscriminatingInstitute(right))) ||
+      ((left.placeholderTitle || right.placeholderTitle) &&
+        (isNonDiscriminatingInstitute(left) ||
+          isNonDiscriminatingInstitute(right))) ||
+      isPlaceholderProfileReferencedByNotice(left, right) ||
+      isPlaceholderProfileReferencedByNotice(right, left)
     );
   }
   if (
@@ -1426,11 +1501,56 @@ function areCrossSourceExactUrlMatches(
   );
 }
 
+function isUnidentifiedAggregateProfile(
+  profile: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
+): boolean {
+  return /^(?:待识别|待补全)$/u.test(profile.school) && profile.placeholderTitle;
+}
+
+function isKnownCrossSchoolAffiliationUrl(value: string): boolean {
+  try {
+    return new URL(value).hostname.toLowerCase() === "gs.imr.ac.cn";
+  } catch {
+    return false;
+  }
+}
+
+function isPlaceholderProfileReferencedByNotice(
+  placeholder: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>,
+  notice: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
+): boolean {
+  if (!placeholder.placeholderTitle || notice.placeholderTitle) {
+    return false;
+  }
+  const noticeText = normalizeInstituteIdentity(notice.entityText);
+  return [placeholder.school, placeholder.institute]
+    .map(normalizeInstituteIdentity)
+    .filter((value) => value.length >= 3)
+    .some((value) => noticeText.includes(value));
+}
+
+function isNonDiscriminatingInstitute(
+  profile: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
+): boolean {
+  const institute = normalizeInstituteIdentity(profile.institute);
+  const school = normalizeInstituteIdentity(profile.school);
+  return (
+    institute === "" ||
+    institute === school ||
+    /^(?:全校类?|研究生招生办公室|研究生院|入伍研究生)$/u.test(institute)
+  );
+}
+
 function areStrongSameSourceExactUrlDuplicates(
   left: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>,
   right: NonNullable<ReturnType<typeof getExactUrlMatchProfile>>
 ): boolean {
-  return (
+  const corroboratedCrossSchoolPlaceholder =
+    left.schoolMatchKey !== right.schoolMatchKey &&
+    (left.placeholderTitle || right.placeholderTitle) &&
+    (left.sourceGroups.size > 1 || right.sourceGroups.size > 1) &&
+    areCrossSourceExactUrlMatches(left, right);
+  return corroboratedCrossSchoolPlaceholder || (
     left.urlMatchKey === right.urlMatchKey &&
     left.school === right.school &&
     isSpecificNoticeUrl(left.canonicalUrl) &&
@@ -1478,8 +1598,8 @@ function haveEquivalentExactUrlTitles(
 }
 
 function areInstituteAliasesOrEmpty(left: string, right: string): boolean {
-  const normalizedLeft = normalizeComparableEntity(left);
-  const normalizedRight = normalizeComparableEntity(right);
+  const normalizedLeft = normalizeInstituteIdentity(left);
+  const normalizedRight = normalizeInstituteIdentity(right);
   if (normalizedLeft === "" || normalizedRight === "") {
     return true;
   }
@@ -1491,6 +1611,26 @@ function areInstituteAliasesOrEmpty(left: string, right: string): boolean {
     shorterLength >= 4 &&
     (normalizedLeft.includes(normalizedRight) ||
       normalizedRight.includes(normalizedLeft))
+  );
+}
+
+function normalizeInstituteIdentity(value: string): string {
+  const withoutAnnotation = value.replace(
+    /[-—–].*(?:发布|报名|审核|活动时间|举办|招生简介|本校学生|即刻报名|截止|考核|分批).*$/u,
+    ""
+  );
+  return normalizeComparableEntity(withoutAnnotation)
+    .replace(
+      /(?:发布|报名|审核|活动时间|举办|招生简介|本校学生|即刻报名|截止|考核|分批).*$/u,
+      ""
+    )
+    .replace(/研究所/gu, "所");
+}
+
+function hasDeadlineExtensionEvidence(value: string): boolean {
+  return (
+    /(?:延长|延期|顺延)/u.test(value) &&
+    /(?:报名|申请|截止)/u.test(value)
   );
 }
 
@@ -1511,7 +1651,9 @@ function isAggregatePlaceholderTitle(value: string): boolean {
   return (
     normalized === "" ||
     normalized === "保研信息平台补充源" ||
-    normalized === "noresponse"
+    normalized === "noresponse" ||
+    normalized === "待补全" ||
+    normalized === "待识别"
   );
 }
 
@@ -1754,12 +1896,26 @@ function dedupeObservations(observations: SourceObservation[]): SourceObservatio
 function chooseMergedField(
   entries: SourceItemInput[],
   primary: SourceItemInput,
-  field: "name" | "institute"
+  field: "name" | "institute",
+  selectedTitle: string
 ): string {
+  const candidates = entries.filter((entry) => entry[field].trim() !== "");
+  const selectedTitleKey = normalizeComparableEntity(selectedTitle);
   if (field === "institute") {
-    return entries
-      .filter((entry) => entry.institute.trim() !== "")
+    return candidates
       .sort((left, right) => {
+        const titleMatchCompare =
+          Number(!selectedTitleKey.includes(normalizeComparableEntity(left.institute))) -
+          Number(!selectedTitleKey.includes(normalizeComparableEntity(right.institute)));
+        if (titleMatchCompare !== 0) {
+          return titleMatchCompare;
+        }
+        const placeholderCompare =
+          Number(isAggregatePlaceholderTitle(left.description)) -
+          Number(isAggregatePlaceholderTitle(right.description));
+        if (placeholderCompare !== 0) {
+          return placeholderCompare;
+        }
         const annotationCompare =
           getInstituteAnnotationPenalty(left.institute) -
           getInstituteAnnotationPenalty(right.institute);
@@ -1777,13 +1933,30 @@ function chooseMergedField(
         );
       })[0]?.institute.trim() ?? "";
   }
-  const primaryValue = primary[field].trim();
-  if (primaryValue !== "") {
-    return primaryValue;
-  }
-  return entries
-    .map((entry) => entry[field].trim())
-    .sort((left, right) => right.length - left.length || left.localeCompare(right))[0] ?? "";
+  return candidates
+    .sort((left, right) => {
+      const titleMatchCompare =
+        Number(!selectedTitleKey.includes(normalizeComparableEntity(left.name))) -
+        Number(!selectedTitleKey.includes(normalizeComparableEntity(right.name)));
+      if (titleMatchCompare !== 0) {
+        return titleMatchCompare;
+      }
+      const placeholderCompare =
+        Number(isAggregatePlaceholderTitle(left.description)) -
+        Number(isAggregatePlaceholderTitle(right.description));
+      if (placeholderCompare !== 0) {
+        return placeholderCompare;
+      }
+      const sourceCompare =
+        getSourcePriority(right.sourceGroup) - getSourcePriority(left.sourceGroup);
+      if (sourceCompare !== 0) {
+        return sourceCompare;
+      }
+      return (
+        right.name.trim().length - left.name.trim().length ||
+        left.name.localeCompare(right.name)
+      );
+    })[0]?.name.trim() ?? primary.name.trim();
 }
 
 function getInstituteAnnotationPenalty(value: string): number {
@@ -1878,7 +2051,18 @@ function selectMergedDeadline(observations: SourceObservation[]): {
   if (candidates.length === 0) {
     return { value: "", precision: "unknown", conflict: false, source: "" };
   }
-  candidates.sort(([leftKey, left], [rightKey, right]) => {
+  const extensionCandidates = candidates.filter(([_key, candidate]) =>
+    candidate.observations.some((observation) =>
+      hasDeadlineExtensionEvidence(observation.title)
+    )
+  );
+  const selectableCandidates =
+    extensionCandidates.length > 0 ? extensionCandidates : candidates;
+  selectableCandidates.sort(([leftKey, left], [rightKey, right]) => {
+    const deadlineCompare = leftKey.localeCompare(rightKey);
+    if (deadlineCompare !== 0) {
+      return extensionCandidates.length > 0 ? -deadlineCompare : deadlineCompare;
+    }
     const precisionCompare =
       getDeadlinePrecisionRank(right.precision) - getDeadlinePrecisionRank(left.precision);
     if (precisionCompare !== 0) {
@@ -1894,9 +2078,9 @@ function selectMergedDeadline(observations: SourceObservation[]): {
     if (priorityCompare !== 0) {
       return priorityCompare;
     }
-    return leftKey.localeCompare(rightKey);
+    return 0;
   });
-  const [value, selected] = candidates[0]!;
+  const [value, selected] = selectableCandidates[0]!;
   const selectedSourceGroups = Array.from(
     new Set(selected.observations.map((observation) => observation.sourceGroup))
   );
