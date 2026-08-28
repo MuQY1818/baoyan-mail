@@ -3709,7 +3709,7 @@ describe("DDL API", () => {
             contentHash: "2".repeat(64),
             sourceGroup: "xingkebaoyan",
             sourceGroups: ["xingkebaoyan"],
-            name: "中央财经大学",
+            name: "错误聚合站校名",
             institute: "金融学院",
             description: "报名补充说明",
             deadline: "2026-08-31T04:00:00.000Z",

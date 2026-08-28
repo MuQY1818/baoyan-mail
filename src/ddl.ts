@@ -180,7 +180,7 @@ function hideSupersededGraceAliases(
       : getItemUrlMatchKeys(context.item);
     return urlMatchKeys.size === 0
       ? []
-      : [{ item, school: getNotificationSchoolMatchKey(item.school), urlMatchKeys }];
+      : [{ item, urlMatchKeys }];
   });
   return items.filter((item) => {
     if (item.sourceVisibility !== "grace") {
@@ -202,8 +202,10 @@ function hideSupersededGraceAliases(
     const replacedAtSameSpecificUrl = activeSpecificItems.some(
       (active) =>
         active.item.key !== item.key &&
-        active.school === school &&
-        Array.from(urlMatchKeys).some((url) => active.urlMatchKeys.has(url))
+        Array.from(urlMatchKeys).some((url) => active.urlMatchKeys.has(url)) &&
+        item.sourceGroups.every((sourceGroup) =>
+          active.item.sourceGroups.includes(sourceGroup)
+        )
     );
     return !coveredByMergedItem && !replacedAtSameSpecificUrl;
   });
