@@ -13,6 +13,7 @@ import {
   getSnapshotRowsPageBySourceGroups,
   getSnapshotRowsBySourceGroups,
   getVisitDailyStats,
+  getWriteBudget,
   incrementVisitDailyStat,
   recordClassificationFeedback,
   insertReviewRule,
@@ -21,6 +22,8 @@ import {
   releaseAppStateLock,
   setAppState,
   stageExternalSourceSyncItems,
+  stageExternalSourceSyncBatch,
+  reserveWriteBudget,
   unsubscribeByToken,
   upsertItemActivityTypeClassifications,
   upsertItemRelevanceClassifications,
@@ -37,12 +40,14 @@ import {
 } from "./ddl";
 import { LAST_SOURCE_STATS_STATE_KEY } from "./checker";
 import { sha256Hex } from "./crypto";
+import { claimSync, classificationRunGuard, getPipelineRun, getSnapshotVersion, publicationGuard, requestSourceSync } from "./pipeline";
 import {
   BAOYAN_AREA_OPTIONS,
   AUTOMATIC_SOURCE_GROUPS,
   MANUAL_SOURCE_GROUP,
   canonicalizeNotificationUrl,
   createManualItemFromReviewPayload,
+  isSpecificNoticeUrl,
   normalizeBaoyanXinxiDeadline
 } from "./source";
 import type { SourceReviewCandidateInput } from "./source";
@@ -144,6 +149,35 @@ export async function handleRequest(
     if (request.method === "GET" && url.pathname === "/api/admin/source-health") {
       return await handleSourceHealth(request, env);
     }
+    if (url.pathname.startsWith("/api/admin/") &&
+        ["/api/admin/source-sync/request", "/api/admin/source-sync/claim", "/api/admin/pipeline-runs", "/api/admin/classification-progress"].includes(url.pathname)) {
+      if (!isAuthorizedAdmin(request, env)) return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+      if (request.method === "GET" && url.pathname === "/api/admin/pipeline-runs") {
+        const runs = await env.DB.prepare("SELECT * FROM pipeline_runs ORDER BY updated_at DESC LIMIT 30").all<{ workflow_run_id: string | null }>();
+        return jsonResponse({ ok: true, runs: (runs.results ?? []).map((run) => ({ ...run,
+          workflowRunUrl: run.workflow_run_id && env.GITHUB_REPOSITORY
+            ? `https://github.com/${env.GITHUB_REPOSITORY}/actions/runs/${run.workflow_run_id}` : null
+        })), snapshotVersion: await getSnapshotVersion(env) });
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/source-sync/request") {
+        const result = await requestSourceSync(env, "manual");
+        return jsonResponse(result, result.ok ? 200 : 503);
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/source-sync/claim") {
+        const body = await request.json() as Record<string, unknown>;
+        const runId = readString(body.runId);
+        if (!isValidRunId(runId)) return jsonResponse({ ok: false, error: "invalid_run_id" }, 400);
+        const workflowRunId = readString(body.workflowRunId);
+        if (workflowRunId && !/^\d{1,30}$/.test(workflowRunId)) return jsonResponse({ ok: false, error: "invalid_workflow_run_id" }, 400);
+        const ok = await claimSync(env, runId);
+        if (ok && workflowRunId) await env.DB.prepare("UPDATE pipeline_runs SET workflow_run_id = ? WHERE run_id = ? AND kind = 'sync'")
+          .bind(workflowRunId, runId).run();
+        return jsonResponse({ ok, runId, ...(ok ? {} : { error: "sync_run_active_or_completed" }) }, ok ? 200 : 409);
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/classification-progress") {
+        return await handleClassificationProgress(request, env);
+      }
+    }
     if (
       request.method === "POST" &&
       url.pathname === "/api/admin/verification-candidates"
@@ -172,16 +206,16 @@ export async function handleRequest(
       return await handleExternalSourceSyncAbort(request, env);
     }
     if (request.method === "POST" && url.pathname === "/api/admin/relevance-classifications") {
-      return await handleRelevanceClassifications(request, env);
+      return await handleVersionedClassification(request, env, handleRelevanceClassifications);
     }
     if (request.method === "POST" && url.pathname === "/api/admin/activity-type-classifications") {
-      return await handleActivityTypeClassifications(request, env);
+      return await handleVersionedClassification(request, env, handleActivityTypeClassifications);
     }
     if (request.method === "POST" && url.pathname === "/api/admin/official-verifications") {
-      return await handleOfficialItemVerifications(request, env);
+      return await handleVersionedClassification(request, env, handleOfficialItemVerifications);
     }
     if (request.method === "POST" && url.pathname === "/api/admin/classification-feedback") {
-      return await handleClassificationFeedback(request, env);
+      return await handleVersionedClassification(request, env, handleClassificationFeedback);
     }
     if (request.method === "GET" && url.pathname === "/api/admin/review") {
       return await handleReviewPage(request, env);
@@ -201,6 +235,16 @@ export async function handleRequest(
     return htmlResponse(renderMessagePage("页面不存在", "请检查访问地址。"), 404);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (url.pathname.startsWith("/api/") && message.includes("pipeline_daily_write_limit")) {
+      return jsonResponse({ ok: false, error: "pipeline_write_budget_exhausted",
+        message: "本项目每日写入预算不足，已保留健康快照；请勿立即重试", writeBudget: await getWriteBudget(env) }, 429);
+    }
+    if (url.pathname.startsWith("/api/") && message.includes("CHECK constraint")) {
+      return jsonResponse({ ok: false, error: "pipeline_state_changed", message: "状态变化或重复批次内容不一致，已停止写入" }, 409);
+    }
+    if (url.pathname.startsWith("/api/") && error instanceof SyntaxError) {
+      return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+    }
     return htmlResponse(renderMessagePage("服务暂时不可用", message), 500);
   }
 }
@@ -285,7 +329,10 @@ async function handleSourceHealth(request: Request, env: Env): Promise<Response>
   return jsonResponse({
     ok: true,
     syncMode: "external-batched",
+    protocolVersion: 2,
+    snapshotVersion: await getSnapshotVersion(env),
     lastSyncedAt: await getAppState(env, "last_synced_at"),
+    writeBudget: await getWriteBudget(env),
     sourceStats
   });
 }
@@ -298,7 +345,15 @@ async function handleVerificationCandidates(
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
   const body = (await request.json()) as Record<string, unknown>;
+  const snapshotVersion = await getSnapshotVersion(env);
   const cursor = readString(body.cursor);
+  const runId = readString(body.runId);
+  if (body.runId !== undefined && !/^[\w:.-]{1,180}$/.test(runId)) {
+    return jsonResponse({ ok: false, error: "invalid_run_id" }, 400);
+  }
+  if ((cursor !== "" || body.snapshotVersion !== undefined) && body.snapshotVersion !== snapshotVersion) {
+    return jsonResponse({ ok: false, error: "snapshot_version_changed", snapshotVersion }, 409);
+  }
   const requestedLimit = readInteger(body.limit) ?? VERIFICATION_CANDIDATE_LIMIT;
   if (
     cursor.length > 200 ||
@@ -399,6 +454,7 @@ async function handleVerificationCandidates(
       return [
         {
           key: row.item_key,
+          contentHash: row.content_hash,
           school: item.name,
           institute: item.institute,
           title: item.description,
@@ -420,10 +476,27 @@ async function handleVerificationCandidates(
       return [];
     }
   });
+  if (await getSnapshotVersion(env) !== snapshotVersion) {
+    return jsonResponse({ ok: false, error: "snapshot_version_changed" }, 409);
+  }
+  const nextCursor = rows.length > requestedLimit ? pageRows.at(-1)?.item_key ?? null : null;
+  if (runId) {
+    await env.DB.batch([
+      publicationGuard(env, snapshotVersion),
+      env.DB.prepare(`INSERT OR REPLACE INTO pipeline_assertions (id, valid)
+        SELECT 'candidate-pages', CASE WHEN NOT EXISTS (SELECT 1 FROM pipeline_runs WHERE run_id = ? AND kind <> 'classification')
+          AND NOT EXISTS (SELECT 1 FROM classification_candidate_pages WHERE run_id = ? AND snapshot_version <> ?)
+          THEN 1 ELSE 0 END`).bind(runId, runId, snapshotVersion),
+      env.DB.prepare(`INSERT INTO classification_candidate_pages (run_id, snapshot_version, cursor, next_cursor, candidate_keys, created_at)
+        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(run_id, cursor) DO NOTHING`)
+        .bind(runId, snapshotVersion, cursor, nextCursor, JSON.stringify(candidates.map((candidate) => candidate.key)), new Date().toISOString())
+    ]);
+  }
   return jsonResponse({
     ok: true,
+    snapshotVersion,
     candidates,
-    nextCursor: rows.length > requestedLimit ? pageRows.at(-1)?.item_key ?? null : null
+    nextCursor
   });
 }
 
@@ -452,27 +525,34 @@ async function handleExternalSourceSyncStart(request: Request, env: Env): Promis
     return jsonResponse({ ok: false, error: "invalid_sync_run" }, 400);
   }
   const now = new Date().toISOString();
-  const serializedMetadata = JSON.stringify(metadata);
-  const staleBefore = new Date(Date.now() - EXTERNAL_SYNC_LOCK_TIMEOUT_MS).toISOString();
-  const acquired = await acquireAppStateLock(
-    env,
-    EXTERNAL_SYNC_STATE_KEY,
-    serializedMetadata,
-    now,
-    staleBefore
-  );
-  if (!acquired) {
-    const activeRun = await getActiveExternalSourceSyncRun(env, metadata.runId);
-    if (activeRun === null) {
-      return jsonResponse({ ok: false, error: "sync_run_active" }, 409);
-    }
-  } else {
-    await discardExternalSourceSyncItemsCreatedBefore(
-      env,
-      new Date(Date.now() - EXTERNAL_SYNC_STAGING_RETENTION_MS).toISOString()
-    );
-    await discardExternalSourceSyncItems(env, metadata.runId);
+  const prior = await getPipelineRun(env, metadata.runId);
+  if (prior?.kind === "sync" && prior.status === "succeeded") return jsonResponse({ ok: true, runId: metadata.runId, result: JSON.parse(prior.result ?? "{}") });
+  if (!await claimSync(env, metadata.runId)) return jsonResponse({ ok: false, error: "sync_run_active_or_completed" }, 409);
+  const previousStats = JSON.parse(await getAppState(env, LAST_SOURCE_STATS_STATE_KEY) ?? "[]") as SourceStats[];
+  const dropped = metadata.sourceStats.filter((current) => {
+    const previous = previousStats.find((entry) => entry.sourceGroup === current.sourceGroup);
+    return previous !== undefined && ((previous.rawCount >= 10 && current.rawCount < previous.rawCount * 0.65) ||
+      (previous.acceptedCount >= 10 && current.acceptedCount < previous.acceptedCount * 0.7));
+  });
+  const currentCount = await env.DB.prepare(`SELECT COUNT(*) AS count FROM item_snapshots
+    WHERE missing_since IS NULL AND source_group IN (${AUTOMATIC_SOURCE_GROUPS.map(() => "?").join(",")})`)
+    .bind(...AUTOMATIC_SOURCE_GROUPS).first<{ count: number }>();
+  if (dropped.length > 0 || ((currentCount?.count ?? 0) >= 100 && metadata.expectedCount < currentCount!.count * 0.65)) {
+    return jsonResponse({ ok: false, error: "source_count_drop", sources: dropped.map((entry) => entry.sourceGroup) }, 409);
   }
+  await discardExternalSourceSyncItemsCreatedBefore(env, new Date(Date.now() - EXTERNAL_SYNC_STAGING_RETENTION_MS).toISOString());
+  const serializedMetadata = JSON.stringify(metadata);
+  const activeRaw = await getAppState(env, EXTERNAL_SYNC_STATE_KEY);
+  if (activeRaw !== serializedMetadata && JSON.parse(activeRaw ?? "{}").phase !== "collecting") {
+    return jsonResponse({ ok: false, error: "sync_metadata_mismatch" }, 409);
+  }
+  await env.DB.batch([
+    env.DB.prepare(`INSERT OR REPLACE INTO pipeline_assertions (id, valid)
+      SELECT 'start', CASE WHEN EXISTS (SELECT 1 FROM app_state WHERE key = ? AND value = ?) THEN 1 ELSE 0 END`)
+      .bind(EXTERNAL_SYNC_STATE_KEY, activeRaw),
+    env.DB.prepare("UPDATE app_state SET value = ?, updated_at = ? WHERE key = ?").bind(serializedMetadata, now, EXTERNAL_SYNC_STATE_KEY),
+    env.DB.prepare("UPDATE pipeline_runs SET metadata = ?, updated_at = ? WHERE run_id = ?").bind(serializedMetadata, now, metadata.runId)
+  ]);
   return jsonResponse({
     ok: true,
     runId: metadata.runId,
@@ -505,6 +585,7 @@ async function handleExternalSourceSyncIndex(
     cursor,
     requestedLimit
   );
+  const lastSyncedAt = await getAppState(env, "last_synced_at");
   const items = rows.flatMap((row) => {
     try {
       const item = JSON.parse(row.payload) as NormalizedItem;
@@ -517,7 +598,7 @@ async function handleExternalSourceSyncIndex(
           website: item.website,
           alternateWebsites: item.alternateWebsites ?? [],
           active: row.missing_since === null,
-          lastSeenAt: row.last_seen_at ?? ""
+          lastSeenAt: row.missing_since === null ? lastSyncedAt ?? row.last_seen_at ?? "" : row.last_seen_at ?? ""
         }
       ];
     } catch {
@@ -580,11 +661,10 @@ async function handleExternalSourceSyncReviewCandidates(
   if (candidates.some((candidate) => candidate === null)) {
     return jsonResponse({ ok: false, error: "invalid_review_candidate" }, 400);
   }
-  await upsertReviewCandidates(
-    env,
-    candidates as SourceReviewCandidateInput[],
-    metadata.runId
-  );
+  if (new Set(candidates.map((candidate) => `${candidate!.normalizedUrl}\u0000${candidate!.sourceGroup}`)).size !== candidates.length) {
+    return jsonResponse({ ok: false, error: "duplicate_review_candidate" }, 400);
+  }
+  await stageExternalSourceSyncBatch(env, metadata.runId, "reviews", candidates as SourceReviewCandidateInput[], new Date().toISOString());
   return jsonResponse({ ok: true, runId: metadata.runId, accepted: candidates.length });
 }
 
@@ -596,42 +676,48 @@ async function handleExternalSourceSyncFinalize(
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
   const body = (await request.json()) as Record<string, unknown>;
+  const previous = await getPipelineRun(env, readString(body.runId));
+  if (previous?.kind === "sync" && previous.status === "succeeded") return jsonResponse({ ok: true, result: JSON.parse(previous.result ?? "{}") });
   const metadata = await getActiveExternalSourceSyncRun(env, readString(body.runId));
   if (metadata === null) {
     return jsonResponse({ ok: false, error: "sync_run_not_active" }, 409);
   }
   const writtenCount = await getExternalSourceSyncItemCount(env, metadata.runId);
-  if (writtenCount !== metadata.expectedCount) {
+  const stagedReviews = await env.DB.prepare("SELECT COUNT(*) AS count FROM external_source_sync_review_rows WHERE run_id = ?")
+    .bind(metadata.runId).first<{ count: number }>();
+  if (writtenCount !== metadata.expectedCount || stagedReviews?.count !== metadata.reviewCandidateCount) {
     return jsonResponse(
       {
         ok: false,
         error: "sync_item_count_mismatch",
         expectedCount: metadata.expectedCount,
-        writtenCount
+        writtenCount,
+        expectedReviewCount: metadata.reviewCandidateCount,
+        writtenReviewCount: stagedReviews?.count ?? 0
       },
       409
     );
   }
   const now = new Date().toISOString();
-  const missingCount = await publishExternalSourceSyncItems(
+  const publication = { scanned: metadata.expectedCount, reviewCandidates: metadata.reviewCandidateCount,
+    lastSyncedAt: now, snapshotVersion: metadata.runId, sourceStats: metadata.sourceStats,
+    activityTypeCounts: metadata.activityTypeCounts };
+  try {
+    await publishExternalSourceSyncItems(
     env,
     metadata.runId,
     [...AUTOMATIC_SOURCE_GROUPS],
     now,
     metadata.sourceStats,
     EXTERNAL_SYNC_STATE_KEY,
-    JSON.stringify(metadata)
+    JSON.stringify(metadata), metadata.expectedCount, metadata.reviewCandidateCount, publication
   );
-  return jsonResponse({
-    ok: true,
-    result: {
-      scanned: metadata.expectedCount,
-      missingCount,
-      lastSyncedAt: now,
-      sourceStats: metadata.sourceStats,
-      activityTypeCounts: metadata.activityTypeCounts
-    }
-  });
+  } catch (error) {
+    const completed = await getPipelineRun(env, metadata.runId);
+    if (completed?.status !== "succeeded") throw error;
+  }
+  const completed = await getPipelineRun(env, metadata.runId);
+  return jsonResponse({ ok: true, result: JSON.parse(completed?.result ?? "{}") });
 }
 
 async function handleExternalSourceSyncAbort(
@@ -642,21 +728,38 @@ async function handleExternalSourceSyncAbort(
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
   const body = (await request.json()) as Record<string, unknown>;
-  const metadata = await getActiveExternalSourceSyncRun(env, readString(body.runId));
-  if (metadata === null) {
+  const runId = readString(body.runId);
+  const run = await getPipelineRun(env, runId);
+  if (run?.kind === "sync" && run.status === "succeeded") return jsonResponse({ ok: true, alreadyPublished: true });
+  const active = await getAppState(env, EXTERNAL_SYNC_STATE_KEY);
+  if (active === null || JSON.parse(active || "{}").runId !== runId) {
     return jsonResponse({ ok: false, error: "sync_run_not_active" }, 409);
   }
-  await discardExternalSourceSyncItems(env, metadata.runId);
-  const released = await releaseAppStateLock(
-    env,
-    EXTERNAL_SYNC_STATE_KEY,
-    JSON.stringify(metadata),
-    new Date().toISOString()
-  );
-  return jsonResponse({ ok: released, runId: metadata.runId }, released ? 200 : 409);
+  const now = new Date().toISOString();
+  try {
+    await env.DB.batch([
+      env.DB.prepare(`INSERT OR REPLACE INTO pipeline_assertions (id, valid)
+        SELECT 'abort', CASE WHEN EXISTS (SELECT 1 FROM app_state WHERE key = ? AND value = ?)
+          AND EXISTS (SELECT 1 FROM pipeline_runs WHERE run_id = ? AND kind = 'sync' AND status = 'running')
+          THEN 1 ELSE 0 END`).bind(EXTERNAL_SYNC_STATE_KEY, active, runId),
+      env.DB.prepare("DELETE FROM external_source_sync_items WHERE run_id = ?").bind(runId),
+      env.DB.prepare("DELETE FROM external_source_sync_reviews WHERE run_id = ?").bind(runId),
+      env.DB.prepare("DELETE FROM external_source_sync_batches WHERE run_id = ?").bind(runId),
+      env.DB.prepare("UPDATE pipeline_runs SET status = 'failed', error = ?, updated_at = ? WHERE run_id = ?")
+        .bind(readString(body.error).slice(0, 500) || "collector_aborted", now, runId),
+      env.DB.prepare("UPDATE app_state SET value = '', updated_at = ? WHERE key = ? AND value = ?")
+        .bind(now, EXTERNAL_SYNC_STATE_KEY, active)
+    ]);
+  } catch (error) {
+    const completed = await getPipelineRun(env, runId);
+    if (completed?.kind === "sync" && completed.status === "succeeded") return jsonResponse({ ok: true, alreadyPublished: true });
+    throw error;
+  }
+  return jsonResponse({ ok: true, runId });
 }
 
 async function handleDdl(env: Env, url: URL): Promise<Response> {
+  const snapshotVersion = await getSnapshotVersion(env);
   const rows = await getSnapshotRowsBySourceGroups(env, [
     ...AUTOMATIC_SOURCE_GROUPS,
     MANUAL_SOURCE_GROUP
@@ -678,7 +781,14 @@ async function handleDdl(env: Env, url: URL): Promise<Response> {
       officialVerifications
     }
   );
-  return jsonResponse(response, 200, {
+  if (await getSnapshotVersion(env) !== snapshotVersion) {
+    return jsonResponse({ ok: false, error: "snapshot_version_changed", message: "数据正在发布，请重试" }, 503, corsHeaders());
+  }
+  const ageMinutes = response.lastSyncedAt === null ? null : Math.max(0, Math.floor((Date.now() - Date.parse(response.lastSyncedAt)) / 60_000));
+  return jsonResponse({ ...response, snapshotVersion, health: {
+    status: ageMinutes === null ? "unavailable" : ageMinutes > 90 ? "delayed" : "healthy",
+    ageMinutes, coverage: "connected-sources"
+  } }, 200, {
     "cache-control": "public, max-age=300, s-maxage=900",
     // 允许 LLM / Agent 在浏览器端跨域抓取结构化数据
     "access-control-allow-origin": "*",
@@ -715,7 +825,7 @@ async function handleAnalyticsSummary(env: Env): Promise<Response> {
   });
 }
 
-async function handleRelevanceClassifications(request: Request, env: Env): Promise<Response> {
+async function handleRelevanceClassifications(request: Request, env: Env, pending?: D1PreparedStatement[]): Promise<Response> {
   if (!isAuthorizedAdmin(request, env)) {
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
@@ -735,7 +845,7 @@ async function handleRelevanceClassifications(request: Request, env: Env): Promi
   const changed = await upsertItemRelevanceClassifications(
     env,
     entries as ItemRelevanceClassification[],
-    now
+    now, pending
   );
   const feedbackWritten = await recordClassificationFeedback(
     env,
@@ -748,7 +858,7 @@ async function handleRelevanceClassifications(request: Request, env: Env): Promi
       source: "model" as const,
       classifier: entry.classifier,
       createdAt: now
-    }))
+    })), pending
   );
   return jsonResponse({
     ok: true,
@@ -758,7 +868,7 @@ async function handleRelevanceClassifications(request: Request, env: Env): Promi
   });
 }
 
-async function handleActivityTypeClassifications(request: Request, env: Env): Promise<Response> {
+async function handleActivityTypeClassifications(request: Request, env: Env, pending?: D1PreparedStatement[]): Promise<Response> {
   if (!isAuthorizedAdmin(request, env)) {
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
@@ -778,7 +888,7 @@ async function handleActivityTypeClassifications(request: Request, env: Env): Pr
   const changed = await upsertItemActivityTypeClassifications(
     env,
     entries as ItemActivityTypeClassification[],
-    now
+    now, pending
   );
   const feedbackWritten = await recordClassificationFeedback(
     env,
@@ -791,7 +901,7 @@ async function handleActivityTypeClassifications(request: Request, env: Env): Pr
       source: "model" as const,
       classifier: entry.classifier,
       createdAt: now
-    }))
+    })), pending
   );
   return jsonResponse({
     ok: true,
@@ -801,7 +911,7 @@ async function handleActivityTypeClassifications(request: Request, env: Env): Pr
   });
 }
 
-async function handleOfficialItemVerifications(request: Request, env: Env): Promise<Response> {
+async function handleOfficialItemVerifications(request: Request, env: Env, pending?: D1PreparedStatement[]): Promise<Response> {
   if (!isAuthorizedAdmin(request, env)) {
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
@@ -821,12 +931,12 @@ async function handleOfficialItemVerifications(request: Request, env: Env): Prom
   const changed = await upsertOfficialItemVerifications(
     env,
     entries as OfficialItemVerification[],
-    now
+    now, pending
   );
   return jsonResponse({ ok: true, accepted: entries.length, changed });
 }
 
-async function handleClassificationFeedback(request: Request, env: Env): Promise<Response> {
+async function handleClassificationFeedback(request: Request, env: Env, pending?: D1PreparedStatement[]): Promise<Response> {
   if (!isAuthorizedAdmin(request, env)) {
     return jsonResponse({ ok: false, error: "unauthorized" }, 401);
   }
@@ -843,8 +953,184 @@ async function handleClassificationFeedback(request: Request, env: Env): Promise
     return jsonResponse({ ok: false, error: "invalid_feedback" }, 400);
   }
   const accepted = entries as ClassificationFeedback[];
-  const written = await recordClassificationFeedback(env, accepted);
+  const written = await recordClassificationFeedback(env, accepted, pending);
   return jsonResponse({ ok: true, accepted: accepted.length, written });
+}
+
+function isValidRunId(runId: string): boolean {
+  return Number.isFinite(Date.parse(runId)) && new Date(runId).toISOString() === runId &&
+    Math.abs(Date.now() - Date.parse(runId)) < 24 * 60 * 60_000;
+}
+
+async function handleVersionedClassification(
+  request: Request, env: Env,
+  handler: (request: Request, env: Env, pending: D1PreparedStatement[]) => Promise<Response>
+): Promise<Response> {
+  if (!isAuthorizedAdmin(request, env)) return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+  const body = await request.clone().json() as Record<string, unknown>;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+  }
+  const version = readString(body.snapshotVersion);
+  const submissionId = readString(body.submissionId);
+  const runId = readString(body.runId);
+  const model = readString(body.model);
+  const refs = Array.isArray(body.targets) ? body.targets as Array<Record<string, unknown>> : [];
+  const items = Array.isArray(body.items) ? body.items as Array<Record<string, unknown>> : [];
+  if (!version || !/^[\w:.-]{1,180}$/.test(submissionId) || !/^[\w:.-]{1,180}$/.test(runId) || !model || model.length > 100 ||
+      items.length < 1 || items.length > 100 || refs.length < 1 || refs.length > 100 ||
+      refs.some((ref) => !ref || !readString(ref.key) || !readString(ref.contentHash))) {
+    return jsonResponse({ ok: false, error: "versioned_submission_required", message: "需要版本、内容指纹、runId、实际模型与 submissionId" }, 428);
+  }
+  const requestHash = await sha256Hex(new URL(request.url).pathname + JSON.stringify(body));
+  const readPrevious = () => env.DB.prepare("SELECT request_hash, result FROM classification_submissions WHERE submission_id = ?")
+    .bind(submissionId).first<{ request_hash: string; result: string }>();
+  const previous = await readPrevious();
+  if (previous !== null) return previous.request_hash === requestHash
+    ? jsonResponse(JSON.parse(previous.result)) : jsonResponse({ ok: false, error: "idempotency_key_reused" }, 409);
+  if (await getSnapshotVersion(env) !== version) return jsonResponse({ ok: false, error: "snapshot_version_changed" }, 409);
+  const urls = new Map<string, Set<string>>();
+  if (new Set(refs.map((ref) => ref.key)).size !== refs.length) {
+    return jsonResponse({ ok: false, error: "duplicate_targets" }, 400);
+  }
+  const run = await getPipelineRun(env, runId);
+  if (run !== null && (run.kind !== "classification" || JSON.parse(run.metadata).model !== model ||
+      JSON.parse(run.metadata).snapshotVersion !== version)) {
+    return jsonResponse({ ok: false, error: "classification_run_mismatch" }, 409);
+  }
+  const pending: D1PreparedStatement[] = [publicationGuard(env, version), classificationRunGuard(env, runId, version, model)];
+  for (const ref of refs) {
+    const row = await env.DB.prepare("SELECT payload, content_hash, missing_since FROM item_snapshots WHERE item_key = ?")
+      .bind(ref.key).first<{ payload: string; content_hash: string; missing_since: string | null }>();
+    if (row === null || row.content_hash !== ref.contentHash || row.missing_since !== null) {
+      return jsonResponse({ ok: false, error: "candidate_content_changed", key: ref.key }, 409);
+    }
+    const item = JSON.parse(row.payload) as NormalizedItem;
+    for (const url of [item.website, ...(item.alternateWebsites ?? [])]) {
+      const normalized = canonicalizeNotificationUrl(url);
+      const owners = urls.get(normalized) ?? new Set<string>();
+      owners.add(readString(ref.key)); urls.set(normalized, owners);
+    }
+    pending.push(env.DB.prepare(`INSERT OR REPLACE INTO pipeline_assertions (id, valid)
+      SELECT 'classification-content', CASE WHEN EXISTS (SELECT 1 FROM item_snapshots
+      WHERE item_key = ? AND content_hash = ? AND missing_since IS NULL) THEN 1 ELSE 0 END`).bind(ref.key, ref.contentHash));
+  }
+  if (items.some((item) => {
+    if (!item) return true;
+    const owners = urls.get(canonicalizeNotificationUrl(readString(item.website) || readString(item.normalizedUrl)));
+    return owners === undefined || (item.itemKey !== undefined ? !owners.has(readString(item.itemKey)) : owners.size !== 1) ||
+      (readString(item.classifier) || readString(item.verifier)) !== model;
+  })) {
+    return jsonResponse({ ok: false, error: "classification_target_or_model_mismatch" }, 400);
+  }
+  // URL 级标签会被所有同链接项目读取，不能用单个候选替共用门户或多批次作结论。
+  const path = new URL(request.url).pathname;
+  if (path.endsWith("/activity-type-classifications") || path.endsWith("/relevance-classifications")) {
+    const submittedUrls = new Set(items.map((item) =>
+      canonicalizeNotificationUrl(readString(item.website) || readString(item.normalizedUrl))));
+    if ([...submittedUrls].some((value) => {
+      if (isSpecificNoticeUrl(value)) return false;
+      const url = new URL(value);
+      return (url.pathname === "/" && !url.search && !url.hash) ||
+        /(?:^|\/)(?:index|default|login|logon|signin|signup|sign_up|apply|application)(?:\.[a-z0-9]+)?(?:\/|$)/iu.test(url.pathname);
+    })) {
+      return jsonResponse({ ok: false, error: "ambiguous_classification_url", message: "通用链接保留待核验，请使用具体官方通知或逐项目核验" }, 409);
+    }
+    const current = await env.DB.prepare(`SELECT item_key, json_extract(payload, '$.website') AS website,
+      json_extract(payload, '$.alternateWebsites') AS alternates FROM item_snapshots WHERE missing_since IS NULL`)
+      .all<{ item_key: string; website: string; alternates: string | null }>();
+    const allOwners = new Map<string, Set<string>>();
+    for (const row of current.results ?? []) {
+      for (const website of [row.website, ...JSON.parse(row.alternates ?? "[]")]) {
+        const url = canonicalizeNotificationUrl(website);
+        if (!submittedUrls.has(url)) continue;
+        const owners = allOwners.get(url) ?? new Set<string>();
+        owners.add(row.item_key); allOwners.set(url, owners);
+      }
+    }
+    if ([...allOwners.values()].some((owners) => owners.size > 1)) {
+      return jsonResponse({ ok: false, error: "shared_classification_url", message: "链接对应多个项目或批次，请保留待核验，按 itemKey 分别核实" }, 409);
+    }
+  }
+  const response = await handler(request, env, pending);
+  if (!response.ok) return response;
+  const result = await response.json() as Record<string, unknown>;
+  const now = new Date().toISOString();
+  Object.assign(result, { snapshotVersion: version, submissionId, runId, model });
+  const feedbackField = "feedbackWritten" in result ? "feedbackWritten" : "written" in result ? "written" : null;
+  pending.splice(2, 0,
+    env.DB.prepare(`INSERT INTO classification_submissions (submission_id, run_id, snapshot_version, request_hash, result, created_at)
+      VALUES (?, ?, ?, ?, json_set(?, '$._feedbackBefore', (SELECT COUNT(*) FROM classification_feedback)), ?)`)
+      .bind(submissionId, runId, version, requestHash, JSON.stringify(result), now)
+  );
+  if (feedbackField !== null) pending.push(env.DB.prepare(`UPDATE classification_submissions
+    SET result = json_set(result, ?, (SELECT COUNT(*) FROM classification_feedback) - json_extract(result, '$._feedbackBefore'))
+    WHERE submission_id = ?`).bind(`$.${feedbackField}`, submissionId));
+  pending.push(
+    env.DB.prepare(`UPDATE classification_submissions SET result = json_remove(result, '$._feedbackBefore') WHERE submission_id = ?`).bind(submissionId),
+    env.DB.prepare(`INSERT INTO pipeline_runs (run_id, kind, status, metadata, created_at, updated_at)
+      VALUES (?, 'classification', 'running', ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET status = 'running', updated_at = excluded.updated_at`)
+      .bind(runId, JSON.stringify({ model, snapshotVersion: version }), now, now)
+  );
+  try {
+    pending.unshift(reserveWriteBudget(env, 32 + pending.length * 12, now));
+    await env.DB.batch(pending);
+  } catch (error) {
+    const completed = await readPrevious();
+    if (completed?.request_hash === requestHash) return jsonResponse(JSON.parse(completed.result));
+    if (String(error).includes("pipeline_daily_write_limit")) throw error;
+    if (await getSnapshotVersion(env) !== version) return jsonResponse({ ok: false, error: "snapshot_version_changed" }, 409);
+    if (String(error).includes("CHECK constraint")) return jsonResponse({ ok: false, error: "candidate_content_changed" }, 409);
+    throw error;
+  }
+  return jsonResponse(JSON.parse((await readPrevious())!.result));
+}
+
+async function handleClassificationProgress(request: Request, env: Env): Promise<Response> {
+  const body = await request.json() as Record<string, unknown>;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return jsonResponse({ ok: false, error: "invalid_body" }, 400);
+  }
+  const runId = readString(body.runId);
+  const version = readString(body.snapshotVersion);
+  if (!/^[\w:.-]{1,180}$/.test(runId) || !version || !readString(body.model) ||
+      !["running", "succeeded", "partial", "failed"].includes(readString(body.status)) ||
+      !Array.isArray(body.retry) || body.retry.length > 1000 || JSON.stringify(body).length > 200_000 ||
+      !Number.isSafeInteger(body.processed) || Number(body.processed) < 0 ||
+      !(body.cursor === null || typeof body.cursor === "string") ||
+      (body.status === "succeeded" && (body.cursor !== null || body.retry.length > 0 || body.paginationComplete !== true))) {
+    return jsonResponse({ ok: false, error: "invalid_progress" }, 400);
+  }
+  if (await getSnapshotVersion(env) !== version) return jsonResponse({ ok: false, error: "snapshot_version_changed" }, 409);
+  if (body.status === "succeeded") {
+    const result = await env.DB.prepare(`SELECT cursor, next_cursor, candidate_keys FROM classification_candidate_pages
+      WHERE run_id = ? AND snapshot_version = ?`).bind(runId, version)
+      .all<{ cursor: string; next_cursor: string | null; candidate_keys: string }>();
+    const pages = new Map((result.results ?? []).map((page) => [page.cursor, page]));
+    const visited = new Set<string>(); const candidates = new Set<string>();
+    let cursor: string | null = "";
+    while (cursor !== null && !visited.has(cursor)) {
+      const page = pages.get(cursor);
+      if (!page) break;
+      visited.add(cursor); JSON.parse(page.candidate_keys).forEach((key: string) => candidates.add(key));
+      cursor = page.next_cursor;
+    }
+    if (cursor !== null || Number(body.processed) < candidates.size) {
+      return jsonResponse({ ok: false, error: "classification_incomplete", message: "需要完整分页和全部候选的处理记录" }, 409);
+    }
+  }
+  const now = new Date().toISOString();
+  await env.DB.batch([
+    publicationGuard(env, version),
+    classificationRunGuard(env, runId, version, readString(body.model)),
+    env.DB.prepare(`INSERT INTO pipeline_runs (run_id, kind, status, metadata, result, created_at, updated_at)
+      VALUES (?, 'classification', ?, ?, json_object('accepted',
+        (SELECT COALESCE(SUM(json_extract(result, '$.accepted')), 0) FROM classification_submissions WHERE run_id = ?)), ?, ?)
+      ON CONFLICT(run_id) DO UPDATE SET status = excluded.status, metadata = excluded.metadata,
+        result = excluded.result, updated_at = excluded.updated_at WHERE pipeline_runs.kind = 'classification'`)
+      .bind(runId, body.status, JSON.stringify(body), runId, now, now)
+  ]);
+  return jsonResponse({ ok: true, runId });
 }
 
 async function handleMissingLink(request: Request, env: Env): Promise<Response> {
@@ -1836,6 +2122,8 @@ function readExternalSourceStats(value: unknown): SourceStats[] | null {
       duplicateCount < 0 ||
       supplementedDeadlineCount === null ||
       supplementedDeadlineCount < 0 ||
+      acceptedCount > rawCount || filteredCount > rawCount || duplicateCount > rawCount ||
+      supplementedDeadlineCount > acceptedCount ||
       readString(record.error).trim() !== ""
     ) {
       return null;

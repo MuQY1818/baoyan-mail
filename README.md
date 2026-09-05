@@ -5,10 +5,14 @@
 一个部署在 Cloudflare Workers 上的保研 DDL 数据服务。系统在北京时间白天每小时交叉拉取保研信息平台、星刻保研和保研岛的公开数据，按官方通知链接进行保守合并；公开网站默认展示 AI 判定的计算机类强相关条目，并保留可能相关和全部源站切换。
 当前项目只维护网站和公开 API，DDL 邮件推送已经关闭。
 
+2026-09-05 工作台与可靠性升级：见 [实现、验收与发布手册](docs/workbench-reliability.md)。升级采用添加式迁移；云端兜底默认关闭，生产发布须单独确认。
+
+D1 写入优化：全量采集按批暂存，只有变化项目才重写快照；采集和 AI 分类共享每日保守写入预算。额度不足保留上一健康快照，不通过删除历史数据腾出当日额度。
+
 ## 功能
 
 - 邮件推送已经关闭，新的订阅和确认入口返回停用提示；历史退订链接仍然有效。
-- 北京时间 08:00-23:00 每小时同步多个公开源，公开 API 返回合并后的未截止条目、AI 相关度、项目类型、来源集合和 DDL 可信度状态。
+- 北京时间 08:17-23:17 每小时同步多个公开源，公开 API 返回合并后的未截止条目、AI 相关度、项目类型、来源集合和 DDL 可信度状态；定时执行可能延迟。
 - 网站按 `Top2`、`华五`、`C9`、`985`、`211`、`其他` 展示互斥学校层次；来源和方向不写入标签。
 - 使用 D1 保存数据快照、AI 相关度分类、官方标题项目类型分类、官方 DDL 核验、审核候选和访问统计。
 - 提供公开 DDL 查询 API 和 Vercel 前端网站，默认展示强相关未截止项目，并支持切换可能相关或全部源站。
@@ -21,12 +25,15 @@
 ## 架构
 
 ```text
-GitHub Actions（北京时间 08:00-23:00 每小时）
+GitHub Actions（北京时间 08:17-23:17 每小时）
   -> 并行拉取保研信息平台、星刻保研、保研岛
   -> 规范化官方链接、保守合并、校验每源健康与数量骤降
   -> 分批写入 Cloudflare Worker staging 表并原子发布到 D1
 
-Luna High（北京时间每天 08:30）
+Cloudflare watchdog（每 15 分钟检查，默认关闭）
+  -> 白天超过 90 分钟无健康发布时，带共享锁和冷却补触发 Actions
+
+gpt-5.6-luna / high（本地自动化，北京时间每天 08:00）
   -> 分页读取待核验候选
   -> 访问官方通知，回写相关度、项目类型和精确 DDL
 
@@ -67,6 +74,10 @@ https://api.zscampus.com/zs-baoyan-summer/summer/getListWithConditions
 | `GET` | `/api/admin/run-check` | 已停用的旧 Worker 抓取入口，返回 `409 external_sync_required` |
 | `GET` | `/api/admin/sync-sources` | 已停用的旧 Worker 抓取入口，返回 `409 external_sync_required` |
 | `GET` | `/api/admin/source-health` | 返回最近一次多源同步健康统计，需要管理员密钥 |
+| `POST` | `/api/admin/source-sync/claim` | 采集前申请共享锁，关联逻辑运行 ID 与 GitHub run ID |
+| `POST` | `/api/admin/source-sync/request` | 统一补同步入口；未启用云端兜底时返回 disabled |
+| `GET` | `/api/admin/pipeline-runs` | 最近 30 次采集/分类运行、进度、失败原因与实际 workflow 链接 |
+| `POST` | `/api/admin/classification-progress` | 保存分类处理进度、完整分页凭证及待重试清单 |
 | `POST` | `/api/admin/verification-candidates` | 分页返回需要官方核验的条目及原因，需要管理员密钥 |
 | `POST` | `/api/admin/relevance-classifications` | 批量写入 AI 相关度分类，需要管理员密钥 |
 | `POST` | `/api/admin/activity-type-classifications` | 批量写入官方标题项目类型分类，需要管理员密钥 |
@@ -80,13 +91,15 @@ BAOYAN_SYNC_BASE_URL=https://baoyan.example.com \
   npm run sync:sources:external
 ```
 
+分类写回使用 v2 协议。先读取 `/api/admin/source-health` 确认 `protocolVersion: 2`，再从 `/api/admin/verification-candidates` 获取当前 `snapshotVersion`、`key`、`contentHash`。以下字符串仅为结构占位符，不能直接用于生产写回；每次逻辑提交使用独立 `submissionId`，同一提交重试保持完整请求不变。完整流程见 [v2 分类协议](docs/workbench-reliability.md#分类协议-v2)。
+
 写入 AI 相关度分类：
 
 ```bash
 curl -X POST \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  --data '{"items":[{"website":"https://example.com/notice","relevance":"strong","areas":["计算机"],"reason":"院系明确为计算机学院","classifier":"codex-ai"}]}' \
+  --data '{"snapshotVersion":"COPY_FROM_CANDIDATES","runId":"ai-run-unique","submissionId":"ai-run-unique-relevance-1","model":"gpt-5.6-luna","targets":[{"key":"COPY_KEY","contentHash":"COPY_HASH"}],"items":[{"website":"https://example.com/notice/123.html","relevance":"strong","areas":["计算机"],"reason":"院系明确为计算机学院","classifier":"gpt-5.6-luna"}]}' \
   https://baoyan.example.com/api/admin/relevance-classifications
 ```
 
@@ -96,7 +109,7 @@ curl -X POST \
 curl -X POST \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  --data '{"items":[{"website":"https://example.com/notice","activityType":"pre_recommendation","reason":"官方标题明确写有推荐免试研究生预报名","classifier":"codex-official-title"}]}' \
+  --data '{"snapshotVersion":"COPY_FROM_CANDIDATES","runId":"ai-run-unique","submissionId":"ai-run-unique-type-1","model":"gpt-5.6-luna","targets":[{"key":"COPY_KEY","contentHash":"COPY_HASH"}],"items":[{"website":"https://example.com/notice/123.html","activityType":"pre_recommendation","reason":"官方标题明确写有推荐免试研究生预报名","classifier":"gpt-5.6-luna"}]}' \
   https://baoyan.example.com/api/admin/activity-type-classifications
 ```
 
@@ -106,7 +119,7 @@ curl -X POST \
 curl -X POST \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  --data '{"items":[{"itemKey":"snapshot-item-key","website":"https://example.com/notice","title":"2027年接收推免生预报名通知","deadline":"2026-09-10 17:00","deadlinePrecision":"exact","reason":"官方通知正文明确写明报名截止时间","verifier":"luna-high"}]}' \
+  --data '{"snapshotVersion":"COPY_FROM_CANDIDATES","runId":"ai-run-unique","submissionId":"ai-run-unique-ddl-1","model":"gpt-5.6-luna","targets":[{"key":"COPY_KEY","contentHash":"COPY_HASH"}],"items":[{"itemKey":"COPY_KEY","website":"https://example.com/notice/123.html","title":"2027年接收推免生预报名通知","deadline":"2026-09-10 17:00","deadlinePrecision":"exact","reason":"官方通知正文明确写明报名截止时间","verifier":"gpt-5.6-luna"}]}' \
   https://baoyan.example.com/api/admin/official-verifications
 ```
 
@@ -218,13 +231,14 @@ https://baoyan-mail.weijuebu.workers.dev/api/ddl
 
 ## 定时任务
 
-系统有两条定时链路：
+系统有两条执行链路和一条可选云端兜底：
 
-- GitHub Actions 在北京时间 08:00-23:00 每小时整点运行 `npm run sync:sources:external`。每个来源独立抓取；任一源失败、为空或相对上一轮数量异常骤降时整轮停止，不会发布半套数据，也不会把旧条目标记为消失。仓库需要配置 Actions Secret `BAOYAN_ADMIN_TOKEN`。
-- Luna High 自动化每天北京时间 09:30 检查 `/api/admin/source-health` 的最新同步时间和各源统计，再分页读取 `/api/admin/verification-candidates`。它只访问官方通知并写回相关度、夏令营/预推免类型和官方 DDL，不再负责抓取聚合站。同一通知有多个节点时，主 DDL 取最早会导致申请资格失效的强制截止时间；后续材料或确认时间不得覆盖更早的系统报名截止。旧核验和晚于源数据的核验会继续进入复核队列。
+- GitHub Actions 在北京时间 08:17-23:17 每小时运行 `npm run sync:sources:external`。每个来源独立抓取；任一源失败、为空、分页不完整或相对上一轮数量异常骤降时整轮停止，不会发布半套数据，也不会把旧条目标记为消失。仓库需要配置 Actions Secret `BAOYAN_ADMIN_TOKEN`。
+- 原 `baoyan-mail-ddl-ai` 本地自动化使用 `gpt-5.6-luna / high`，每天北京时间 08:00 检查 `/api/admin/source-health` 的最新同步时间和各源统计，再分页读取 `/api/admin/verification-candidates`。只访问官方通知并写回相关度、夏令营/预推免类型和官方 DDL，不负责抓取聚合站。同一通知有多个节点时，主 DDL 取最早会导致申请资格失效的强制截止时间；后续材料或确认时间不得覆盖更早的系统报名截止。旧核验和晚于源数据的核验会继续进入复核队列。
+- 可选 Cloudflare Cron 每 15 分钟检查一次，在北京时间 08:00-23:59、超过 90 分钟没有健康发布且没有在途运行时，补触发 Actions。共享锁为 30 分钟、触发冷却为 30 分钟。`SOURCE_WATCHDOG_ENABLED` 默认 `false`，必须按发布手册配置 Secret 后才启用。它不执行 AI 分类，也不恢复本地自动化宿主。
 - 没有明确截止时间的当前项目不会从公开 API 消失，而是以 `status=unknown`、`deadlineText=待确认` 返回；网站可通过“待确认”时间筛选单独查看。
 
-Worker 不再配置 Cloudflare Cron，也不在请求或定时事件中执行重型抓取；这是为了适配 Cloudflare Free Worker 的 CPU 限制。
+Worker Cron 只做轻量检查与派发，不执行重型聚合站抓取。定时任务不是实时保证；覆盖率仅指接入源的可验证完整性，不代表全网零遗漏。
 
 ## 更新检测规则
 

@@ -5,6 +5,14 @@ workers_dev = true
 
 [vars]
 APP_BASE_URL = "https://baoyan.example.com"
+SOURCE_WATCHDOG_ENABLED = "false"
+PIPELINE_DAILY_WRITE_BUDGET = "60000"
+GITHUB_REPOSITORY = "MuQY1818/baoyan-mail"
+GITHUB_SYNC_WORKFLOW = "sync-sources.yml"
+GITHUB_SYNC_REF = "main"
+
+[triggers]
+crons = ["*/15 * * * *"]
 
 [[d1_databases]]
 binding = "DB"

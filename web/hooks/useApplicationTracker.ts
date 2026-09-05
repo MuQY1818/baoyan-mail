@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type React from "react";
 import {
   APPLICATION_TRACKER_SCHEMA,
@@ -8,10 +8,13 @@ import {
   type ApplicationTrackerData
 } from "../applicationTracker";
 import type { ApplicationStorageIssue } from "../types";
+import { persistApplicationData, validateApplicationData } from "../utils/applicationStorage";
+
+export type SaveApplicationData = (value: React.SetStateAction<ApplicationTrackerData>) => boolean;
 
 export function useApplicationTracker(): [
   ApplicationTrackerData,
-  React.Dispatch<React.SetStateAction<ApplicationTrackerData>>,
+  SaveApplicationData,
   ApplicationStorageIssue | null,
   () => void
 ] {
@@ -36,7 +39,7 @@ export function useApplicationTracker(): [
       ) {
         throw new Error("数据格式或版本不受支持");
       }
-      return { data: normalizeTrackerData(parsed), issue: null };
+      return { data: validateApplicationData(parsed), issue: null };
     } catch (error) {
       return {
         data: createEmptyTrackerData(),
@@ -50,24 +53,40 @@ export function useApplicationTracker(): [
   const [data, setData] = useState<ApplicationTrackerData>(initialState.data);
   const [storageIssue, setStorageIssue] = useState<ApplicationStorageIssue | null>(initialState.issue);
 
-  useEffect(() => {
-    if (storageIssue !== null) {
-      return;
-    }
+  const current = useRef(data);
+  const lastRaw = useRef<string | null | undefined>(undefined);
+  if (lastRaw.current === undefined) {
     try {
-      window.localStorage.setItem(APPLICATION_TRACKER_STORAGE_KEY, JSON.stringify(data));
+      lastRaw.current = window.localStorage.getItem(APPLICATION_TRACKER_STORAGE_KEY);
+    } catch {
+      lastRaw.current = null;
+    }
+  }
+  const save = useCallback<SaveApplicationData>((value) => {
+    try {
+      const next = typeof value === "function" ? value(current.current) : value;
+      if (next === current.current) return true;
+      persistApplicationData(next, lastRaw.current);
+      lastRaw.current = window.localStorage.getItem(APPLICATION_TRACKER_STORAGE_KEY);
+      current.current = next;
+      setData(next);
+      setStorageIssue(null);
+      return true;
     } catch (error) {
       setStorageIssue({
         message: error instanceof Error ? error.message : "浏览器拒绝写入本地数据",
-        rawValue: JSON.stringify(data)
+        rawValue: lastRaw.current ?? ""
       });
+      return false;
     }
-  }, [data, storageIssue]);
+  }, []);
 
   function resetStorage(): void {
     const empty = createEmptyTrackerData();
     try {
       window.localStorage.setItem(APPLICATION_TRACKER_STORAGE_KEY, JSON.stringify(empty));
+      current.current = empty;
+      lastRaw.current = JSON.stringify(empty);
       setData(empty);
       setStorageIssue(null);
     } catch (error) {
@@ -78,5 +97,5 @@ export function useApplicationTracker(): [
     }
   }
 
-  return [data, setData, storageIssue, resetStorage];
+  return [data, save, storageIssue, resetStorage];
 }

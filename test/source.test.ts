@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { SqliteD1 } from "./sqliteD1";
 import {
   collectDailyDeadlineDigestItems,
   collectNewDeadlineNotificationCandidates,
@@ -3967,7 +3968,8 @@ describe("DDL API", () => {
   });
 
   it("accepts admin relevance classifications and rejects invalid payloads", async () => {
-    const db = new FakeD1Database();
+    const db = new SqliteD1();
+    db.itemSnapshots.set("notice", { item_key: "notice", content_hash: "hash", payload: JSON.stringify({ website: "https://example.com/notice" }), source_group: "xingkebaoyan", first_seen_at: new Date().toISOString(), updated_at: new Date().toISOString(), last_seen_at: new Date().toISOString(), missing_since: null });
     const context = {
       waitUntil: () => undefined,
       passThroughOnException: () => undefined
@@ -4015,7 +4017,7 @@ describe("DDL API", () => {
               reason: "电气系统方向，可能与控制相关",
               classifier: "codex-ai"
             }
-          ]
+          ], snapshotVersion: "unpublished", submissionId: "test-relevance", runId: "test-ai", model: "codex-ai", targets: [{ key: "notice", contentHash: "hash" }]
         })
       }),
       { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env,
@@ -4024,14 +4026,14 @@ describe("DDL API", () => {
     const body = (await accepted.json()) as { ok: boolean; accepted: number };
 
     expect(unauthorized.status).toBe(401);
-    expect(invalid.status).toBe(400);
+    expect(invalid.status).toBe(428);
     expect(accepted.status).toBe(200);
     expect(body).toMatchObject({ ok: true, accepted: 1 });
     expect(db.relevanceClassifications.has("https://example.com/notice")).toBe(true);
   });
 
   it("persists activity type classifications and exposes them through the public API", async () => {
-    const db = new FakeD1Database();
+    const db = new SqliteD1();
     const context = {
       waitUntil: () => undefined,
       passThroughOnException: () => undefined
@@ -4091,7 +4093,7 @@ describe("DDL API", () => {
               reason: "官方标题明确写有推荐免试研究生预报名",
               classifier: "codex-official-title"
             }
-          ]
+          ], snapshotVersion: "unpublished", submissionId: "test-activity", runId: "test-ai", model: "codex-official-title", targets: [{ key: item.key, contentHash: item.contentHash }]
         })
       }),
       { DB: db as unknown as D1Database, ADMIN_TOKEN: "secret" } as Env,
@@ -4111,7 +4113,7 @@ describe("DDL API", () => {
     };
 
     expect(unauthorized.status).toBe(401);
-    expect(invalid.status).toBe(400);
+    expect(invalid.status).toBe(428);
     expect(accepted.status).toBe(200);
     expect(db.activityTypeClassifications.has("https://example.com/pre")).toBe(true);
     expect(body.items[0]).toMatchObject({
@@ -4183,7 +4185,7 @@ describe("DDL API", () => {
   });
 
   it("accepts a complete external source sync and only then marks old rows missing", async () => {
-    const db = new FakeD1Database();
+    const db = new SqliteD1();
     const context = {
       waitUntil: () => undefined,
       passThroughOnException: () => undefined
@@ -4426,7 +4428,7 @@ describe("DDL API", () => {
       new Request("https://example.com/api/admin/verification-candidates", {
         method: "POST",
         headers,
-        body: JSON.stringify({ cursor: firstBody.nextCursor, limit: 1 })
+        body: JSON.stringify({ cursor: firstBody.nextCursor, limit: 1, snapshotVersion: "unpublished" })
       }),
       env,
       context
@@ -4481,7 +4483,7 @@ describe("DDL API", () => {
       context
     );
 
-    expect(missingItemKey.status).toBe(400);
+    expect(missingItemKey.status).toBe(428);
   });
 
   it("rejects legacy Worker-side source sync", async () => {

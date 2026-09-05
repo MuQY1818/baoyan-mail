@@ -1,9 +1,15 @@
 name: Sync DDL sources
+run-name: DDL source sync (${{ inputs.sync_run_id || github.run_id }})
 
 on:
   schedule:
-    - cron: "0 0-15 * * *"
+    - cron: "17 0-15 * * *"
   workflow_dispatch:
+    inputs:
+      sync_run_id:
+        description: "云端兜底关联运行 ID（留空自动生成）"
+        required: false
+        type: string
 
 concurrency:
   group: sync-ddl-sources
@@ -33,4 +39,5 @@ jobs:
         env:
           BAOYAN_ADMIN_TOKEN: ${{ secrets.BAOYAN_ADMIN_TOKEN }}
           BAOYAN_SYNC_BASE_URL: https://baoyan-mail.weijuebu.workers.dev
+          BAOYAN_SYNC_RUN_ID: ${{ inputs.sync_run_id }}
         run: npm run sync:sources:external

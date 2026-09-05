@@ -62,6 +62,9 @@
 - 2026-08-10：修复官方核验候选分页和公开 DDL 大批量查询的 503 压力路径；新增分类反馈审计表与管理接口，增加明确预推免文本的规则保护，并使用 `gpt-5.6-sol/high` 完成全量项目类型、相关度和反馈复查。
 - 2026-08-28：修复多阶段通知误选后续材料截止的问题；旧核验不再覆盖更新源数据，晚于现有源 DDL 的核验保留更早安全下界并继续复核，无明确 DDL 的当前项目改为公开展示“待确认”。
 
+- 2026-09-05：实现工作台与数据可靠性升级：发布和审核池原子提交、finalize 幂等、版本化分类、反馈去重、运行追踪及默认关闭的云端补采集；统一截止可信度与安全本地存储，补前后端测试和真实浏览器验收。迁移、密钥和生产部署须单独确认，操作顺序见 `docs/workbench-reliability.md`。
+- 2026-09-05：针对 D1 日写入额度告警，增加 JSON 批次暂存、增量快照发布、UTC 日采集/分类预算和预算耗尽停止重试；保留完整 inventory、历史项目和反馈，未变化项目不因省略逐行更新时间被标记消失。
+
 ## 部署经验
 
 - Vercel 部署若长时间显示 `Building`，但 `vercel inspect --format=json` 里 `readyState` 是 `BLOCKED`，先看 `readyStateReason`。本项目曾因 Git author 为 `muqy1818@users.noreply.github.com` 被 Vercel Team Access 拦截，提示该 author 没有团队部署权限；解决方法是把提交 author/committer 改为 Vercel 认可的 `2565324759@qq.com`，再重新 `vercel build --prod && vercel deploy --prebuilt --prod --yes`。

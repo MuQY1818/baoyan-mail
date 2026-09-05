@@ -54,6 +54,7 @@ function MainTabs({
     <nav className="main-tabs desktop-tabs" aria-label="平台功能">
       {tabs.map((tab) => (
         <button
+          aria-current={activeTab === tab.value ? "page" : undefined}
           className={activeTab === tab.value ? "main-tab main-tab-active" : "main-tab"}
           key={tab.value}
           onClick={() => onSelect(tab.value)}

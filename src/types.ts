@@ -16,6 +16,12 @@ export interface Env {
   ADMIN_TOKEN?: string;
   ADMIN_REVIEW_PASSWORD?: string;
   BATCH_SIZE?: string;
+  SOURCE_WATCHDOG_ENABLED?: string;
+  PIPELINE_DAILY_WRITE_BUDGET?: string;
+  GITHUB_ACTIONS_TOKEN?: string;
+  GITHUB_REPOSITORY?: string;
+  GITHUB_SYNC_WORKFLOW?: string;
+  GITHUB_SYNC_REF?: string;
 }
 
 export type SubscriberStatus = "pending" | "active" | "unsubscribed";

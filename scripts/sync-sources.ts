@@ -48,26 +48,29 @@ interface SyncOptions {
 
 async function main(): Promise<void> {
   const options = readOptions(process.argv.slice(2));
-  const runId = new Date().toISOString();
-  const sourceResult = await fetchSourceItemsWithStats({
-    BAOYANXINXI_SOURCE_URL: process.env.BAOYANXINXI_SOURCE_URL,
-    BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_URL:
-      process.env.BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_URL,
-    XINGKE_SOURCE_URL: process.env.XINGKE_SOURCE_URL,
-    ZSCAMPUS_SOURCE_URL: process.env.ZSCAMPUS_SOURCE_URL,
-    SOURCE_YEAR: process.env.SOURCE_YEAR
-  } as Env);
-  assertHealthySources(sourceResult.stats);
-  const previousHealth = (await sendAdminRequest(
-    options,
-    "source-health"
-  )) as unknown as SourceHealthResponse;
-  assertNoUnexpectedSourceDrop(sourceResult.stats, previousHealth.sourceStats ?? []);
-
-  const activityTypeCounts = countActivityTypes(sourceResult.items);
+  const runId = process.env.BAOYAN_SYNC_RUN_ID?.trim() || new Date().toISOString();
   let started = false;
   let finalized = false;
+  let failure = "collector_aborted";
   try {
+    await sendAdminRequest(options, "source-sync-claim", { runId, workflowRunId: process.env.GITHUB_RUN_ID });
+    started = true;
+    const sourceResult = await fetchSourceItemsWithStats({
+      BAOYANXINXI_SOURCE_URL: process.env.BAOYANXINXI_SOURCE_URL,
+      BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_URL:
+        process.env.BAOYANXINXI_PRE_RECOMMENDATION_SOURCE_URL,
+      XINGKE_SOURCE_URL: process.env.XINGKE_SOURCE_URL,
+      ZSCAMPUS_SOURCE_URL: process.env.ZSCAMPUS_SOURCE_URL,
+      SOURCE_YEAR: process.env.SOURCE_YEAR
+    } as Env);
+    assertHealthySources(sourceResult.stats);
+    const previousHealth = (await sendAdminRequest(
+      options,
+      "source-health"
+    )) as unknown as SourceHealthResponse;
+    assertNoUnexpectedSourceDrop(sourceResult.stats, previousHealth.sourceStats ?? []);
+
+    const activityTypeCounts = countActivityTypes(sourceResult.items);
     await sendAdminRequest(options, "source-sync-start", {
       runId,
       expectedCount: sourceResult.items.length,
@@ -113,10 +116,13 @@ async function main(): Promise<void> {
         2
       )}\n`
     );
+  } catch (error) {
+    failure = error instanceof Error ? error.message : "collector_failed";
+    throw error;
   } finally {
     if (started && !finalized) {
       try {
-        await sendAdminRequest(options, "source-sync-abort", { runId });
+        await sendAdminRequest(options, "source-sync-abort", { runId, error: failure });
       } catch {
         // The lock also expires automatically; keep the original sync error.
       }
@@ -203,7 +209,7 @@ export function assertNoUnexpectedMergedDrop(
   }
 }
 
-async function fetchSnapshotIndex(
+export async function fetchSnapshotIndex(
   options: SyncOptions,
   runId: string
 ): Promise<DdlIndexItem[]> {
@@ -227,8 +233,14 @@ async function fetchSnapshotIndex(
     if (items.length > 100_000) {
       throw new Error("历史快照索引超过安全上限");
     }
-    if (typeof response.nextCursor !== "string" || response.nextCursor === "") {
+    if (new Set(items.map((item) => item.key)).size !== items.length) {
+      throw new Error("历史快照索引包含重复条目");
+    }
+    if (response.nextCursor === null) {
       return items;
+    }
+    if (typeof response.nextCursor !== "string" || response.nextCursor === "" || response.items.length === 0) {
+      throw new Error("历史快照索引未明确结束或出现异常空页");
     }
     cursor = response.nextCursor;
   }
@@ -408,21 +420,12 @@ async function sendAdminRequest(
   payload?: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
   if (options.authHelper !== null) {
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      try {
-        return await sendThroughAuthHelper(options.authHelper, action, payload);
-      } catch (error) {
-        lastError = error;
-        if (attempt < 3) {
-          await delay(attempt * 1_000);
-        }
-      }
-    }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    // 助手负责其自身的重试策略，不在未知 HTTP 状态下重复操作。
+    return sendThroughAuthHelper(options.authHelper, action, payload);
   }
   const routeByAction: Record<string, { method: "GET" | "POST"; path: string }> = {
     "source-health": { method: "GET", path: "/api/admin/source-health" },
+    "source-sync-claim": { method: "POST", path: "/api/admin/source-sync/claim" },
     "source-sync-start": { method: "POST", path: "/api/admin/source-sync/start" },
     "source-sync-index": { method: "POST", path: "/api/admin/source-sync/index" },
     "source-sync-items": { method: "POST", path: "/api/admin/source-sync/items" },
@@ -481,7 +484,7 @@ function sendThroughAuthHelper(
   });
 }
 
-async function adminRequestWithRetry(
+export async function adminRequestWithRetry(
   url: string,
   method: "GET" | "POST",
   payload: Record<string, unknown> | undefined,
@@ -505,6 +508,12 @@ async function adminRequestWithRetry(
       const response = await fetch(url, requestInit);
       const text = await response.text();
       if (!response.ok) {
+        if (response.status === 429 && text.includes('"pipeline_write_budget_exhausted"')) {
+          throw new NonRetryableRequestError(`每日写入预算不足，已停止重试：${text.slice(0, 500)}`);
+        }
+        if (response.status < 500 && response.status !== 408 && response.status !== 429) {
+          throw new NonRetryableRequestError(`HTTP ${response.status}: ${text.slice(0, 500)}`);
+        }
         throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
       }
       const parsed = JSON.parse(text) as Record<string, unknown>;
@@ -513,6 +522,7 @@ async function adminRequestWithRetry(
       }
       return parsed;
     } catch (error) {
+      if (error instanceof NonRetryableRequestError) throw error;
       lastError = error;
       if (attempt < 3) {
         await delay(attempt * 1_000);
@@ -521,6 +531,8 @@ async function adminRequestWithRetry(
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
+
+class NonRetryableRequestError extends Error {}
 
 function chunks<T>(items: T[], size: number): T[][] {
   const result: T[][] = [];

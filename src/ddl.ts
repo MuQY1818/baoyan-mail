@@ -1,4 +1,5 @@
 import {
+  AUTOMATIC_SOURCE_GROUPS,
   canonicalizeNotificationUrl,
   classifyBaoyanXinxiRecord,
   getActivityTypeDetails,
@@ -116,9 +117,13 @@ export function buildDdlResponse(
 ): DdlApiResponse {
   const activityTypeClassifications = options.activityTypeClassifications ?? new Map();
   const officialVerifications = options.officialVerifications ?? new Map();
-  const contexts = entries.map((entry) =>
-    toDdlContext(entry, classifications, activityTypeClassifications, officialVerifications)
-  );
+  const contexts = entries.map((entry) => {
+    const context = toDdlContext(entry, classifications, activityTypeClassifications, officialVerifications);
+    // 未变化的活动项目不逐行刷新时间；完整发布已证明它们仍在源站。
+    if (context.missingSince === null && lastSyncedAt !== null &&
+        AUTOMATIC_SOURCE_GROUPS.some((group) => group === context.item.sourceGroup)) context.lastSeenAt = lastSyncedAt;
+    return context;
+  });
   const serializedItems = hideSupersededGraceAliases(
     contexts
       .map((context) => serializeDdlItem(context, now))

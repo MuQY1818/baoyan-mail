@@ -49,6 +49,8 @@ export interface DdlItem {
 }
 
 export interface DdlResponse {
+  snapshotVersion?: string;
+  health?: { status: "healthy" | "delayed" | "unavailable"; ageMinutes: number | null; coverage: string };
   ok: true;
   generatedAt: string;
   lastSyncedAt: string | null;

@@ -19,8 +19,34 @@ import type {
   SubscriberRow,
   VisitDailyStatRow
 } from "./types";
+import { sha256Hex } from "./crypto";
+import type { SourceReviewCandidateInput } from "./source";
 
 const SQL_BATCH_SIZE = 50;
+
+export function writeBudgetLimit(env: Env): number {
+  const configured = Number(env.PIPELINE_DAILY_WRITE_BUDGET ?? 60_000);
+  return Number.isSafeInteger(configured) && configured >= 0 && configured <= 60_000 ? configured : 60_000;
+}
+
+export function reserveWriteBudget(env: Env, cost: number, now: string): D1PreparedStatement {
+  if (!Number.isSafeInteger(cost) || cost < 0) throw new Error("invalid_write_budget_cost");
+  return env.DB.prepare(`INSERT INTO pipeline_write_budget (utc_day, reserved, daily_limit)
+    VALUES (?, ?, ?) ON CONFLICT(utc_day) DO UPDATE SET
+      reserved = pipeline_write_budget.reserved + excluded.reserved,
+      daily_limit = MIN(pipeline_write_budget.daily_limit, excluded.daily_limit)`)
+    .bind(now.slice(0, 10), cost, writeBudgetLimit(env));
+}
+
+export async function getWriteBudget(env: Env, now = new Date()) {
+  const day = now.toISOString().slice(0, 10);
+  const row = await env.DB.prepare("SELECT reserved, daily_limit FROM pipeline_write_budget WHERE utc_day = ?")
+    .bind(day).first<{ reserved: number; daily_limit: number }>();
+  const limit = Math.min(row?.daily_limit ?? writeBudgetLimit(env), writeBudgetLimit(env));
+  return { scope: "pipeline-estimate", utcDay: day, reserved: row?.reserved ?? 0, limit,
+    remaining: Math.max(0, limit - (row?.reserved ?? 0)),
+    resetsAt: new Date(Date.parse(`${day}T00:00:00Z`) + 86_400_000).toISOString() };
+}
 
 export async function findSubscriberByEmail(env: Env, email: string): Promise<SubscriberRow | null> {
   return env.DB.prepare("SELECT * FROM subscribers WHERE email = ?")
@@ -242,7 +268,7 @@ export async function getExternalSourceSyncItemCount(
   runId: string
 ): Promise<number> {
   const row = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM external_source_sync_items WHERE run_id = ?"
+    "SELECT COUNT(*) AS count FROM external_source_sync_item_rows WHERE run_id = ?"
   )
     .bind(runId)
     .first<{ count: number }>();
@@ -255,51 +281,60 @@ export async function stageExternalSourceSyncItems(
   items: NormalizedItem[],
   now: string
 ): Promise<void> {
-  const statements = items.map((item) =>
-    env.DB.prepare(
-      `
-        INSERT INTO external_source_sync_items (
-          run_id,
-          item_key,
-          content_hash,
-          payload,
-          source_group,
-          created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(run_id, item_key) DO UPDATE SET
-          content_hash = excluded.content_hash,
-          payload = excluded.payload,
-          source_group = excluded.source_group
-      `
-    ).bind(
-      runId,
-      item.key,
-      item.contentHash,
-      JSON.stringify(item),
-      item.sourceGroup,
-      now
-    )
-  );
-  await runBatchInChunks(env, statements);
+  await stageExternalSourceSyncBatch(env, runId, "items", items, now);
+}
+
+export async function stageExternalSourceSyncBatch(
+  env: Env, runId: string, kind: "items" | "reviews",
+  items: NormalizedItem[] | SourceReviewCandidateInput[], now: string
+): Promise<void> {
+  const keyOf = (item: NormalizedItem | SourceReviewCandidateInput) => "key" in item ? item.key : `${item.normalizedUrl}\u0000${item.sourceGroup}`;
+  const sorted = [...items].sort((a, b) => keyOf(a).localeCompare(keyOf(b)));
+  const keys = sorted.map(keyOf);
+  if (new Set(keys).size !== keys.length) throw new Error("duplicate_batch_keys");
+  const payload = JSON.stringify(sorted);
+  const batchKey = await sha256Hex(JSON.stringify(keys));
+  const previous = await env.DB.prepare(`SELECT payload FROM external_source_sync_batches
+    WHERE run_id = ? AND kind = ? AND batch_key = ?`).bind(runId, kind, batchKey).first<{ payload: string }>();
+  if (previous?.payload === payload) return;
+  const rowView = kind === "items" ? "external_source_sync_item_rows" : "external_source_sync_review_rows";
+  const keyExpression = kind === "items" ? "item_key" : "normalized_url || char(0) || source_group";
+  await env.DB.batch([
+    env.DB.prepare(`INSERT OR REPLACE INTO pipeline_assertions (id, valid)
+      SELECT 'stage-batch', CASE WHEN EXISTS (SELECT 1 FROM app_state
+        WHERE key = 'external_source_sync_active_run' AND json_extract(NULLIF(value, ''), '$.runId') = ?)
+        AND (EXISTS (SELECT 1 FROM external_source_sync_batches WHERE run_id = ? AND kind = ?
+          AND batch_key = ? AND payload = ?) OR NOT EXISTS (
+            SELECT 1 FROM ${rowView} WHERE run_id = ? AND ${keyExpression} IN (SELECT value FROM json_each(?))))
+        THEN 1 ELSE 0 END`).bind(runId, runId, kind, batchKey, payload, runId, JSON.stringify(keys)),
+    // 包含批次、预算、断言和日后清理开销，重复成功请求走上面的只读返回。
+    reserveWriteBudget(env, 12, now),
+    env.DB.prepare(`INSERT INTO external_source_sync_batches (run_id, kind, batch_key, payload, created_at)
+      VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_id, kind, batch_key) DO NOTHING`)
+      .bind(runId, kind, batchKey, payload, now)
+  ]);
 }
 
 export async function discardExternalSourceSyncItems(
   env: Env,
   runId: string
 ): Promise<void> {
-  await env.DB.prepare("DELETE FROM external_source_sync_items WHERE run_id = ?")
-    .bind(runId)
-    .run();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM external_source_sync_batches WHERE run_id = ?").bind(runId),
+    env.DB.prepare("DELETE FROM external_source_sync_items WHERE run_id = ?").bind(runId),
+    env.DB.prepare("DELETE FROM external_source_sync_reviews WHERE run_id = ?").bind(runId)
+  ]);
 }
 
 export async function discardExternalSourceSyncItemsCreatedBefore(
   env: Env,
   createdBefore: string
 ): Promise<void> {
-  await env.DB.prepare("DELETE FROM external_source_sync_items WHERE created_at < ?")
-    .bind(createdBefore)
-    .run();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM external_source_sync_batches WHERE created_at < ?").bind(createdBefore),
+    env.DB.prepare("DELETE FROM external_source_sync_items WHERE created_at < ?").bind(createdBefore),
+    env.DB.prepare("DELETE FROM external_source_sync_reviews WHERE created_at < ?").bind(createdBefore)
+  ]);
 }
 
 export async function publishExternalSourceSyncItems(
@@ -309,10 +344,52 @@ export async function publishExternalSourceSyncItems(
   now: string,
   sourceStats: SourceStats[],
   lockKey: string,
-  expectedLockValue: string
-): Promise<number> {
+  expectedLockValue: string,
+  expectedCount: number,
+  reviewCount: number,
+  publication: Record<string, unknown>
+): Promise<void> {
   const placeholders = sourceGroups.map(() => "?").join(", ");
-  const results = await env.DB.batch([
+  const changedItems = `(SELECT COUNT(*) FROM external_source_sync_item_rows s
+    LEFT JOIN item_snapshots t ON t.item_key = s.item_key WHERE s.run_id = ?
+    AND (t.item_key IS NULL OR t.content_hash <> s.content_hash OR t.payload <> s.payload OR t.missing_since IS NOT NULL))`;
+  const changedReviews = `(SELECT COUNT(*) FROM external_source_sync_review_rows s
+    LEFT JOIN source_review_candidates t ON t.normalized_url = s.normalized_url AND t.source_group = s.source_group
+    WHERE s.run_id = ? AND (t.id IS NULL OR (t.status = 'pending' AND (t.reason <> s.reason OR t.payload <> s.payload))))`;
+  const missingItems = `(SELECT COUNT(*) FROM item_snapshots WHERE source_group IN (${placeholders})
+    AND missing_since IS NULL AND item_key NOT IN (SELECT item_key FROM external_source_sync_item_rows WHERE run_id = ?))`;
+  const estimatedCost = `(64 + 10 * ${changedItems} + 8 * ${changedReviews} + 4 * ${missingItems})`;
+  await env.DB.batch([
+    env.DB.prepare(`INSERT OR REPLACE INTO pipeline_assertions (id, valid)
+      SELECT 'publish', CASE WHEN
+        EXISTS (SELECT 1 FROM app_state WHERE key = ? AND value = ?)
+        AND (SELECT COUNT(DISTINCT item_key) FROM external_source_sync_item_rows WHERE run_id = ?) = ?
+        AND (SELECT COUNT(*) FROM external_source_sync_item_rows WHERE run_id = ?) = ?
+        AND (SELECT COUNT(*) FROM external_source_sync_review_rows WHERE run_id = ?) = ?
+        AND (SELECT COUNT(*) FROM (SELECT normalized_url, source_group FROM external_source_sync_review_rows
+          WHERE run_id = ? GROUP BY normalized_url, source_group)) = ?
+        AND EXISTS (SELECT 1 FROM pipeline_runs WHERE run_id = ? AND status = 'running')
+      THEN 1 ELSE 0 END`).bind(lockKey, expectedLockValue, runId, expectedCount, runId, expectedCount,
+        runId, reviewCount, runId, reviewCount, runId),
+    env.DB.prepare(`INSERT INTO pipeline_write_budget (utc_day, reserved, daily_limit)
+      SELECT ?, ${estimatedCost}, ? ON CONFLICT(utc_day) DO UPDATE SET
+        reserved = pipeline_write_budget.reserved + excluded.reserved,
+        daily_limit = MIN(pipeline_write_budget.daily_limit, excluded.daily_limit)`)
+      .bind(now.slice(0, 10), runId, runId, ...sourceGroups, runId, writeBudgetLimit(env)),
+    env.DB.prepare(`UPDATE pipeline_runs SET status = 'succeeded', updated_at = ?,
+      result = json_set(?, '$.missingCount', ${missingItems}, '$.changedItems', ${changedItems},
+        '$.changedReviews', ${changedReviews}, '$.estimatedPublishWrites', ${estimatedCost}) WHERE run_id = ?`)
+      .bind(now, JSON.stringify(publication), ...sourceGroups, runId, runId, runId,
+        runId, runId, ...sourceGroups, runId, runId),
+    env.DB.prepare(`INSERT INTO source_review_candidates
+      (normalized_url, source_group, status, reason, payload, created_at, updated_at)
+      SELECT normalized_url, source_group, 'pending', reason, payload, ?, ?
+      FROM external_source_sync_review_rows WHERE run_id = ?
+      ON CONFLICT(normalized_url, source_group) DO UPDATE SET
+        reason = excluded.reason, payload = excluded.payload, updated_at = excluded.updated_at
+      WHERE source_review_candidates.status = 'pending' AND
+        (source_review_candidates.reason <> excluded.reason OR source_review_candidates.payload <> excluded.payload)`)
+      .bind(now, now, runId),
     env.DB.prepare(
       `
         INSERT INTO item_snapshots (
@@ -334,7 +411,7 @@ export async function publishExternalSourceSyncItems(
           ?,
           ?,
           NULL
-        FROM external_source_sync_items
+        FROM external_source_sync_item_rows
         WHERE run_id = ?
         ON CONFLICT(item_key) DO UPDATE SET
           content_hash = excluded.content_hash,
@@ -346,6 +423,8 @@ export async function publishExternalSourceSyncItems(
           END,
           last_seen_at = excluded.last_seen_at,
           missing_since = NULL
+        WHERE item_snapshots.content_hash <> excluded.content_hash
+          OR item_snapshots.payload <> excluded.payload OR item_snapshots.missing_since IS NOT NULL
       `
     ).bind(now, now, now, runId),
     env.DB.prepare(
@@ -353,10 +432,10 @@ export async function publishExternalSourceSyncItems(
         UPDATE item_snapshots
         SET missing_since = ?
         WHERE source_group IN (${placeholders})
-          AND COALESCE(last_seen_at, '') <> ?
+          AND item_key NOT IN (SELECT item_key FROM external_source_sync_item_rows WHERE run_id = ?)
           AND missing_since IS NULL
       `
-    ).bind(now, ...sourceGroups, now),
+    ).bind(now, ...sourceGroups, runId),
     env.DB.prepare(
       `
         INSERT INTO app_state (key, value, updated_at)
@@ -376,6 +455,10 @@ export async function publishExternalSourceSyncItems(
       `
     ).bind(JSON.stringify(sourceStats), now),
     env.DB.prepare("DELETE FROM external_source_sync_items WHERE run_id = ?").bind(runId),
+    env.DB.prepare("DELETE FROM external_source_sync_reviews WHERE run_id = ?").bind(runId),
+    env.DB.prepare("DELETE FROM external_source_sync_batches WHERE run_id = ?").bind(runId),
+    env.DB.prepare(`INSERT INTO app_state (key, value, updated_at) VALUES ('snapshot_version', ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`).bind(runId, now),
     env.DB.prepare(
       `
         UPDATE app_state
@@ -384,7 +467,6 @@ export async function publishExternalSourceSyncItems(
       `
     ).bind(now, lockKey, expectedLockValue)
   ]);
-  return results[1]?.meta.changes ?? 0;
 }
 
 export async function getSnapshotRowsBySourceGroups(
@@ -535,7 +617,8 @@ export async function getItemRelevanceClassifications(
 export async function upsertItemRelevanceClassifications(
   env: Env,
   entries: ItemRelevanceClassification[],
-  now: string
+  now: string,
+  pending?: D1PreparedStatement[]
 ): Promise<number> {
   const statements = entries.map((entry) =>
     env.DB.prepare(
@@ -570,6 +653,7 @@ export async function upsertItemRelevanceClassifications(
       now
     )
   );
+  if (pending !== undefined) { pending.push(...statements); return entries.length; }
   const results = await runBatchInChunks(env, statements);
   return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
 }
@@ -612,7 +696,8 @@ export async function getItemActivityTypeClassifications(
 export async function upsertItemActivityTypeClassifications(
   env: Env,
   entries: ItemActivityTypeClassification[],
-  now: string
+  now: string,
+  pending?: D1PreparedStatement[]
 ): Promise<number> {
   const statements = entries.map((entry) =>
     env.DB.prepare(
@@ -644,6 +729,7 @@ export async function upsertItemActivityTypeClassifications(
       now
     )
   );
+  if (pending !== undefined) { pending.push(...statements); return entries.length; }
   const results = await runBatchInChunks(env, statements);
   return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
 }
@@ -739,7 +825,8 @@ export async function getOfficialItemVerifications(
 
 export async function recordClassificationFeedback(
   env: Env,
-  entries: ClassificationFeedback[]
+  entries: ClassificationFeedback[],
+  pending?: D1PreparedStatement[]
 ): Promise<number> {
   if (entries.length === 0) {
     return 0;
@@ -747,7 +834,7 @@ export async function recordClassificationFeedback(
   const statements = entries.map((entry) =>
     env.DB.prepare(
       `
-        INSERT INTO classification_feedback (
+        INSERT OR IGNORE INTO classification_feedback (
           normalized_url,
           classification_kind,
           model_value,
@@ -755,9 +842,10 @@ export async function recordClassificationFeedback(
           reason,
           source,
           classifier,
-          created_at
+          created_at,
+          feedback_key
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
     ).bind(
       entry.normalizedUrl,
@@ -767,9 +855,12 @@ export async function recordClassificationFeedback(
       entry.reason,
       entry.source,
       entry.classifier,
-      entry.createdAt
+      entry.createdAt,
+      JSON.stringify([entry.normalizedUrl, entry.classificationKind, entry.modelValue,
+        entry.correctedValue, entry.reason, entry.source, entry.classifier])
     )
   );
+  if (pending !== undefined) { pending.push(...statements); return entries.length; }
   const results = await runBatchInChunks(env, statements);
   return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
 }
@@ -777,7 +868,8 @@ export async function recordClassificationFeedback(
 export async function upsertOfficialItemVerifications(
   env: Env,
   entries: OfficialItemVerification[],
-  now: string
+  now: string,
+  pending?: D1PreparedStatement[]
 ): Promise<number> {
   const statements = entries.map((entry) =>
     env.DB.prepare(
@@ -818,6 +910,7 @@ export async function upsertOfficialItemVerifications(
       now
     )
   );
+  if (pending !== undefined) { pending.push(...statements); return entries.length; }
   const results = await runBatchInChunks(env, statements);
   return results.reduce((count, result) => count + (result.meta.changes ?? 0), 0);
 }

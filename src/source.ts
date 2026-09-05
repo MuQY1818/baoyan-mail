@@ -952,8 +952,31 @@ async function fetchZscampusItems(
       fetchZscampusPage(sourceUrl, sourceYear, index + 2)
     )
   );
-  const records = [firstPage, ...remainingPages].flatMap((page) => page.records);
+  const records = validateZscampusPages([firstPage, ...remainingPages], SOURCE_PAGE_SIZE);
   return normalizeZscampusData(records, sourceUrl, pageCount);
+}
+
+export function validateZscampusPages<T extends { summerid?: unknown }>(
+  pages: Array<{ total: number; records: T[] }>, pageSize: number
+): T[] {
+  const total = pages[0]?.total;
+  if (total === undefined || !Number.isSafeInteger(total) || total < 0 || pageSize < 1 ||
+      pages.length !== Math.max(1, Math.ceil(total / pageSize))) {
+    throw new Error("来源分页不完整：缺页或无效 total");
+  }
+  const seen = new Set<string>();
+  for (const [index, page] of pages.entries()) {
+    const expected = Math.min(pageSize, Math.max(0, total - index * pageSize));
+    if (page.total !== total || page.records.length !== expected) {
+      throw new Error(`来源第 ${index + 1} 页数量异常或 total 在采集时发生变化`);
+    }
+    for (const record of page.records) {
+      const id = toSourceItemId(record.summerid);
+      if (id === "" || seen.has(id)) throw new Error(`来源第 ${index + 1} 页缺少 ID 或含重复记录`);
+      seen.add(id);
+    }
+  }
+  return pages.flatMap((page) => page.records);
 }
 
 export function normalizeZscampusData(
@@ -978,8 +1001,7 @@ export function normalizeZscampusData(
       name === "" ||
       title === "" ||
       canonicalizeNotificationUrl(website) === "" ||
-      deadlineAt === null ||
-      deadlineAt.getTime() <= now.getTime()
+      (deadlineAt !== null && deadlineAt.getTime() <= now.getTime())
     ) {
       continue;
     }
@@ -1036,6 +1058,7 @@ export function normalizeZscampusData(
       reviewCandidateCount: 0,
       duplicateCount: 0,
       supplementedDeadlineCount: 0,
+      unknownDeadlineCount: items.filter((item) => item.deadline === "").length,
       pageCount,
       latestPublishedAt
     },
@@ -1077,9 +1100,10 @@ async function fetchZscampusPage(
     throw new Error(`第 ${page} 页返回格式异常`);
   }
   const pageData = payload.data;
-  const records = Array.isArray(pageData.list) ? (pageData.list as ZscampusRecord[]) : [];
+  if (!Array.isArray(pageData.list)) throw new Error(`第 ${page} 页缺少 list`);
+  const records = pageData.list as ZscampusRecord[];
   const total = Number(pageData.total);
-  if (!Number.isFinite(total) || total < 0) {
+  if (!Number.isSafeInteger(total) || total < 0) {
     throw new Error(`第 ${page} 页缺少有效 total`);
   }
   return { total, records };

@@ -10,6 +10,8 @@ import {
   formatEventType
 } from "../../utils/applications";
 import { formatRelativeEventDate, formatTodayLabel } from "../../utils/datetime";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { MOBILE_VIEW_MEDIA_QUERY } from "../../constants";
 
 export function ApplicationCalendar({
   activeRecordId,
@@ -23,6 +25,10 @@ export function ApplicationCalendar({
   records: ApplicationRecord[];
 }): React.ReactElement {
   const [monthOffset, setMonthOffset] = useState(0);
+  const mobile = useMediaQuery(MOBILE_VIEW_MEDIA_QUERY);
+  const [view, setView] = useState<"month" | "agenda" | null>(null);
+  const [expandedDays, setExpandedDays] = useState<Set<string>>(new Set());
+  const showMonth = (view ?? (mobile ? "agenda" : "month")) === "month";
   const monthDate = useMemo(() => {
     const date = new Date();
     date.setDate(1);
@@ -47,7 +53,8 @@ export function ApplicationCalendar({
           <p>聚合已加入申请的 DDL、面试、开营、结果和补材料日程。</p>
         </div>
         <div className="calendar-actions">
-          <button
+          <button className="secondary-action" onClick={() => setView(showMonth ? "agenda" : "month")} type="button">{showMonth ? "日程列表" : "月历视图"}</button>
+          {showMonth && <><button
             aria-label="查看上月"
             className="icon-button"
             onClick={() => setMonthOffset((value) => value - 1)}
@@ -67,7 +74,7 @@ export function ApplicationCalendar({
             type="button"
           >
             <ChevronRight aria-hidden="true" size={20} />
-          </button>
+          </button></>}
         </div>
       </header>
 
@@ -80,7 +87,7 @@ export function ApplicationCalendar({
       </div>
 
       <div className="calendar-grid">
-        <section className="month-card" aria-label={monthTitle}>
+        {showMonth && <section className="month-card" aria-label={monthTitle}>
           <div className="month-title-row">
             <div className="month-title">{monthTitle}</div>
             <span className="today-badge">今天 {todayLabel}</span>
@@ -99,14 +106,14 @@ export function ApplicationCalendar({
                   {day.isToday && <span className="day-today-label">今天</span>}
                 </div>
                 <div className="day-events">
-                  {day.events.slice(0, 3).map((event) => (
+                  {day.events.slice(0, expandedDays.has(day.key) ? undefined : 3).map((event) => (
                     <button
                       className={
                         event.record.id === activeRecordId
                           ? `day-event day-event-${event.event.type} day-event-active`
                           : `day-event day-event-${event.event.type}`
                       }
-                      key={event.event.id}
+                      key={`${event.record.id}-${event.event.id}`}
                       onClick={() => {
                         onOpenRecord(event.record.id);
                         onSelectApplications();
@@ -116,12 +123,16 @@ export function ApplicationCalendar({
                       {event.record.school} · {formatEventType(event.event.type)}
                     </button>
                   ))}
-                  {day.events.length > 3 && <span className="day-more">+{day.events.length - 3}</span>}
+                  {day.events.length > 3 && <button type="button" className="day-more" aria-expanded={expandedDays.has(day.key)}
+                    aria-label={`${day.key} ${expandedDays.has(day.key) ? "收起" : "展开全部"}日程`}
+                    onClick={() => setExpandedDays((current) => { const next = new Set(current); if (next.has(day.key)) next.delete(day.key); else next.add(day.key); return next; })}>
+                    {expandedDays.has(day.key) ? "收起" : `+${day.events.length - 3} 查看全部`}
+                  </button>}
                 </div>
               </div>
             ))}
           </div>
-        </section>
+        </section>}
 
         <aside className="upcoming-card" aria-label="近期日程">
           <h3>近期日程</h3>
@@ -129,7 +140,7 @@ export function ApplicationCalendar({
             <p className="empty-hint">暂无未来日程。</p>
           ) : (
             <ol className="upcoming-list">
-              {upcoming.slice(0, 12).map(({ event, record }) => (
+              {upcoming.map(({ event, record }) => (
                 <li key={`${record.id}-${event.id}`}>
                   <button
                     onClick={() => {
@@ -140,6 +151,7 @@ export function ApplicationCalendar({
                   >
                     <span className={`event-type event-${event.type}`}>{formatEventType(event.type)}</span>
                     <strong>{record.school}</strong>
+                    <span>{record.institute} · {event.title}</span>
                     <em>{formatRelativeEventDate(event.date)}</em>
                   </button>
                 </li>

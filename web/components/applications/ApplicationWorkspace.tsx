@@ -42,11 +42,11 @@ export function ApplicationWorkspace({
 }: {
   activeRecordId: string | null;
   data: ApplicationTrackerData;
-  onRemoveRecord: (id: string) => void;
-  onReplaceData: (data: ApplicationTrackerData) => void;
+  onRemoveRecord: (id: string) => boolean;
+  onReplaceData: (data: ApplicationTrackerData) => boolean;
   onResetStorage: () => void;
   onSelectRecord: (id: string | null) => void;
-  onUpdateRecord: (id: string, values: Partial<ApplicationRecord>) => void;
+  onUpdateRecord: (id: string, values: Partial<ApplicationRecord>) => boolean;
   storageIssue: ApplicationStorageIssue | null;
 }): React.ReactElement {
   const isMobileViewport = useMediaQuery(MOBILE_VIEW_MEDIA_QUERY);
@@ -107,7 +107,7 @@ export function ApplicationWorkspace({
             type="button"
           >
             <Database aria-hidden="true" size={17} />
-            数据工具
+            备份与导入
             <ChevronDown aria-hidden="true" className={agentOpen ? "chevron-open" : ""} size={16} />
           </button>
           <span className="local-badge">仅存本地</span>

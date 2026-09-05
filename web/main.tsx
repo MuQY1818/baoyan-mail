@@ -1,11 +1,12 @@
 import { ChevronDown, RotateCcw, Search, SlidersHorizontal, X } from "lucide-react";
 import React, {
   useCallback,
-  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
-  useState
+  useState,
+  lazy,
+  Suspense
 } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -34,8 +35,6 @@ import { DdlResults } from "./components/DdlResults";
 import { DdlSkeleton } from "./components/DdlSkeleton";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { Timeline } from "./components/Timeline";
-import { ApplicationCalendar } from "./components/applications/ApplicationCalendar";
-import { ApplicationWorkspace } from "./components/applications/ApplicationWorkspace";
 import { FilterSegment, StateMessage, ViewSwitcher } from "./components/controls";
 import {
   ACTIVITY_TYPE_OPTIONS,
@@ -52,6 +51,8 @@ import {
   TIER_OPTIONS
 } from "./constants";
 import { useApplicationTracker } from "./hooks/useApplicationTracker";
+import { useDdlData } from "./hooks/useDdlData";
+import { useDdlFilters } from "./hooks/useDdlFilters";
 import { useMediaQuery } from "./hooks/useMediaQuery";
 import { useStoredKeySet } from "./hooks/useStoredKeySet";
 import type {
@@ -61,7 +62,6 @@ import type {
   BaoyanAgentApi,
   DdlItem,
   DdlResponse,
-  MainTab,
   RangeFilter,
   RecentFilter,
   RelevanceFilter,
@@ -71,8 +71,7 @@ import type {
   ViewMode
 } from "./types";
 import { sendDailyVisitPing } from "./utils/analytics";
-import { persistApplicationData, readStoredApplicationData } from "./utils/applicationStorage";
-import { formatGeneratedAt } from "./utils/datetime";
+import { readStoredApplicationData } from "./utils/applicationStorage";
 import {
   buildActivityTypeStats,
   buildStats,
@@ -81,33 +80,24 @@ import {
   getAdvancedFilterCount,
   getDdlActiveFilterCount
 } from "./utils/ddl";
-import { persistViewMode, readInitialTheme, readStoredViewMode } from "./utils/storage";
-import { readFiltersFromUrl, writeFiltersToUrl } from "./utils/urlFilters";
+import { persistViewMode, readInitialTheme } from "./utils/storage";
 import "./styles.css";
 
-function App(): React.ReactElement {
-  const initialFilters = useMemo(readFiltersFromUrl, []);
+const ApplicationWorkspace = lazy(() => import("./components/applications/ApplicationWorkspace").then((module) => ({ default: module.ApplicationWorkspace })));
+const ApplicationCalendar = lazy(() => import("./components/applications/ApplicationCalendar").then((module) => ({ default: module.ApplicationCalendar })));
+
+export function App(): React.ReactElement {
   const isMobileViewport = useMediaQuery(MOBILE_VIEW_MEDIA_QUERY);
+  const { query, setQuery, deferredQuery, range, setRange, source, setSource, relevance, setRelevance,
+    activityType, setActivityType, recent, setRecent, viewMode, setViewMode, mainTab, setMainTab,
+    activeTiers, setActiveTiers, activeAreas, setActiveAreas } = useDdlFilters(isMobileViewport);
   const [theme, setTheme] = useState<ThemeMode>(readInitialTheme);
-  const [data, setData] = useState<DdlResponse | null>(null);
+  const { data, error, isLoading, refresh } = useDdlData();
   const [archivalData, setArchivalData] = useState<DdlResponse | null>(null);
   const [analytics, setAnalytics] = useState<AnalyticsSummary | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [query, setQuery] = useState(initialFilters.query);
-  // 搜索词延迟参与过滤，避免每敲一键就同步重渲染整列卡片和时间线
-  const deferredQuery = useDeferredValue(query);
-  const [range, setRange] = useState<RangeFilter>(initialFilters.range);
-  const [source, setSource] = useState<SourceFilter>(initialFilters.source);
-  const [relevance, setRelevance] = useState<RelevanceFilter>(initialFilters.relevance);
-  const [activityType, setActivityType] = useState<ActivityTypeFilter>(initialFilters.activityType);
-  const [recent, setRecent] = useState<RecentFilter>(initialFilters.recent);
-  const [viewMode, setViewMode] = useState<ViewMode>(initialFilters.viewMode);
+  const [timelineOpen, setTimelineOpen] = useState(false);
   const [moreFiltersOpen, setMoreFiltersOpen] = useState(false);
-  const [mainTab, setMainTab] = useState<MainTab>(initialFilters.mainTab);
   const [activeApplicationId, setActiveApplicationId] = useState<string | null>(null);
-  const [activeTiers, setActiveTiers] = useState<Set<TierFilter>>(initialFilters.tiers);
-  const [activeAreas, setActiveAreas] = useState<Set<AreaFilter>>(initialFilters.areas);
   const [favorites, toggleFavorite] = useStoredKeySet(FAVORITE_STORAGE_KEY);
   const [readItems, toggleReadItem] = useStoredKeySet(READ_STORAGE_KEY);
   const [applicationData, setApplicationData, applicationStorageIssue, resetApplicationStorage] =
@@ -115,44 +105,40 @@ function App(): React.ReactElement {
   const scrollTargetRef = useRef<string | null>(null);
   const [scrollNonce, setScrollNonce] = useState(0);
   const [highlightKey, setHighlightKey] = useState<string | null>(null);
-  const filterPanelRef = useRef<HTMLElement>(null);
   const analyticsSectionRef = useRef<HTMLDivElement>(null);
-  const previousMobileViewport = useRef(isMobileViewport);
+  const advancedFiltersRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!isMobileViewport || !moreFiltersOpen || mainTab !== "ddl") return;
+    const previousFocus = document.activeElement as HTMLElement | null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    advancedFiltersRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    function onKeyDown(event: KeyboardEvent): void {
+      if (event.key === "Escape") { event.preventDefault(); setMoreFiltersOpen(false); }
+      if (event.key !== "Tab") return;
+      const controls = Array.from(advancedFiltersRef.current?.querySelectorAll<HTMLElement>("button, select, input, a[href]") ?? []);
+      const first = controls[0]; const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+      previousFocus?.focus();
+    };
+  }, [isMobileViewport, moreFiltersOpen, mainTab]);
 
   useEffect(() => {
     let ignore = false;
-    async function loadData(): Promise<void> {
-      try {
-        const currentResponse = await fetch("/api/ddl");
-        if (!currentResponse.ok) {
-          throw new Error(`数据接口返回 ${currentResponse.status}`);
-        }
-        const body = (await currentResponse.json()) as DdlResponse;
-        if (!ignore) {
-          setData(body);
-          setError(null);
-        }
-      } catch (loadError) {
-        if (!ignore) {
-          setError(loadError instanceof Error ? loadError.message : String(loadError));
-        }
-      } finally {
-        if (!ignore) {
-          setIsLoading(false);
-        }
-      }
-    }
 
     // 归档数据体积大且只用于回填本地申请缺失的官方链接，不门控首屏；
     // 本地没有缺链接的申请记录时直接跳过这次请求。
     async function loadArchivalData(): Promise<void> {
-      const needsHydration = readStoredApplicationData().records.some(
-        (record) => record.website.trim() === ""
-      );
-      if (!needsHydration) {
-        return;
-      }
       try {
+        const needsHydration = readStoredApplicationData().records.some((record) => record.website.trim() === "");
+        if (!needsHydration) return;
         const archivalResponse = await fetch("/api/ddl?includeExpired=1");
         if (!archivalResponse.ok) {
           return;
@@ -166,7 +152,6 @@ function App(): React.ReactElement {
       }
     }
 
-    void loadData();
     void loadArchivalData();
     return () => {
       ignore = true;
@@ -216,29 +201,6 @@ function App(): React.ReactElement {
       observer.disconnect();
     };
   }, []);
-
-  useEffect(() => {
-    writeFiltersToUrl({
-      activeAreas,
-      activeTiers,
-      query,
-      range,
-      recent,
-      relevance,
-      source,
-      activityType,
-      viewMode,
-      mainTab
-    });
-  }, [activeAreas, activeTiers, activityType, mainTab, query, range, recent, relevance, source, viewMode]);
-
-  useEffect(() => {
-    if (previousMobileViewport.current === isMobileViewport) {
-      return;
-    }
-    previousMobileViewport.current = isMobileViewport;
-    setViewMode(readStoredViewMode("ddl", isMobileViewport));
-  }, [isMobileViewport]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -292,7 +254,7 @@ function App(): React.ReactElement {
       ),
     [activeAreas, activeTiers, activityType, deferredQuery, futureItems, range, recent, relevance, source]
   );
-  const stats = useMemo(() => buildStats(relevanceScopedItems), [relevanceScopedItems]);
+  const stats = useMemo(() => buildStats(visibleItems), [visibleItems]);
   const activityStats = useMemo(
     () => buildActivityTypeStats(visibleItems),
     [visibleItems]
@@ -421,11 +383,6 @@ function App(): React.ReactElement {
     persistViewMode("ddl", isMobileViewport, nextViewMode);
   }
 
-  function openFiltersFromMobileBar(): void {
-    setMoreFiltersOpen(true);
-    filterPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }
-
   function toggleTheme(): void {
     setTheme((current) => (current === "dark" ? "light" : "dark"));
   }
@@ -443,8 +400,11 @@ function App(): React.ReactElement {
         return;
       }
       const record = createApplicationRecord(item);
-      setApplicationData((current) => addOrReplaceApplicationRecord(current, record));
-      openApplication(record.id);
+      if (setApplicationData((current) => addOrReplaceApplicationRecord(current, record))) {
+        openApplication(record.id);
+      } else {
+        setMainTab("applications");
+      }
     },
     [applicationData.records, openApplication, setApplicationData]
   );
@@ -459,26 +419,29 @@ function App(): React.ReactElement {
     [applicationData.records, openApplication]
   );
 
-  function updateApplication(id: string, values: Partial<ApplicationRecord>): void {
-    setApplicationData((current) => updateApplicationRecord(current, id, values));
+  function updateApplication(id: string, values: Partial<ApplicationRecord>): boolean {
+    return setApplicationData((current) => updateApplicationRecord(current, id, values));
   }
 
-  function removeApplication(id: string): void {
-    setApplicationData((current) => removeApplicationRecord(current, id));
+  function removeApplication(id: string): boolean {
+    if (!setApplicationData((current) => removeApplicationRecord(current, id))) return false;
     setActiveApplicationId((current) => (current === id ? null : current));
+    return true;
   }
 
-  function replaceApplicationData(nextData: ApplicationTrackerData): void {
-    setApplicationData(normalizeTrackerData(nextData));
+  function replaceApplicationData(nextData: ApplicationTrackerData): boolean {
+    return setApplicationData(nextData);
   }
 
   useEffect(() => {
+    function saveAgentData(nextData: ApplicationTrackerData): void {
+      if (!setApplicationData(nextData)) throw new Error("申请写入失败，原始数据已保留，请在页面中检查存储状态");
+    }
     const api: BaoyanAgentApi = {
       addFromDdlItem(item: DdlItem): ApplicationTrackerData {
         const record = createApplicationRecord(item);
         const nextData = addOrReplaceApplicationRecord(readStoredApplicationData(), record);
-        persistApplicationData(nextData);
-        setApplicationData(nextData);
+        saveAgentData(nextData);
         return nextData;
       },
       applyPatch(patch: unknown): {
@@ -489,27 +452,23 @@ function App(): React.ReactElement {
         const parsed = parseApplicationPatch(patch);
         const result = applyApplicationPatch(readStoredApplicationData(), parsed);
         if (result.errors.length === 0) {
-          persistApplicationData(result.data);
-          setApplicationData(result.data);
+          saveAgentData(result.data);
         }
         return result;
       },
       clearAll(): ApplicationTrackerData {
         const nextData = createEmptyTrackerData();
-        persistApplicationData(nextData);
-        setApplicationData(nextData);
+        saveAgentData(nextData);
         return nextData;
       },
       createApplication(record: ApplicationRecord): ApplicationTrackerData {
         const nextData = addOrReplaceApplicationRecord(readStoredApplicationData(), record);
-        persistApplicationData(nextData);
-        setApplicationData(nextData);
+        saveAgentData(nextData);
         return nextData;
       },
       deleteApplication(id: string): ApplicationTrackerData {
         const nextData = removeApplicationRecord(readStoredApplicationData(), id);
-        persistApplicationData(nextData);
-        setApplicationData(nextData);
+        saveAgentData(nextData);
         return nextData;
       },
       exportData(): ApplicationTrackerData {
@@ -538,8 +497,7 @@ function App(): React.ReactElement {
         if (result.errors.length > 0) {
           throw new Error(result.errors.join("; "));
         }
-        persistApplicationData(result.data);
-        setApplicationData(result.data);
+        saveAgentData(result.data);
         return result.data;
       }
     };
@@ -556,7 +514,7 @@ function App(): React.ReactElement {
       <AppHeader
         activeTab={mainTab}
         applicationCount={applicationCount}
-        ddlCount={relevanceScopedItems.length}
+        ddlCount={visibleItems.length}
         lastSyncedAt={data?.lastSyncedAt ?? data?.generatedAt}
         onSelect={setMainTab}
       />
@@ -566,22 +524,22 @@ function App(): React.ReactElement {
           <section className="ddl-workspace" aria-labelledby="page-title">
             <header className="workspace-intro">
               <div>
-                <span className="section-kicker">DEADLINE DESK</span>
-                <h1 id="page-title">找到下一场值得投的项目</h1>
-                <p>默认展示计算机类强相关通知，筛选、收藏并直接加入本地申请计划。</p>
-              </div>
-              <div className="workspace-intro-meta">
-                <strong>{relevanceScopedItems.length}</strong>
-                <span>条强相关 DDL</span>
+                <span className="section-kicker">保研进度台 / 项目发现</span>
+                <h1 id="page-title">把握每一个申请节点</h1>
+                <p>查找项目，核对截止时间，加入你的申请计划。</p>
               </div>
             </header>
+            {(data?.health?.status === "delayed" || data?.health?.status === "unavailable") && (
+              <div className="health-notice" role="status">数据更新延迟，正在展示上次成功同步的内容。临近截止请以官方通知为准。</div>
+            )}
 
-            <section className="discovery-panel" aria-label="DDL 筛选" ref={filterPanelRef}>
+            <section className="discovery-panel" aria-label="DDL 筛选">
               <label className="search-field search-field-main">
                 <span>搜索学校、院系或研究方向</span>
                 <div className="search-control">
                   <Search aria-hidden="true" size={20} strokeWidth={2} />
                   <input
+                    aria-label="搜索学校、院系或研究方向"
                     value={query}
                     onChange={(event: React.ChangeEvent<HTMLInputElement>) =>
                       setQuery(event.currentTarget.value)
@@ -605,12 +563,6 @@ function App(): React.ReactElement {
                   value={activityType}
                 />
                 <FilterSegment
-                  label="相关度"
-                  onChange={(value) => setRelevance(value as RelevanceFilter)}
-                  options={RELEVANCE_OPTIONS}
-                  value={relevance}
-                />
-                <FilterSegment
                   label="截止范围"
                   onChange={(value) => setRange(value as RangeFilter)}
                   options={RANGE_OPTIONS}
@@ -630,6 +582,7 @@ function App(): React.ReactElement {
                 </div>
                 <button
                   aria-expanded={moreFiltersOpen}
+                  aria-controls="advanced-filters"
                   className={moreFiltersOpen ? "secondary-action secondary-action-active" : "secondary-action"}
                   onClick={() => setMoreFiltersOpen((value) => !value)}
                   type="button"
@@ -666,7 +619,12 @@ function App(): React.ReactElement {
                 source={source}
               />
 
-              <div className={moreFiltersOpen ? "advanced-filters advanced-filters-open" : "advanced-filters"}>
+              {isMobileViewport && moreFiltersOpen && <button className="filter-backdrop" aria-label="关闭高级筛选" onClick={() => setMoreFiltersOpen(false)} type="button" tabIndex={-1} />}
+              <div id="advanced-filters" ref={advancedFiltersRef} role={isMobileViewport && moreFiltersOpen ? "dialog" : "region"}
+                aria-modal={isMobileViewport && moreFiltersOpen ? true : undefined} aria-label="高级筛选条件"
+                className={moreFiltersOpen ? "advanced-filters advanced-filters-open" : "advanced-filters"}>
+                {isMobileViewport && <div className="filter-drawer-head"><strong>高级筛选</strong><button className="secondary-action" aria-label="关闭筛选面板" type="button" onClick={() => setMoreFiltersOpen(false)}><X size={18} /></button></div>}
+                <FilterSegment label="相关度" onChange={(value) => setRelevance(value as RelevanceFilter)} options={RELEVANCE_OPTIONS} value={relevance} />
                 <div className="control-block">
                   <div className="control-label">学校层次</div>
                   <div className="control-row control-row-wrap" aria-label="学校层次">
@@ -680,8 +638,8 @@ function App(): React.ReactElement {
                         {tier}
                       </button>
                     ))}
-                  </div>
                 </div>
+              </div>
                 <div className="control-block advanced-area-filter">
                   <div className="control-label">研究方向</div>
                   <div className="control-row control-row-wrap" aria-label="方向筛选">
@@ -723,47 +681,40 @@ function App(): React.ReactElement {
                   options={RECENT_OPTIONS}
                   value={recent}
                 />
+                {isMobileViewport && <button className="primary-action filter-drawer-done" onClick={() => setMoreFiltersOpen(false)} type="button">查看 {visibleItems.length} 条结果</button>}
               </div>
             </section>
 
-            <div className="mobile-filter-bar">
-              <button onClick={openFiltersFromMobileBar} type="button">
-                <SlidersHorizontal aria-hidden="true" size={18} />
-                筛选{activeFilterCount > 0 ? ` ${activeFilterCount}` : ""}
+            <div className="timeline-summary">
+              <button className="secondary-action" aria-expanded={timelineOpen} aria-controls="deadline-timeline" onClick={() => setTimelineOpen((open) => !open)} type="button">
+                <ChevronDown size={16} className={timelineOpen ? "chevron-open" : ""} aria-hidden="true" />{timelineOpen ? "收起截止概览" : "展开截止概览"}
               </button>
-              <span>{visibleItems.length} 条结果</span>
-              {activeFilterCount > 0 && (
-                <button aria-label="清除全部筛选" onClick={resetFilters} type="button">
-                  <RotateCcw aria-hidden="true" size={17} />
-                </button>
-              )}
+              <span>今日 {stats.today} · 未来 15 天 {stats.fifteenDays} · 待确认 {stats.unknown}</span>
+              <button className="text-action" type="button" onClick={() => { setRange("unknown"); setRelevance("all"); }}>查看待确认项目</button>
             </div>
-
-            <Timeline
+            {timelineOpen && <div id="deadline-timeline"><Timeline
               loading={isLoading}
               onSelectItem={jumpToItem}
               range={range}
               stops={timelineStops}
-            />
+            /></div>}
 
             <section className="results-panel" aria-labelledby="results-title">
               <header className="results-head">
                 <div>
-                  <span className="section-kicker">RESULTS</span>
-                  <h2 id="results-title">DDL 结果</h2>
+                  <h2 id="results-title">项目列表 <span className="result-count">{visibleItems.length}</span></h2>
                   <p>
-                    今日截止 {stats.today} 条，未来 15 天 {stats.fifteenDays} 条，
-                    截止待确认 {stats.unknown} 条，
-                    {formatGeneratedAt(data?.lastSyncedAt ?? data?.generatedAt)}。
+                    以最早影响申请资格的节点为准，报名前请核对官方通知。
                   </p>
                 </div>
-                <ViewSwitcher onChange={changeViewMode} value={viewMode} />
+                <div className="results-tools"><button className="secondary-action" disabled={isLoading} onClick={() => void refresh()} type="button"><RotateCcw size={15} aria-hidden="true" />{isLoading ? "刷新中" : "刷新"}</button><ViewSwitcher onChange={changeViewMode} value={viewMode} /></div>
               </header>
 
-              {isLoading ? (
+              {error !== null && data !== null && <div className="health-notice" role="alert">刷新失败，已保留上次加载的数据。{error}</div>}
+              {isLoading && data === null ? (
                 <DdlSkeleton />
-              ) : error !== null ? (
-                <StateMessage title="数据加载失败" message={error} />
+              ) : error !== null && data === null ? (
+                <StateMessage title="数据加载失败" message={error} actionLabel="重新加载" onAction={() => void refresh()} />
               ) : visibleItems.length === 0 ? (
                 <StateMessage
                   title="当前筛选没有结果"
@@ -790,7 +741,7 @@ function App(): React.ReactElement {
         )}
 
         {mainTab === "applications" && (
-          <ApplicationWorkspace
+          <Suspense fallback={<DdlSkeleton />}><ApplicationWorkspace
             activeRecordId={activeApplicationId}
             data={applicationData}
             onRemoveRecord={removeApplication}
@@ -799,16 +750,16 @@ function App(): React.ReactElement {
             onUpdateRecord={updateApplication}
             onResetStorage={resetApplicationStorage}
             storageIssue={applicationStorageIssue}
-          />
+          /></Suspense>
         )}
 
         {mainTab === "calendar" && (
-          <ApplicationCalendar
+          <Suspense fallback={<DdlSkeleton />}><ApplicationCalendar
             activeRecordId={activeApplicationId}
             records={applicationData.records}
             onOpenRecord={openApplication}
             onSelectApplications={() => setMainTab("applications")}
-          />
+          /></Suspense>
         )}
 
         <ApiHint />
@@ -829,11 +780,7 @@ function App(): React.ReactElement {
 }
 
 const rootElement = document.getElementById("root");
-if (rootElement === null) {
-  throw new Error("缺少 root 节点");
-}
-
-createRoot(rootElement).render(
+if (rootElement !== null) createRoot(rootElement).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>

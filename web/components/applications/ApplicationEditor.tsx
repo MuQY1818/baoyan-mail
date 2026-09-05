@@ -33,8 +33,8 @@ export function ApplicationEditor({
   record
 }: {
   onClose: () => void;
-  onRemoveRecord: (id: string) => void;
-  onUpdateRecord: (id: string, values: Partial<ApplicationRecord>) => void;
+  onRemoveRecord: (id: string) => boolean;
+  onUpdateRecord: (id: string, values: Partial<ApplicationRecord>) => boolean;
   record: ApplicationRecord | null;
 }): React.ReactElement | null {
   const [draft, setDraft] = useState<ApplicationRecord | null>(null);
@@ -44,11 +44,14 @@ export function ApplicationEditor({
   const [newEventDate, setNewEventDate] = useState("");
   const [newEventNote, setNewEventNote] = useState("");
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const [eventError, setEventError] = useState("");
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const drawerRef = useRef<HTMLElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
-  const hasChanges =
-    draft !== null && baseline !== null && serializeEditableRecord(draft) !== serializeEditableRecord(baseline);
+  const hasPendingEvent = [newEventTitle, newEventDate, newEventNote].some((value) => value.trim() !== "");
+  const hasChanges = hasPendingEvent ||
+    (draft !== null && baseline !== null && serializeEditableRecord(draft) !== serializeEditableRecord(baseline));
   const hasChangesRef = useRef(hasChanges);
   hasChangesRef.current = hasChanges;
 
@@ -61,6 +64,8 @@ export function ApplicationEditor({
     setNewEventDate("");
     setNewEventNote("");
     setSaved(false);
+    setSaveError(false);
+    setEventError("");
   }, [record?.id]);
 
   useEffect(() => {
@@ -143,6 +148,7 @@ export function ApplicationEditor({
   function addEvent(): void {
     const title = newEventTitle.trim();
     if (title === "" || newEventDate.trim() === "") {
+      setEventError("请填写日程名称和时间，再添加日程。");
       return;
     }
     const event: ApplicationEvent = {
@@ -156,13 +162,22 @@ export function ApplicationEditor({
     setNewEventTitle("");
     setNewEventDate("");
     setNewEventNote("");
+    setEventError("");
   }
 
   function saveChanges(): void {
+    if (hasPendingEvent) {
+      setEventError("日程尚未添加，请先点击添加日程，或清空日程输入。");
+      return;
+    }
     if (!hasChanges) {
       return;
     }
-    onUpdateRecord(activeRecord.id, activeRecord);
+    if (!onUpdateRecord(activeRecord.id, activeRecord)) {
+      setSaveError(true);
+      return;
+    }
+    setSaveError(false);
     setBaseline(cloneApplicationRecord(activeRecord));
     setSaved(true);
     window.setTimeout(() => setSaved(false), 1800);
@@ -172,7 +187,10 @@ export function ApplicationEditor({
     if (!window.confirm(`确定删除“${activeRecord.school}”的申请记录吗？`)) {
       return;
     }
-    onRemoveRecord(activeRecord.id);
+    if (!onRemoveRecord(activeRecord.id)) {
+      setSaveError(true);
+      return;
+    }
     onClose();
   }
 
@@ -237,6 +255,10 @@ export function ApplicationEditor({
                 <input
                   type="datetime-local"
                   value={dateTimeIsoToLocal(activeRecord.deadlineAt)}
+                  onInput={(event) => {
+                    const deadlineAt = dateTimeLocalToIso(event.currentTarget.value);
+                    updateDraft({ deadlineAt, deadlineText: formatEventDate(deadlineAt) });
+                  }}
                   onChange={(event) => {
                     const deadlineAt = dateTimeLocalToIso(event.currentTarget.value);
                     updateDraft({ deadlineAt, deadlineText: formatEventDate(deadlineAt) });
@@ -375,6 +397,7 @@ export function ApplicationEditor({
               <input
                 aria-label="日程时间"
                 value={newEventDate}
+                onInput={(event) => setNewEventDate(event.currentTarget.value)}
                 onChange={(event) => setNewEventDate(event.currentTarget.value)}
                 type="datetime-local"
               />
@@ -390,6 +413,7 @@ export function ApplicationEditor({
                 添加日程
               </button>
             </div>
+            {eventError && <p role="alert" className="health-notice">{eventError}</p>}
           </section>
 
           <section className="editor-section" aria-labelledby="editor-notes-title">
@@ -415,7 +439,7 @@ export function ApplicationEditor({
 
         <footer className="editor-savebar">
           <span aria-live="polite">
-            {saved ? "已保存到当前浏览器" : hasChanges ? "有未保存的修改" : "本地数据已保存"}
+            {saveError ? "保存失败，草稿已保留。请检查本地存储或先备份。" : saved ? "已保存到当前浏览器" : hasChanges ? "有未保存的修改" : "本地数据已保存"}
           </span>
           <div>
             {activeRecord.website.trim() !== "" && (

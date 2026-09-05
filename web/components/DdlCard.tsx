@@ -9,7 +9,8 @@ import {
 } from "lucide-react";
 import React from "react";
 import type { DdlItem } from "../types";
-import { formatRelevance, getAreaClass, getItemAreas, truncate } from "../utils/ddl";
+import { DeadlineTrust, displayDeadline } from "./DeadlineTrust";
+import { formatRelevance, getItemAreas } from "../utils/ddl";
 
 export const DdlCard = React.memo(function DdlCard({
   addedToApplications,
@@ -71,30 +72,9 @@ export const DdlCard = React.memo(function DdlCard({
             <span className="tier-badge">{item.tier}</span>
           </div>
         </div>
-        <AreaBadges item={item} />
-        <div className="relevance-line">
-          <span className={`relevance-badge relevance-${item.relevance}`}>
-            {formatRelevance(item.relevance)}
-          </span>
-          {item.relevanceReason !== null && item.relevanceReason !== "" && (
-            <span className="relevance-reason">{truncate(item.relevanceReason, 48)}</span>
-          )}
-        </div>
-        <dl className="meta-grid">
-          <div>
-            <dt>截止时间</dt>
-            <dd>{item.deadlineText}</dd>
-          </div>
-          <div>
-            <dt>来源</dt>
-            <dd>{item.sourceLabel}</dd>
-          </div>
-          <div>
-            <dt>状态</dt>
-            <dd>{item.remainingText}</dd>
-          </div>
-        </dl>
-        {item.description !== "" && <p className="description">{truncate(item.description, 96)}</p>}
+        <p className="project-secondary">{getItemAreas(item).join(" / ")} · {formatRelevance(item.relevance)}</p>
+        <p className="card-deadline"><span>截止 · 北京时间</span><strong>{displayDeadline(item)}</strong></p>
+        <DeadlineTrust item={item} />
         <div className="card-actions">
           <a className="source-link" href={item.website} rel="noreferrer" target="_blank">
             <ExternalLink aria-hidden="true" size={16} />
@@ -135,13 +115,3 @@ export const DdlCard = React.memo(function DdlCard({
     </li>
   );
 });
-
-function AreaBadges({ item }: { item: DdlItem }): React.ReactElement {
-  return (
-    <div className="area-badges" aria-label="方向分类">
-      {getItemAreas(item).map((area) => (
-        <span className={`area-badge ${getAreaClass(area)}`} key={area}>{area}</span>
-      ))}
-    </div>
-  );
-}
