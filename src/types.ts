@@ -271,6 +271,7 @@ export interface ReviewCandidatePayload {
   website: string;
   submittedBy?: string;
   note?: string;
+  relatedProjects?: Omit<ReviewCandidatePayload, "relatedProjects">[];
 }
 
 export interface SourceReviewCandidateRow {

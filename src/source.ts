@@ -461,10 +461,10 @@ export async function fetchSourceItemsWithStats(env: Env): Promise<FetchSourceIt
   return {
     items: finalized.items,
     stats: enrichSourceStats(sourceResults.map((result) => result.stats), mergedItems),
-    reviewCandidates: [
+    reviewCandidates: groupReviewCandidatesByNotice([
       ...sourceResults.flatMap((result) => result.reviewCandidates),
       ...buildMergeReviewCandidates(mergedItems.items)
-    ]
+    ])
   };
 }
 
@@ -2332,6 +2332,25 @@ function buildMergeReviewCandidates(items: SourceItemInput[]): SourceReviewCandi
         }
       ];
     });
+}
+
+// 审核池按通知链接存储；共享通知的院系/联合培养项目不能相互覆盖。
+export function groupReviewCandidatesByNotice(candidates: SourceReviewCandidateInput[]): SourceReviewCandidateInput[] {
+  const groups = new Map<string, SourceReviewCandidateInput[]>();
+  for (const candidate of candidates) {
+    const normalizedUrl = canonicalizeNotificationUrl(candidate.normalizedUrl);
+    if (!normalizedUrl) throw new Error("审核候选缺少有效通知链接");
+    const key = JSON.stringify([normalizedUrl, candidate.sourceGroup]);
+    groups.set(key, [...groups.get(key) ?? [], { ...candidate, normalizedUrl }]);
+  }
+  return [...groups.values()].map((group) => {
+    const first = group[0]!;
+    const projects = [...new Map(group.flatMap((entry) => entry.payload.relatedProjects ?? [entry.payload])
+      .map((payload) => [JSON.stringify(payload), payload])).values()];
+    if (projects.length === 1) return first;
+    return { ...first, reason: group.some((entry) => entry.reason === "deadline-conflict") ? "deadline-conflict" : first.reason,
+      payload: { ...first.payload, relatedProjects: projects } };
+  });
 }
 
 function enrichSourceStats(

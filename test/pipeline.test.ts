@@ -4,7 +4,7 @@ import { handleRequest } from "../src/routes";
 import { claimSync, isWatchdogWindow, requestSourceSync } from "../src/pipeline";
 import { getWriteBudget, reserveWriteBudget, setAppState } from "../src/db";
 import { buildDdlResponse } from "../src/ddl";
-import { normalizeZscampusData, validateZscampusPages } from "../src/source";
+import { groupReviewCandidatesByNotice, normalizeZscampusData, validateZscampusPages } from "../src/source";
 import { adminRequestWithRetry } from "../scripts/sync-sources";
 import type { Env, NormalizedItem } from "../src/types";
 
@@ -117,6 +117,38 @@ describe("发布事务", () => {
 });
 
 describe("写入额度与增量发布", () => {
+  it("共享官方通知的审核项按链接归组，两个院系及证据均保存，主项目仍独立", async () => {
+    const { db, env, post } = fixture(); const runId = new Date().toISOString();
+    const website = "https://example.test/review.html";
+    const reviews = groupReviewCandidatesByNotice(["中科院苏州医工所", "中国科大苏州学院"].map((name) => ({
+      normalizedUrl: website, sourceGroup: "multi-source-merge", reason: "deadline-conflict",
+      payload: { sourceGroup: "multi-source-merge", name, institute: name, description: "联合招生", deadline: "", website, note: `证据：${name}` }
+    })));
+    expect(reviews).toHaveLength(1); expect(reviews[0]?.payload.relatedProjects).toHaveLength(2);
+    expect((await post("source-sync/start", metadata(runId, reviews.length, 2))).status).toBe(200);
+    await post("source-sync/items", { runId, items: [item("a"), item("b")] });
+    expect((await post("source-sync/review-candidates", { runId, items: reviews })).status).toBe(200);
+    expect((await post("source-sync/finalize", { runId })).status).toBe(200);
+    const stored = db.sqlite.prepare("SELECT id, payload FROM source_review_candidates").get()!;
+    expect(JSON.parse(String(stored.payload)).relatedProjects.map((project: { name: string }) => project.name)).toEqual(["中科院苏州医工所", "中国科大苏州学院"]);
+    expect(db.itemSnapshots.size).toBe(2);
+    env.ADMIN_REVIEW_PASSWORD = "test-review";
+    const loginBody = new FormData(); loginBody.set("password", "test-review");
+    const login = await handleRequest(new Request("https://example.test/api/admin/review/login", { method: "POST", body: loginBody }), env, ctx);
+    const form = new FormData(); form.set("id", String(stored.id));
+    const result = await handleRequest(new Request("https://example.test/api/admin/review/approve", {
+      method: "POST", headers: { cookie: login.headers.get("set-cookie")!.split(";")[0]! }, body: form
+    }), env, ctx);
+    expect(result.status).toBe(409);
+  });
+  it("共享审核项中其他通知的内容不能伪装成本通知项目", async () => {
+    const { post } = fixture(); const runId = new Date().toISOString(); await post("source-sync/start", metadata(runId, 1));
+    const payload = { sourceGroup: "multi-source-merge", name: "大学", institute: "院系", description: "通知", deadline: "", website: "https://example.test/review.html" };
+    const response = await post("source-sync/review-candidates", { runId, items: [{ normalizedUrl: payload.website,
+      sourceGroup: payload.sourceGroup, reason: "deadline-conflict", payload: { ...payload,
+        relatedProjects: [payload, { ...payload, website: "https://example.test/other.html" }] } }] });
+    expect(response.status).toBe(400);
+  });
   it("20 个项目只保存一行批次，乱序重试不写入也不重复计费", async () => {
     const { db, env, post } = fixture(); const runId = new Date().toISOString();
     const items = Array.from({ length: 20 }, (_, index) => item(`item-${index}`));

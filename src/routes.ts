@@ -657,7 +657,7 @@ async function handleExternalSourceSyncReviewCandidates(
   if (rawCandidates.length === 0 || rawCandidates.length > EXTERNAL_SYNC_BATCH_LIMIT) {
     return jsonResponse({ ok: false, error: "invalid_items" }, 400);
   }
-  const candidates = rawCandidates.map(readExternalSourceReviewCandidate);
+  const candidates = rawCandidates.map((candidate) => readExternalSourceReviewCandidate(candidate));
   if (candidates.some((candidate) => candidate === null)) {
     return jsonResponse({ ok: false, error: "invalid_review_candidate" }, 400);
   }
@@ -1205,6 +1205,10 @@ async function handleReviewApprove(request: Request, env: Env): Promise<Response
     return htmlResponse(renderMessagePage("候选不存在", "请返回审核页刷新后再试。"), 404);
   }
 
+  if ((candidate.candidate.relatedProjects?.length ?? 0) > 1) {
+    return htmlResponse(renderMessagePage("共享通知需逐项核验", "此通知对应多个项目，不能批准成一条人工项目。请按各项目 itemKey 核验，项目仍分别保留在主快照中。"), 409);
+  }
+
   const payload = mergeCandidatePayload(candidate.candidate, {
     sourceGroup: candidate.candidate.sourceGroup,
     name: String(form.get("name") ?? ""),
@@ -1646,6 +1650,7 @@ function renderReviewCandidate(candidate: {
   candidate: ReviewCandidatePayload;
 }): string {
   const payload = candidate.candidate;
+  const related = payload.relatedProjects ?? [];
   return `
     <section class="review-card">
       <div class="review-meta">
@@ -1653,6 +1658,8 @@ function renderReviewCandidate(candidate: {
         <span>${escapeHtml(candidate.reason)}</span>
         <span>${escapeHtml(formatReviewTime(candidate.updated_at))}</span>
       </div>
+      ${related.length > 1 ? `<details open><summary>同一通知涉及 ${related.length} 个项目，需分别核验</summary>${related.map((project) =>
+        `<p><strong>${escapeHtml(project.name)} · ${escapeHtml(project.institute)}</strong><br>${escapeHtml(project.description)}<br>截止：${escapeHtml(project.deadline || "待确认")}<br>${escapeHtml(project.note ?? "")}</p>`).join("")}</details>` : ""}
       <form action="/api/admin/review/approve" method="post">
         <input type="hidden" name="id" value="${candidate.id}">
         <label>学校
@@ -1674,7 +1681,7 @@ function renderReviewCandidate(candidate: {
           <input name="note" value="">
         </label>
         <div class="review-actions">
-          <button type="submit">批准公开</button>
+          <button type="submit" ${related.length > 1 ? "disabled" : ""}>${related.length > 1 ? "请按项目分别核验" : "批准公开"}</button>
         </div>
       </form>
       <form action="/api/admin/review/reject" method="post">
@@ -2201,7 +2208,8 @@ function readExternalSourceSyncItem(value: unknown): NormalizedItem | null {
 }
 
 function readExternalSourceReviewCandidate(
-  value: unknown
+  value: unknown,
+  allowRelated = true
 ): SourceReviewCandidateInput | null {
   if (value === null || typeof value !== "object") {
     return null;
@@ -2221,6 +2229,13 @@ function readExternalSourceReviewCandidate(
     return null;
   }
   const payloadRecord = payload as Record<string, unknown>;
+  let relatedProjects: ReviewCandidatePayload[] | undefined;
+  if (payloadRecord.relatedProjects !== undefined) {
+    if (!allowRelated || !Array.isArray(payloadRecord.relatedProjects) || payloadRecord.relatedProjects.length < 2 || payloadRecord.relatedProjects.length > 100) return null;
+    const related = payloadRecord.relatedProjects.map((project) => readExternalSourceReviewCandidate({ normalizedUrl, sourceGroup, reason, payload: project }, false));
+    if (related.some((project) => project === null || canonicalizeNotificationUrl(project.payload.website) !== normalizedUrl)) return null;
+    relatedProjects = related.map((project) => project!.payload);
+  }
   const name = readString(payloadRecord.name).trim();
   const institute = readString(payloadRecord.institute).trim();
   const description = readString(payloadRecord.description).trim();
@@ -2249,7 +2264,8 @@ function readExternalSourceReviewCandidate(
       description,
       deadline,
       website,
-      note
+      note,
+      ...(relatedProjects ? { relatedProjects } : {})
     }
   };
 }
