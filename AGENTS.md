@@ -67,6 +67,8 @@
 
 ## 部署经验
 
+- 2026-10-01：新增保研季收官页，首页转到 `/celebration`；原工作台代码和浏览器申请数据保留，在未公开链接的 `/archive` 延迟加载并标记不索引。收官页不采集 DDL 或访问统计，感言经 DeepSeek 润色；没有接入浏览器端模型调用。GitHub 源站同步工作流已由用户要求手动停用，前端更新不恢复定时任务。
+
 - Vercel 部署若长时间显示 `Building`，但 `vercel inspect --format=json` 里 `readyState` 是 `BLOCKED`，先看 `readyStateReason`。本项目曾因 Git author 为 `muqy1818@users.noreply.github.com` 被 Vercel Team Access 拦截，提示该 author 没有团队部署权限；解决方法是把提交 author/committer 改为 Vercel 认可的 `2565324759@qq.com`，再重新 `vercel build --prod && vercel deploy --prebuilt --prod --yes`。
 - 使用 `/tmp` 临时 Wrangler 配置部署 Worker 时，`main` 和 `migrations_dir` 要写绝对路径；Wrangler 会按配置文件所在目录解析相对路径，`main = "src/index.ts"` 在 `/tmp/*.toml` 中会被解析成 `/tmp/src/index.ts`。
 - Vercel `deploy --prebuilt` 如果在上传单个较大静态文件后长时间无响应，`--debug` 显示 `POST /v2/files` 返回非 JSON 的 `Internal Server Error`，应分别测试 `api.vercel.com` 直连和代理。当前环境中鉴权请求可走代理，但 1.8 MB 文件上传会被代理中断；取消 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NODE_USE_ENV_PROXY` 后直连执行 `vercel deploy --prebuilt --prod --yes` 可以正常完成。

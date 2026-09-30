@@ -1,6 +1,13 @@
 {
   "buildCommand": "npm run build:web",
   "outputDirectory": "dist",
+  "redirects": [
+    { "source": "/", "destination": "/celebration", "permanent": false }
+  ],
+  "headers": [
+    { "source": "/archive", "headers": [{ "key": "X-Robots-Tag", "value": "noindex, nofollow" }] },
+    { "source": "/archive/", "headers": [{ "key": "X-Robots-Tag", "value": "noindex, nofollow" }] }
+  ],
   "rewrites": [
     {
       "source": "/api/ddl",
@@ -17,6 +24,10 @@
     {
       "source": "/api/analytics/summary",
       "destination": "https://baoyan-mail.weijuebu.workers.dev/api/analytics/summary"
-    }
+    },
+    { "source": "/celebration", "destination": "/index.html" },
+    { "source": "/celebration/", "destination": "/index.html" },
+    { "source": "/archive", "destination": "/index.html" },
+    { "source": "/archive/", "destination": "/index.html" }
   ]
 }

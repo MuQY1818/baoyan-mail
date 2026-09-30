@@ -8,7 +8,6 @@ import React, {
   lazy,
   Suspense
 } from "react";
-import { createRoot } from "react-dom/client";
 import {
   APPLICATION_PATCH_SCHEMA,
   APPLICATION_TRACKER_SCHEMA,
@@ -520,6 +519,10 @@ export function App(): React.ReactElement {
       />
 
       <main className="shell" id="main-content">
+        <div className="health-notice">
+          本季整理已结束。此工作台仅供回看，数据不再自动更新。
+          {" "}<a href="/celebration">返回收官页</a>
+        </div>
         {mainTab === "ddl" && (
           <section className="ddl-workspace" aria-labelledby="page-title">
             <header className="workspace-intro">
@@ -778,10 +781,3 @@ export function App(): React.ReactElement {
     </div>
   );
 }
-
-const rootElement = document.getElementById("root");
-if (rootElement !== null) createRoot(rootElement).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
